@@ -1,7 +1,8 @@
 import warnings
 
-import mlx.core as mx
 import pytest
+
+from mlx_train_perf.core.guards import install_guardrails
 
 _GATED = ("metal", "smoke", "benchmark", "network")
 
@@ -31,8 +32,6 @@ def _memory_guard() -> None:
     gracefully where no usable Metal device exists (a CI runner without GPU must still
     run the pure default lane, not hard-fail at session setup)."""
     try:
-        dev_max = int(mx.device_info()["max_recommended_working_set_size"])
-        mx.set_wired_limit(min(20 * 1024**3, int(0.85 * dev_max)))
-        mx.set_memory_limit(min(22 * 1024**3, int(0.92 * dev_max)))
+        install_guardrails()
     except Exception as exc:  # broad by design — device query only; tests decide their own lane
         warnings.warn(f"memory guard not installed (no Metal device?): {exc}", stacklevel=1)
