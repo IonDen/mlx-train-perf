@@ -44,6 +44,12 @@ target-version = "py311"
 select = ["E", "F", "W", "I", "N", "UP", "B", "A", "C4", "PT", "RET", "SIM", "ARG", "PTH", "PL", "RUF"]
 ignore = ["PLR0913", "PLR2004"]
 
+[tool.ruff.lint.per-file-ignores]
+# Verbatim-ported MSL kernel body (mlx-train-perf-spike/kernel_v2e.py) — line length is
+# inherent to the source text; reformatting would break the byte-for-byte port fidelity
+# the parity cross-check (task-7-report.md) depends on.
+"src/mlx_train_perf/core/kernel/source.py" = ["E501"]
+
 [tool.mypy]
 strict = true
 python_version = "3.12"
