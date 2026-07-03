@@ -46,10 +46,15 @@ ignore = ["PLR0913", "PLR2004"]
 
 [tool.mypy]
 strict = true
-python_version = "3.11"
+python_version = "3.12"
 
 [[tool.mypy.overrides]]
-module = ["mlx.*", "mlx_lm.*", "Metal"]
+module = ["mlx_lm.*", "Metal"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["numpy", "numpy.*"]
+follow_imports = "skip"
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
