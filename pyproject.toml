@@ -1,0 +1,65 @@
+[build-system]
+requires = ["hatchling", "hatch-vcs"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mlx-train-perf"
+dynamic = ["version"]
+description = "Fused, logit-free linear-cross-entropy loss, RAM-fit planner, and benchmark harness for MLX fine-tuning on Apple Silicon"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{ name = "Denis Ineshin", email = "denis.ineshin@gmail.com" }]
+dependencies = ["mlx>=0.31.2"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Operating System :: MacOS",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.optional-dependencies]
+mlx-lm = ["mlx-lm>=0.31"]
+probe = ["pyobjc-framework-Metal"]
+
+[project.scripts]
+mlx-train-perf = "mlx_train_perf.cli:main"
+
+[tool.hatch.version]
+source = "vcs"
+
+[dependency-groups]
+dev = [
+    "pytest>=8", "pytest-cov", "hypothesis", "ruff", "mypy", "basedpyright",
+    "mlx-lm>=0.31", "pyobjc-framework-Metal",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "A", "C4", "PT", "RET", "SIM", "ARG", "PTH", "PL", "RUF"]
+ignore = ["PLR0913", "PLR2004"]
+
+[tool.mypy]
+strict = true
+python_version = "3.11"
+
+[[tool.mypy.overrides]]
+module = ["mlx.*", "mlx_lm.*", "Metal"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+markers = [
+    "metal: needs a Metal GPU + JIT (collection-gated: --run-metal)",
+    "smoke: loads a real model (collection-gated: --run-smoke)",
+    "benchmark: timing runs (collection-gated: --run-benchmark)",
+    "network: touches the network (collection-gated: --run-network)",
+]
+
+[tool.coverage.report]
+fail_under = 85

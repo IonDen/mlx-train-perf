@@ -1,0 +1,8 @@
+/CLAUDE.md
+docs/superpowers/
+.venv/
+__pycache__/
+*.egg-info/
+.coverage
+dist/
+_artifacts/

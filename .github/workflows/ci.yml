@@ -1,0 +1,37 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  checks:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --all-extras
+      - run: uv run ruff check src/ tests/
+      - run: uv run mypy src/
+      # coverage REPORTED but not gated here: the metal marker gates CORE code (kernel
+      # launch/loss paths), so the default lane can't reach fail_under=85 by construction.
+      # The gate lives in the metal-enabled lane (added in Task 7 once the probe verdict is
+      # known) and in the Task 18 local pre-release check.
+      - run: uv run pytest tests/ --cov=mlx_train_perf --cov-fail-under=0
+  metal-probe:
+    runs-on: macos-15
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync
+      - name: Can this runner JIT + run mx.fast.metal_kernel?
+        run: |
+          uv run python - <<'EOF'
+          import mlx.core as mx
+          k = mx.fast.metal_kernel(name="probe", input_names=["inp"], output_names=["out"],
+                                   source="uint e = thread_position_in_grid.x; out[e] = inp[e] * 2.0f;")
+          x = mx.arange(16, dtype=mx.float32)
+          (y,) = k(inputs=[x], grid=(16, 1, 1), threadgroup=(16, 1, 1),
+                   output_shapes=[(16,)], output_dtypes=[mx.float32])
+          assert (y == x * 2).all().item(), "wrong result"
+          print("METAL PROBE: OK")
+          EOF
