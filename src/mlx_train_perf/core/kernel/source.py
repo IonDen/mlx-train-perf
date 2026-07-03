@@ -182,3 +182,86 @@ def build_dense_source(row_tiles: int) -> str:
     return _DENSE_TEMPLATE.replace("RT_COUNT", str(row_tiles)).replace(
         "ROWS_PER_BLOCK", str(8 * row_tiles)
     )
+
+
+# Dequantize-in-register helper for MLX's affine int4/gs64 layout (verified against the
+# installed mx.quantize output by tests/test_quant_layout.py): `w_q` packs 8 nibbles
+# per uint32 word, low-to-high (nibble i of column k lives at bits [4i, 4i+4) of word
+# k>>3); `scales`/`biases` hold one value per 64-column group. Goes in metal_kernel's
+# `header=` parameter — MSL forbids a nested function definition inside a [[kernel]]
+# body, so helpers must be prepended outside it, not spliced into the source string.
+QUANT_HELPERS = """
+template <typename S>
+inline float mtp_dq4(const device uint* wq_row, const device S* sc_row,
+                     const device S* bi_row, uint k) {
+    uint packed = wq_row[k >> 3];
+    uint nib = (packed >> (4 * (k & 7))) & 0xFu;
+    uint g = k >> 6;                       // group_size 64
+    return (float)sc_row[g] * (float)nib + (float)bi_row[g];
+}
+"""
+
+# Quant variant, derived from the (still-sentineled) dense template by replacing ONLY the
+# B-fragment loads: the dense `wp0[ct]`/`wp1[ct]` device-T pointers into `w` become plain
+# row indices `c0[ct]`/`c1[ct]` (clamped identically), and every B load dequantizes via
+# `mtp_dq4` instead of a straight cast. Everything else (the A/hidden side, the lane
+# mapping, the epilogue) is untouched.
+_QUANT_TEMPLATE = (
+    _DENSE_TEMPLATE.replace(
+        "        const device T* wp0[4];\n"
+        "        const device T* wp1[4];\n"
+        "        #pragma clang loop unroll(full)\n"
+        "        for (uint ct = 0; ct < 4; ++ct) {\n"
+        "            wp0[ct] = w + (size_t)(v0 + metal::min(cc + 8 * ct + fn, cl)) * d;\n"
+        "            wp1[ct] = w + (size_t)(v0 + metal::min(cc + 8 * ct + fn + 1, cl)) * d;\n"
+        "        }",
+        "        uint c0[4];\n"
+        "        uint c1[4];\n"
+        "        #pragma clang loop unroll(full)\n"
+        "        for (uint ct = 0; ct < 4; ++ct) {\n"
+        "            c0[ct] = v0 + metal::min(cc + 8 * ct + fn, cl);\n"
+        "            c1[ct] = v0 + metal::min(cc + 8 * ct + fn + 1, cl);\n"
+        "        }",
+    )
+    .replace(
+        "            #pragma clang loop unroll(full)\n"
+        "            for (uint ct = 0; ct < 4; ++ct) {\n"
+        "                B[ct].thread_elements()[0] = (float)wp0[ct][d0 + fm];\n"
+        "                B[ct].thread_elements()[1] = (float)wp1[ct][d0 + fm];\n"
+        "            }",
+        "            #pragma clang loop unroll(full)\n"
+        "            for (uint ct = 0; ct < 4; ++ct) {\n"
+        "                B[ct].thread_elements()[0] = mtp_dq4(wq + (size_t)c0[ct] * (d >> 3),\n"
+        "                                                     sc + (size_t)c0[ct] * (d >> 6),\n"
+        "                                                     bi + (size_t)c0[ct] * (d >> 6), d0 + fm);\n"
+        "                B[ct].thread_elements()[1] = mtp_dq4(wq + (size_t)c1[ct] * (d >> 3),\n"
+        "                                                     sc + (size_t)c1[ct] * (d >> 6),\n"
+        "                                                     bi + (size_t)c1[ct] * (d >> 6), d0 + fm);\n"
+        "            }",
+    )
+    .replace(
+        "            #pragma clang loop unroll(full)\n"
+        "            for (uint ct = 0; ct < 4; ++ct) {\n"
+        "                B[ct].thread_elements()[0] = (db < d) ? (float)wp0[ct][db] : 0.0f;\n"
+        "                B[ct].thread_elements()[1] = (db < d) ? (float)wp1[ct][db] : 0.0f;\n"
+        "            }",
+        "            #pragma clang loop unroll(full)\n"
+        "            for (uint ct = 0; ct < 4; ++ct) {\n"
+        "                B[ct].thread_elements()[0] = (db < d) ? mtp_dq4(wq + (size_t)c0[ct] * (d >> 3),\n"
+        "                                                     sc + (size_t)c0[ct] * (d >> 6),\n"
+        "                                                     bi + (size_t)c0[ct] * (d >> 6), db) : 0.0f;\n"
+        "                B[ct].thread_elements()[1] = (db < d) ? mtp_dq4(wq + (size_t)c1[ct] * (d >> 3),\n"
+        "                                                     sc + (size_t)c1[ct] * (d >> 6),\n"
+        "                                                     bi + (size_t)c1[ct] * (d >> 6), db) : 0.0f;\n"
+        "            }",
+    )
+)
+
+
+def build_quant_source(row_tiles: int) -> str:
+    """MSL function body for the int4/gs64 dequant-in-kernel MMA kernel. RT in {2, 4}."""
+    if row_tiles not in (2, 4):
+        raise ValueError(f"row_tiles must be 2 or 4, got {row_tiles}")
+    return _QUANT_TEMPLATE.replace("RT_COUNT", str(row_tiles)).replace(
+        "ROWS_PER_BLOCK", str(8 * row_tiles)
+    )
