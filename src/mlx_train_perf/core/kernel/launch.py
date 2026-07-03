@@ -8,8 +8,9 @@ from typing import cast
 
 import mlx.core as mx
 
-from mlx_train_perf.core.kernel.source import build_dense_source
-from mlx_train_perf.errors import LaunchBudgetError
+from mlx_train_perf.core.chunked import QuantSpec
+from mlx_train_perf.core.kernel.source import QUANT_HELPERS, build_dense_source, build_quant_source
+from mlx_train_perf.errors import LaunchBudgetError, UnsupportedHeadError
 
 MAX_DISPATCH_SECONDS = 1.0
 MAX_TOTAL_SECONDS = 60.0
@@ -72,6 +73,58 @@ def forward(
         offs = mx.array([v0, v1], dtype=mx.uint32)
         lse, tgt = kernel(
             inputs=[hidden, w, targets, offs, lse, tgt],
+            template=[("T", hidden.dtype)],
+            grid=(32, row_blocks, 1),
+            threadgroup=(32, tg_y, 1),
+            output_shapes=[(n,), (n,)],
+            output_dtypes=[mx.float32, mx.float32],
+        )
+    return lse, tgt
+
+
+@functools.cache
+def _quant_kernel(row_tiles: int) -> _MetalKernel:
+    kernel = mx.fast.metal_kernel(
+        name=f"mtp_fused_ce_quant_rt{row_tiles}",
+        input_names=["hidden", "wq", "sc", "bi", "targets", "offs", "lse_in", "tgt_in"],
+        output_names=["lse_out", "tgt_out"],
+        source=build_quant_source(row_tiles),
+        header=QUANT_HELPERS,
+    )
+    return cast(_MetalKernel, kernel)
+
+
+def forward_quantized(
+    hidden: mx.array, q: QuantSpec, targets: mx.array, *,
+    row_tiles: int, tile: int, rate_macs_per_s: float | None,
+) -> tuple[mx.array, mx.array]:
+    """Dequant-in-kernel quantized forward. Same (lse, tgt) contract as `forward`.
+    Constraint: 4-bit, group_size=64, d % 64 == 0 (no silent fallback — narrower coverage
+    is post-0.1.0)."""
+    if q.bits != 4 or q.group_size != 64:
+        raise UnsupportedHeadError(
+            f"forward_quantized only supports bits=4, group_size=64 (got bits={q.bits}, "
+            f"group_size={q.group_size}); use impl='chunked' for other quant configs."
+        )
+    n, d = hidden.shape
+    if d % 64 != 0:
+        raise UnsupportedHeadError(
+            f"forward_quantized requires d % 64 == 0 (got d={d}); use impl='chunked'."
+        )
+    v = q.w_q.shape[0]
+    if rate_macs_per_s is not None:
+        check_budget(n=n, d=d, v=v, tile=tile, rate_macs_per_s=rate_macs_per_s)
+    rows = 8 * row_tiles
+    row_blocks = (n + rows - 1) // rows
+    kernel = _quant_kernel(row_tiles)
+    lse = mx.full((n,), float("-inf"), dtype=mx.float32)
+    tgt = mx.zeros((n,), dtype=mx.float32)
+    tg_y = min(8, row_blocks)
+    for v0 in range(0, v, tile):
+        v1 = min(v0 + tile, v)
+        offs = mx.array([v0, v1], dtype=mx.uint32)
+        lse, tgt = kernel(
+            inputs=[hidden, q.w_q, q.scales, q.biases, targets, offs, lse, tgt],
             template=[("T", hidden.dtype)],
             grid=(32, row_blocks, 1),
             threadgroup=(32, tg_y, 1),
