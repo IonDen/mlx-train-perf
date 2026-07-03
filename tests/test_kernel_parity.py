@@ -37,6 +37,9 @@ def test_value_parity_vs_fp32_exact_naive(n: int, d: int, v: int, tile: int,
     # pin fp32 4e-6 (~2.1x margin), bf16 5e-6 (~2.6x margin, same convention as
     # test_chunked.py's dense-CE pins). The kernel accumulates fp32 in-register even for
     # bf16 inputs, so both dtypes land in the same reduction-order-noise class.
+    # This pin is measured over THIS grid only — the spike's broader grid saw 4.8e-6 fp32.
+    # If a future case legitimately lands between this pin and the 1e-5 ceiling, widen
+    # toward the ceiling with a note; don't treat it as a regression.
     tol = 4e-6 if dtype == mx.float32 else 5e-6
     assert mx.abs(ours - ref).max().item() < tol
 
