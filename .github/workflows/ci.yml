@@ -35,3 +35,14 @@ jobs:
           assert (y == x * 2).all().item(), "wrong result"
           print("METAL PROBE: OK")
           EOF
+  # Task-2 probe verdict: METAL PROBE: OK on macos-15 — this lane runs the Metal-gated
+  # kernel parity suite and carries the fail_under=85 coverage gate (the default `checks`
+  # job above can't reach it: the metal marker gates the kernel launch/loss paths).
+  metal-tests:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --all-extras
+      - run: uv run pytest tests/ --run-metal --cov=mlx_train_perf
