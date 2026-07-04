@@ -54,11 +54,10 @@ from mlx_train_perf.core.chunked import QuantSpec
 from mlx_train_perf.core.guards import install_guardrails
 from mlx_train_perf.core.kernel.dispatch import select_variant
 from mlx_train_perf.core.kernel.launch import (
-    SAFETY_FACTOR,
     calibrated_rate,
+    calibrated_rate_quantized,
     forward,
     forward_quantized,
-    probe_tile_for,
 )
 from mlx_train_perf.errors import LaunchBudgetError
 
@@ -119,26 +118,6 @@ def _result_is_fresh(path: Path, identity: dict[str, object]) -> bool:
     return bool(data.get("status") == "ok" and data.get("identity") == identity)
 
 
-def _quant_calibrated_rate(*, row_tiles: int, n: int, d: int, v: int) -> float:
-    """Same probe shape/safety convention as launch.calibrated_rate (dense-only — it
-    builds a plain bf16 `w`, so it can't be reused directly for a QuantSpec head)."""
-    probe_tile = min(probe_tile_for(n=n, d=d), v)
-    mx.random.seed(0)
-    hidden = mx.random.normal((n, d)).astype(mx.bfloat16)
-    w = (mx.random.normal((probe_tile, d)) * 0.05).astype(mx.bfloat16)
-    targets = mx.random.randint(0, probe_tile, (n,))
-    w_q, scales, biases = mx.quantize(w, group_size=GROUP_SIZE, bits=BITS)
-    q = QuantSpec(w_q=w_q, scales=scales, biases=biases, group_size=GROUP_SIZE, bits=BITS)
-    elapsed = 0.0
-    for _timed in (False, True):
-        t0 = time.perf_counter()
-        lse, tgt = forward_quantized(hidden, q, targets, row_tiles=row_tiles, tile=probe_tile,
-                                     rate_macs_per_s=None)
-        mx.eval(lse, tgt)
-        elapsed = time.perf_counter() - t0
-    return SAFETY_FACTOR * (n * probe_tile * d) / max(elapsed, 1e-9)
-
-
 def _timed_forward(
     fn: Callable[[], tuple[mx.array, mx.array]], *, reps: int,
 ) -> tuple[float, list[float], float]:
@@ -194,7 +173,7 @@ def run_condition(condition: str) -> None:
 
         if condition == "quant_kernel":
             q = QuantSpec(w_q=w_q, scales=scales, biases=biases, group_size=GROUP_SIZE, bits=BITS)
-            rate = _quant_calibrated_rate(row_tiles=row_tiles, n=N, d=D, v=V)
+            rate = calibrated_rate_quantized(row_tiles=row_tiles, dtype=mx.bfloat16, n=N, d=D, v=V)
 
             def fn() -> tuple[mx.array, mx.array]:
                 return forward_quantized(hidden, q, targets, row_tiles=row_tiles, tile=TILE,
