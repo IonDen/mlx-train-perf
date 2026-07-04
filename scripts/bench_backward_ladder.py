@@ -43,9 +43,13 @@ and resume skips a condition whose artifact identity is fresh
 computed over `CODE_SHA_DEPS`, which already covers `core/kernel/launch.py` and
 `core/kernel/source.py` (BOTH backward builders/launchers: `build_backward_dhidden_source`
 + `build_backward_dw_source`, `backward_dhidden` + `backward_dw`) plus `core/loss.py` and
-`core/chunked.py` (the staged-vjp path) -- an interruption loses at most one condition's
-run. A `LaunchBudgetError` refusal (either during ramp-driven setup or the final timed
-dispatch) IS a result -- recorded, not a crash.
+`core/chunked.py` (the staged-vjp path). `CODE_SHA_DEPS` deliberately excludes ad hoc
+bench scripts under `scripts/` though, so this script's identity ALSO carries its own
+`script_sha()` (same convention `ground_truth_atomic_outputs.py` established) -- without
+it, an edit to THIS script's OWN measurement logic (the exact `ramp_tile_and_rate`
+MAC-accounting fix below) would not invalidate a stale artifact. An interruption loses at
+most one condition's run. A `LaunchBudgetError` refusal (either during ramp-driven setup
+or the final timed dispatch) IS a result -- recorded, not a crash.
 
 `--tiny` runs the SAME code paths at a cheap synthetic shape (n=256, v=2048, d=256) for
 end-to-end verification, writing to `bench_<condition>_tiny.json` -- a DIFFERENT filename
@@ -60,6 +64,7 @@ session -- `--tiny` is the only mode safe to run outside the main session's heav
 protocol.
 """
 import argparse
+import hashlib
 import statistics
 import subprocess
 import sys
@@ -96,7 +101,22 @@ CONDITIONS = (
 )
 
 _SCRIPTS_DIR = Path(__file__).resolve().parent
+_SCRIPT_PATH = Path(__file__).resolve()
 RESULTS = _SCRIPTS_DIR.parent / "_artifacts" / "bench_backward_ladder"
+
+
+def script_sha() -> str:
+    """Fingerprint of THIS script's own bytes. `run_identity`'s `code_sha` (computed over
+    `mlx_train_perf.bench.artifacts.CODE_SHA_DEPS`) deliberately excludes ad hoc bench
+    scripts under `scripts/` -- same convention `scripts/ground_truth_atomic_outputs.py`
+    already established its own `script_sha()` for. Without this, an edit to THIS
+    script's OWN measurement/accounting logic (e.g. the `ramp_tile_and_rate` MAC-
+    accounting fix) would silently NOT invalidate a previously-written artifact, since
+    `code_sha` alone never changes for a script-only edit -- confirmed the hard way: a
+    `--tiny` re-verification after fixing `ramp_tile_and_rate` read every prior tiny
+    artifact as still \"fresh\" and skipped re-measuring, because this field did not
+    exist yet at that point."""
+    return hashlib.sha256(_SCRIPT_PATH.read_bytes()).hexdigest()[:16]
 
 
 def macs_for_condition(condition: str, *, n: int, v: int, d: int) -> int:
@@ -134,21 +154,53 @@ def ramp_tile_and_rate(
     measure: Callable[[int], float], *, n: int, d: int, v: int,
     start_tile: int, max_stages: int = 3,
 ) -> tuple[int, float]:
-    """Same ramp discipline as `launch.calibrate` (probe, climb while the projected tile
-    keeps growing, sustain past the ramp to reach ramped GPU clocks, then a median-of-3
-    timed measurement) but ALSO returns the tile the ramp converged to. `launch.calibrate`
-    itself only returns the rate -- production dispatches for the ALREADY-CALIBRATED
-    dense/quantized forward always run at a separately-known-safe fixed tile constant, but
-    the backward kernels' v0 rate is UNKNOWN (never assume the forward's), so their
-    production dispatch must run at the SAME tile this ramp actually measured, not a
-    separately-guessed constant. Mirrors `launch.calibrate`'s internals exactly (same
-    `next_probe_tile`/`sustain_reps` calls, same SAFETY_FACTOR application once at the
-    end) -- the only difference is tracking and returning `tile` alongside the rate."""
+    """Same ramp SHAPE as `launch.calibrate` (probe, climb while the projected tile keeps
+    growing, sustain past the ramp to reach ramped GPU clocks, then a median-of-3 timed
+    measurement) but with DIFFERENT MAC accounting, for a reason that must not be
+    flattened into "mirrors calibrate() exactly" -- doing so once produced a real bug
+    (fixed here; see below). Also returns the tile the ramp converged to (`calibrate()`
+    itself only returns the rate) since the backward kernels' v0 rate is UNKNOWN (never
+    assume the forward's), so their production dispatch must run at the SAME tile this
+    ramp actually measured, not a separately-guessed constant.
+
+    THE DATA-SIZING DIFFERENCE THAT DRIVES THE ACCOUNTING DIFFERENCE: `calibrated_rate`'s
+    own `measure(tile)` closure builds a probe `w`/`targets` pair SIZED TO `tile` (`w`'s
+    own vocab dim equals `tile`), so `forward(..., tile=tile)`'s internal
+    `for v0 in range(0, v, tile)` loop -- where `v = w.shape[0] == tile` there -- runs
+    EXACTLY ONE iteration: `per_dispatch_s` genuinely times ONE dispatch of `n*tile*d`
+    MACs, and `n*tile*d/per_dispatch_s` is a correct per-dispatch rate.
+
+    THIS caller's `measure(tile)` closures (see `_dhidden_measure`/`_dw_measure`) reuse
+    the FULL PRODUCTION `w`/`targets` (shape `(v, d)` -- deliberately, since these bench
+    conditions measure the REAL backward kernel at REAL production scale, not a
+    tile-sized synthetic probe). Calling `backward_dhidden`/`backward_dw(..., tile=tile)`
+    against a full-size `w` makes their OWN internal `for v0 in range(0, v, tile)` loop
+    run `ceil(v / tile)` iterations -- `measure(tile)` times the WHOLE CHAIN across every
+    vocab column, not one dispatch. A prior version of this function kept `calibrate()`'s
+    `n*tile*d/per_dispatch_s` formula anyway, which under-reports the rate by
+    approximately `v/tile` (at tile=128 against V=151936, ~1,187x) -- the ramp collapsed
+    to a "0 G MAC/s" rate and `check_budget` refused every kernel condition with a
+    fictional multi-hundred-second projection (confirmed against the production run's
+    recorded refusal artifacts). Since every dispatch in the chain covers a DIFFERENT,
+    disjoint slice of `v` and the chain's total MAC count is therefore ALWAYS `n*v*d`
+    regardless of how many dispatches the chain took or how it was tiled, the correct
+    rate is `n*v*d/elapsed` (used for BOTH the ramp-stage rate below and the final
+    median-of-3 rate) -- this is genuinely per-dispatch-comparable throughput:
+    `check_budget`'s own `n*tile*d/rate` projection then reduces to
+    `elapsed * (tile/v)`, i.e. the chain's measured average time per one `tile`-sized
+    dispatch, exactly the quantity a launch-budget guard needs.
+
+    `sustain_reps(per_dispatch_s=...)` is still fed the CHAIN's elapsed time (not a
+    single dispatch's) here -- that is fine, not a second bug: `sustain_reps`'s whole
+    purpose is ensuring enough CONTINUOUS GPU load to reach ramped clocks before the
+    timed measurement, and a full chain (especially at small tiles, where it is many
+    dispatches back to back) trivially already provides that much continuous load, so
+    `ceil(0.75 / chain_elapsed)` reliably floors at 1 extra rep rather than ballooning."""
     tile = start_tile
     per_dispatch_s = 0.0
     for _stage in range(max_stages):
         per_dispatch_s = measure(tile)
-        raw_rate = n * tile * d / max(per_dispatch_s, 1e-9)
+        raw_rate = n * v * d / max(per_dispatch_s, 1e-9)
         candidate = next_probe_tile(rate_macs_per_s=SAFETY_FACTOR * raw_rate, n=n, d=d, v=v)
         if candidate <= tile:
             break
@@ -157,7 +209,7 @@ def ramp_tile_and_rate(
         measure(tile)
     timings = [measure(tile) for _ in range(3)]
     median_s = statistics.median(timings)
-    rate = n * tile * d / max(median_s, 1e-9)
+    rate = n * v * d / max(median_s, 1e-9)
     return tile, SAFETY_FACTOR * rate
 
 
@@ -350,7 +402,7 @@ def run_condition(condition: str, *, tiny: bool) -> None:
     row_tiles = select_variant(n).row_tiles
     ident = run_identity(
         experiment="bench_backward_ladder", condition=condition,
-        n=n, v=v, d=d, dtype=str(DTYPE), tiny=tiny,
+        n=n, v=v, d=d, dtype=str(DTYPE), tiny=tiny, script_sha=script_sha(),
     )
     out = RESULTS / f"bench_{condition}{'_tiny' if tiny else ''}.json"
     if result_is_fresh(out, ident):
@@ -421,7 +473,7 @@ def main(argv: list[str] | None = None) -> int:
     for condition in CONDITIONS:
         ident = run_identity(
             experiment="bench_backward_ladder", condition=condition,
-            n=n, v=v, d=d, dtype=str(DTYPE), tiny=args.tiny,
+            n=n, v=v, d=d, dtype=str(DTYPE), tiny=args.tiny, script_sha=script_sha(),
         )
         out = RESULTS / f"bench_{condition}{'_tiny' if args.tiny else ''}.json"
         if result_is_fresh(out, ident):

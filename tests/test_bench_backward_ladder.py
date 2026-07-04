@@ -4,10 +4,19 @@ existing convention), so the module is loaded by path rather than via a package 
 
 Only the GPU-free helpers are covered here: `macs_for_condition` (pure MAC accounting)
 and `ramp_tile_and_rate` (the ramp logic, exercised through a FAKE `measure` closure --
-same convention as `test_kernel_launch_calibration.py`'s coverage of `launch.calibrate`,
-which this function wraps to additionally report the tile the ramp converged to). The
-real Metal-backed condition runners are exercised end-to-end via `--tiny` on the main
+same convention as `test_kernel_launch_calibration.py`'s coverage of `launch.calibrate`).
+The real Metal-backed condition runners are exercised end-to-end via `--tiny` on the main
 session, not unit-tested here.
+
+`ramp_tile_and_rate`'s `measure(tile)` closures in this script (see
+`_dhidden_measure`/`_dw_measure`) time a FULL-VOCAB CHAIN against production-sized `w`
+buffers -- `ceil(v / tile)` dispatches, not one -- so every `fake_measure` below returns
+a CHAIN-elapsed value: the total time to cover all `v` columns, independent of how many
+dispatches that took. This is NOT the same convention `test_kernel_launch_calibration.py`
+uses for `launch.calibrate` itself, whose OWN `measure` closures (via `calibrated_rate`)
+size the probe `w` to `tile` so the "chain" is exactly one dispatch -- see
+`ramp_tile_and_rate`'s docstring for the full explanation, including the production
+false-refusal this distinction fixes.
 """
 import sys
 from pathlib import Path
@@ -21,6 +30,7 @@ from bench_backward_ladder import (  # noqa: E402 -- import must follow the sys.
     CONDITIONS,
     macs_for_condition,
     ramp_tile_and_rate,
+    script_sha,
 )
 
 from mlx_train_perf.core.kernel.launch import SAFETY_FACTOR  # noqa: E402
@@ -66,18 +76,21 @@ def test_macs_for_condition_unknown_condition_raises() -> None:
 
 
 # ---------------------------------------------------------------------------
-# ramp_tile_and_rate: same ramp discipline as launch.calibrate, but ALSO reports the
-# tile the ramp converged to (calibrate() itself only returns the rate) -- the backward
-# kernels' production dispatch must run at the SAME tile the ramp measured, since their
-# v0 rate is UNKNOWN and must never be assumed from the forward's.
+# ramp_tile_and_rate: same ramp SHAPE as launch.calibrate, but CHAIN-MAC accounting
+# (n*v*d/elapsed, not n*tile*d/elapsed -- see the module + function docstrings for why).
+# Also reports the tile the ramp converged to (calibrate() itself only returns the rate)
+# -- the backward kernels' production dispatch must run at the SAME tile the ramp
+# measured, since their v0 rate is UNKNOWN and must never be assumed from the forward's.
 # ---------------------------------------------------------------------------
 
 
 def test_ramp_tile_and_rate_lands_the_high_tile_and_safety_margined_rate() -> None:
-    # Same false-refusal-regression scenario as test_kernel_launch_calibration.py's
+    # Same false-refusal-regression SHAPE as test_kernel_launch_calibration.py's
     # test_calibrate_lands_high_tile_despite_underestimating_micro_probe: a tile-128
     # micro-probe under-reports the rate by 2.7x; the ramp must still climb to and
     # measure the true high-rate tile (8192), not anchor on the bad early sample.
+    # CHAIN semantics: fake_measure returns the elapsed time to cover ALL v columns
+    # (n*v*d/effective_rate), independent of tile -- not n*tile*d/effective_rate.
     high_rate = 1_363.4e9
     low_rate = high_rate / 2.7
     calls: list[int] = []
@@ -85,7 +98,7 @@ def test_ramp_tile_and_rate_lands_the_high_tile_and_safety_margined_rate() -> No
     def fake_measure(tile: int) -> float:
         calls.append(tile)
         rate = low_rate if tile <= 128 else high_rate
-        return N * tile * D / rate
+        return N * V * D / rate
 
     tile, rate = ramp_tile_and_rate(fake_measure, n=N, d=D, v=V, start_tile=128)
 
@@ -100,7 +113,9 @@ def test_ramp_tile_and_rate_stops_ramping_once_the_tile_stops_growing() -> None:
 
     def fake_measure(tile: int) -> float:
         calls.append(tile)
-        return n * tile * d / 1e12  # constant rate: the projected tile never grows
+        # constant, TILE-INDEPENDENT chain elapsed: the achievable rate never changes
+        # with tile, so the projected tile never grows past the starting one.
+        return n * v * d / 1e12
 
     tile, rate = ramp_tile_and_rate(fake_measure, n=n, d=d, v=v, start_tile=4096)
 
@@ -112,9 +127,57 @@ def test_ramp_tile_and_rate_stops_ramping_once_the_tile_stops_growing() -> None:
 def test_ramp_tile_and_rate_applies_safety_factor_exactly_once() -> None:
     rate = 4e11
 
-    def fake_measure(tile: int) -> float:
-        return N * tile * D / rate
+    def fake_measure(tile: int) -> float:  # noqa: ARG001 -- chain elapsed is tile-independent
+        return N * V * D / rate
 
     _, reported_rate = ramp_tile_and_rate(fake_measure, n=N, d=D, v=V, start_tile=8192,
                                           max_stages=1)
     assert reported_rate == pytest.approx(SAFETY_FACTOR * rate, rel=1e-6)
+
+
+def test_ramp_tile_and_rate_chain_semantics_regression() -> None:
+    """Regression for the exact production bug (confirmed by reading the code and
+    reproducing against the recorded refusal artifacts): `measure(tile)` closures in
+    this script time a FULL-VOCAB CHAIN against production-sized `w` (`ceil(v / tile)`
+    dispatches), so the chain's total MAC count is ALWAYS n*v*d regardless of tile --
+    dividing by n*tile*d instead (the bug) under-reports the rate by ~v/tile (~1,187x at
+    a tile-128 probe against V=151936), collapsing the ramp and producing a "0 G MAC/s"
+    fiction that made `check_budget` refuse every kernel condition with a projected
+    ~1290 s/dispatch. This fake measure models a kernel whose TRUE, tile-independent
+    achievable rate is HIGH_RATE (a full chain covering all V columns takes the same
+    total time regardless of how it happened to be tiled)."""
+    high_rate = 1_363.4e9
+    start_tile = 128
+
+    def fake_measure(tile: int) -> float:  # noqa: ARG001 -- chain elapsed is tile-independent
+        return N * V * D / high_rate
+
+    # Document the exact symptom: the OLD (buggy) n*tile*d/elapsed formula at the probe
+    # tile would have derived a rate ~V/tile times too low.
+    buggy_elapsed = fake_measure(start_tile)
+    buggy_rate_at_probe_tile = N * start_tile * D / buggy_elapsed
+    assert buggy_rate_at_probe_tile == pytest.approx(high_rate * start_tile / V, rel=1e-9)
+    assert high_rate / buggy_rate_at_probe_tile == pytest.approx(V / start_tile, rel=1e-9)
+
+    # The FIXED arithmetic recovers the true, tile-independent rate and lets the ramp
+    # climb all the way to the production tile -- it does not collapse/get stuck at the
+    # tiny probe tile the way the buggy formula (derived above) would.
+    tile, rate = ramp_tile_and_rate(fake_measure, n=N, d=D, v=V, start_tile=start_tile)
+    assert tile == 8192
+    assert rate == pytest.approx(SAFETY_FACTOR * high_rate, rel=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# script_sha: identity-provenance helper (same convention as
+# ground_truth_atomic_outputs.py's own script_sha -- run_identity's code_sha excludes
+# ad hoc bench scripts, so this is what actually invalidates a stale artifact when THIS
+# script's own logic changes).
+# ---------------------------------------------------------------------------
+
+
+def test_script_sha_is_a_stable_short_hex_digest() -> None:
+    a = script_sha()
+    b = script_sha()
+    assert a == b
+    assert len(a) == 16
+    assert all(c in "0123456789abcdef" for c in a)
