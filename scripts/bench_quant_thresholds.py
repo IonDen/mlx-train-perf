@@ -60,6 +60,7 @@ from mlx_train_perf.core.kernel.launch import (
     forward_quantized,
     probe_tile_for,
 )
+from mlx_train_perf.errors import LaunchBudgetError
 
 N, V, D = 8192, 151936, 4096
 TILE = 8192              # global-constraints vocab tile default; same-tile comparisons only
@@ -209,7 +210,16 @@ def run_condition(condition: str) -> None:
                 return forward(hidden, w_dq, targets, row_tiles=row_tiles, tile=TILE,
                                rate_macs_per_s=rate)
 
-    marginal_peak_gb, walls, active_before_gb = _timed_forward(fn, reps=REPS)
+    try:
+        marginal_peak_gb, walls, active_before_gb = _timed_forward(fn, reps=REPS)
+    except LaunchBudgetError as exc:
+        # A guard refusal IS a result: it means the variant's measured rate cannot run
+        # this tile within the watchdog budget — record it, don't crash the sweep.
+        _write_result(out, ident, "refused", error=str(exc),
+                      calibrated_rate_macs_per_s=round(rate, 1))
+        print(f"{condition}: REFUSED by launch-budget guard "
+              f"(calibrated {rate / 1e9:.0f} G MAC/s) — recorded as a result")
+        return
     med = statistics.median(walls)
     g_mac_per_s = (N * V * D) / med / 1e9
     _write_result(
