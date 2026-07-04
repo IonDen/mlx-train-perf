@@ -21,7 +21,12 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
-mlx-lm = ["mlx-lm>=0.31"]
+# transformers>=5.13 breaks `import mlx_lm` outright: mlx_lm/tokenizer_utils.py:505 calls
+# AutoTokenizer.register("NewlineTokenizer", ...) with a string class name, and
+# transformers 5.13's auto_factory.py:680 requires an actual class object there
+# (AttributeError: 'str' object has no attribute '__module__'). Verified clean on
+# 5.0.0/5.4.0/5.8.0/5.11.0/5.12.0; verified broken on 5.13.0.
+mlx-lm = ["mlx-lm==0.31.3", "transformers>=5.0,<5.13"]
 probe = ["pyobjc-framework-Metal"]
 
 [project.scripts]
@@ -33,7 +38,10 @@ source = "vcs"
 [dependency-groups]
 dev = [
     "pytest>=8", "pytest-cov", "hypothesis", "ruff", "mypy", "basedpyright",
-    "mlx-lm>=0.31", "pyobjc-framework-Metal",
+    # transformers>=5.13 breaks `import mlx_lm` (see the mlx-lm extra above for the
+    # verified-broken/verified-clean version detail); pinned here too since dev installs
+    # both groups.
+    "mlx-lm==0.31.3", "transformers>=5.0,<5.13", "pyobjc-framework-Metal",
 ]
 
 [tool.ruff]
