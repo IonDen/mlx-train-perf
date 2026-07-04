@@ -29,7 +29,10 @@ def test_loss_component_dominates_naive_vanishes_kernel() -> None:
                              lora_layers=2, grad_checkpoint=True, impl="kernel")
     _, comp_n = estimate_peak(s, naive_cfg, calib)
     _, comp_k = estimate_peak(s, kernel_cfg, calib)
-    assert comp_n["loss"] == 2 * 512 * 1000 * 4 * 2
+    # task-13 review item 3: the naive coefficient is now calibrated (measured against
+    # a persisted gate artifact -- see Calibration.naive_loss_bytes_per_nv), replacing
+    # the brief's literal "x2" which under-modeled it by ~1.9x at production shape.
+    assert comp_n["loss"] == int(calib.naive_loss_bytes_per_nv * 2 * 512 * 1000)
     assert comp_k["loss"] < comp_n["loss"] // 100
 
 
@@ -94,18 +97,27 @@ def test_default_budget_uses_this_projects_clamped_wired_cap() -> None:
     assert report.budget_bytes == wired
 
 
-def test_weights_component_prices_only_head_at_quantized_rate() -> None:
-    # Same micro shape as _shape(), but quantized (int4/gs64) -- only the head matrix
-    # (V*D) is priced at the quantized rate; the rest of param_count() stays bf16.
+def test_weights_component_prices_whole_model_at_quantized_rate() -> None:
+    """task-13 review item 2 (controller ruling, supersedes an earlier head-only
+    reading): a quantized ModelShape prices ALL params at the quantized rate (body AND
+    head), not just the V*D head matrix -- real mlx-community 4-bit checkpoints
+    quantize the whole model, and pricing only the head would add a phantom
+    dtype_size-per-param cost for the (dominant) body layers.
+
+    Expected value is INDEPENDENTLY hand-derived using the exact same literal building
+    blocks as test_param_count_hand_computed (64000, 12288, 24576, 128, 64) -- not a
+    call to s.param_count() or any other code path -- so a regression in the
+    implementation can't accidentally still satisfy this assertion.
+    """
     s = ModelShape(vocab=1000, hidden=64, layers=2, intermediate=128, heads=4,
                    kv_heads=2, tied=False, quant_bits=4, quant_group=64)
     calib = load_calibration()
     cfg = TrainConfig(batch=1, seq_len=1, dtype="bfloat16", lora_rank=8, lora_layers=2,
                       grad_checkpoint=True, impl="kernel")
     _, comp = estimate_peak(s, cfg, calib)
-    p_head = s.vocab * s.hidden
-    p_rest = s.param_count() - 2 * p_head  # untied: embed AND head both excluded
-    expected = int(p_rest * 2 + p_head * (4 / 8 + 4 / 64))
+    p_total = 64000 + 64000 + 2 * (12288 + 24576 + 128) + 64  # == 202048
+    rate = 4 / 8 + 4 / 64                                     # bits/8 + 4/group == 0.5625
+    expected = int(p_total * rate)                            # == 113652
     assert comp["weights"] == expected
 
 
@@ -160,3 +172,33 @@ def test_suggestion_is_none_when_nothing_fits_even_at_floor() -> None:
     report = plan_fit(s, cfg, budget_bytes=1000)
     assert not report.fits
     assert report.suggestion is None
+
+
+def test_naive_loss_within_15pct_of_measured_gate_artifact() -> None:
+    """task-13 review item 3: reconciles the naive coefficient against the persisted
+    mlx-train-perf-spike/results/gate_naive_n8192.json artifact (reference-only: read
+    for its recorded numbers, never executed by this project). That gate ran
+    naive_linear_ce under mx.value_and_grad(argnums=(0, 1)) -- a TRAINABLE head, i.e.
+    lora_rank=0 in this planner's terms (gate_trainstep.py's "naive" condition; its
+    nonzero d_w_checksum/d_w_corner fields confirm the head gradient was computed) --
+    at n=8192, V=151936, D=4096, bf16 hidden, measuring marginal_peak_gb=18.547 (GiB,
+    per that script's own `round((peak - active_before) / 1024**3, 3)`).
+
+    Derivation of the calibrated coefficient (see calibration_data.json /
+    Calibration.naive_loss_bytes_per_nv): converting to bytes, measured ~=
+    18.547 * 1024**3 ~= 19,914,689,610. Holding the (separate, unchanged by this item)
+    d_w term V*D*4*2 = 4,978,638,848 fixed, the remaining ~14,936,050,762 bytes divided
+    by n*V = 1,244,659,712 gives ~12.0 bytes per (n, V) pair -- 3 fp32 (N,V)-shaped
+    buffers under MLX's naive autodiff (logits, softmax probabilities, d_logits), not
+    the 2 the brief's literal formula assumed. Body-shape fields (layers/intermediate/
+    heads/kv_heads) are irrelevant to the "loss" component and set to 1 to keep this
+    test isolated to exactly what the artifact measured.
+    """
+    shape = ModelShape(vocab=151936, hidden=4096, layers=1, intermediate=1, heads=1,
+                       kv_heads=1, tied=False, quant_bits=None, quant_group=None)
+    calib = load_calibration()
+    cfg = TrainConfig(batch=1, seq_len=8192, dtype="bfloat16", lora_rank=0, lora_layers=0,
+                      grad_checkpoint=True, impl="naive")
+    _, comp = estimate_peak(shape, cfg, calib)
+    measured_bytes = 18.547 * 1024**3
+    assert abs(comp["loss"] - measured_bytes) / measured_bytes < 0.15
