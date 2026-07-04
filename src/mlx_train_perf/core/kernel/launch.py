@@ -1,7 +1,18 @@
 """Chained-launch driver for the dense MMA kernel. Full buffers + in-kernel offsets —
 Python-side w[v0:v1] slices into chained launches cost 1.22 GB of retained copies
-(measured; user-metal-kernels workflow-and-gotchas.md)."""
+(measured; user-metal-kernels workflow-and-gotchas.md).
+
+Rate calibration ramps through a sequence of probe tiles rather than trusting a single
+cold dispatch: Apple's GPU DVFS needs sustained work over roughly a second to reach peak
+clocks, and a small probe tile starves occupancy, so a lone tile-128 micro-probe measured
+the production-tile rate wrong by up to ~3.6x and once projected a safe dispatch as
+over-budget. Each ramp stage times one dispatch, projects the next (larger) tile from
+that stage's own rate, and stops once the projection stops growing; the final stage then
+runs extra sustained dispatches to reach ramped clocks before taking a median-of-3 timed
+measurement at the tile the production dispatch will actually use."""
 import functools
+import math
+import statistics
 import time
 from collections.abc import Callable
 from typing import cast
@@ -19,7 +30,7 @@ FLOOR_RATE = 10e9        # G MAC/s floor: v0-class, slowest rate ever measured f
 SAFETY_FACTOR = 0.5      # halve the measured rate: covers session drift (~12% measured) plus
                          # probe-timing noise with a deliberate 2x margin; costs nothing —
                          # production dispatches sit ~10x under budget even at half rate
-_RATE_CACHE: dict[tuple[int, str, int], float] = {}
+_RATE_CACHE: dict[tuple[str, int, str, int], float] = {}
 
 
 def _n_bucket(n: int) -> int:
@@ -143,29 +154,141 @@ def probe_tile_for(*, n: int, d: int, floor_rate: float = FLOOR_RATE,
     return max(tile, 32)
 
 
-def calibrated_rate(*, row_tiles: int, dtype: mx.Dtype, n: int, d: int, v: int) -> float:
-    """Micro-probe the kernel at the caller's real n (small-n rates underestimate large-n
-    rates due to occupancy), sized safe by probe_tile_for's floor-rate guard, then apply
-    SAFETY_FACTOR. Cached per (row_tiles, dtype, n-bucket) so repeated calls at the same
-    occupancy regime don't re-dispatch the probe."""
-    key = (row_tiles, str(dtype), _n_bucket(n))
-    if key in _RATE_CACHE:
-        return _RATE_CACHE[key]
-    probe_tile = min(probe_tile_for(n=n, d=d), v)
+def next_probe_tile(*, rate_macs_per_s: float, n: int, d: int, v: int,
+                    budget_s: float = MAX_DISPATCH_SECONDS) -> int:
+    """Largest power-of-two tile <= min(8192, v) whose projected dispatch time at
+    rate_macs_per_s stays within budget_s. Callers pass the SAFETY_FACTOR-halved rate;
+    `calibrate`'s ramp uses this the same way to size the NEXT probe one stage ahead of
+    what it has actually measured. Floors at 32 even if that tile still projects over
+    budget — refusing an over-budget dispatch is `check_budget`'s job, not this sizing
+    heuristic's."""
+    cap = min(8192, v)
+    tile = (1 << (cap.bit_length() - 1)) if cap >= 1 else 32
+    tile = max(tile, 32)
+    while tile > 32 and n * tile * d / rate_macs_per_s > budget_s:
+        tile //= 2
+    return tile
+
+
+def sustain_reps(*, per_dispatch_s: float, target_s: float = 0.75, cap: int = 8) -> int:
+    """Extra back-to-back dispatches needed for cumulative sustained work to reach
+    target_s. Apple's GPU DVFS needs on the order of a second of continuous load to ramp
+    from cold to peak clocks; a single dispatch, however long, only ever runs at whatever
+    clock state the GPU happened to already be in. Floors at 1 (always sustain past the
+    rate-measuring dispatch itself); caps at 8 (bounds calibration wall time for a kernel
+    fast enough that target_s would otherwise demand hundreds of reps)."""
+    if per_dispatch_s <= 0:
+        return cap
+    reps = math.ceil(target_s / per_dispatch_s)
+    return min(max(reps, 1), cap)
+
+
+def calibrate(*, measure: Callable[[int], float], n: int, d: int, v: int,
+             start_tile: int, max_stages: int = 3) -> float:
+    """Ramp through probe tiles under real (or, in unit tests, fake) dispatch timings
+    rather than trusting one cold, occupancy-starved measurement. Each stage times a
+    single dispatch at the current tile and projects a (SAFETY_FACTOR-conservative) next
+    tile from that stage's own rate, advancing only while the projection keeps growing —
+    a kernel already at its safe production tile converges in one stage instead of
+    burning the whole ramp. The final tile then gets extra sustained dispatches (see
+    `sustain_reps`) to reach ramped clocks, and the reported rate is the MEDIAN of 3 timed
+    dispatches at that tile: a single sample is exactly the un-ramped, occupancy-starved
+    measurement this function exists to avoid. Returns the raw (un-halved) rate — the
+    caller applies SAFETY_FACTOR."""
+    tile = start_tile
+    per_dispatch_s = 0.0
+    for _stage in range(max_stages):
+        per_dispatch_s = measure(tile)
+        raw_rate = n * tile * d / max(per_dispatch_s, 1e-9)
+        candidate = next_probe_tile(rate_macs_per_s=SAFETY_FACTOR * raw_rate, n=n, d=d, v=v)
+        if candidate <= tile:
+            break
+        tile = candidate
+    for _rep in range(sustain_reps(per_dispatch_s=per_dispatch_s)):
+        measure(tile)
+    timings = [measure(tile) for _ in range(3)]
+    median_s = statistics.median(timings)
+    return n * tile * d / max(median_s, 1e-9)
+
+
+def _probe_hidden(*, dtype: mx.Dtype, n: int, d: int) -> mx.array:
     # Random probe data, NOT zeros: all-zero buffers are the best case for Apple's
     # lossless memory compression and could optimistically bias this safety-relevant
     # rate (T8 review finding). Seeded for determinism.
     mx.random.seed(0)
     hidden = mx.random.normal((n, d)).astype(dtype)
-    w = (mx.random.normal((probe_tile, d)) * 0.05).astype(dtype)
-    targets = mx.random.randint(0, probe_tile, (n,))
-    # dispatch 1 pays the Metal JIT; time dispatch 2 only
-    for _timed in (False, True):
+    mx.eval(hidden)
+    return hidden
+
+
+def calibrated_rate(*, row_tiles: int, dtype: mx.Dtype, n: int, d: int, v: int) -> float:
+    """Ramped, sustained-load calibration for the dense kernel at the caller's real n
+    (small-n rates underestimate large-n rates due to occupancy) — see the module
+    docstring for why this ramps instead of micro-probing once. Cached per
+    (row_tiles, dtype, n-bucket) so repeated calls at the same occupancy regime don't
+    re-run the calibration."""
+    key = ("dense", row_tiles, str(dtype), _n_bucket(n))
+    if key in _RATE_CACHE:
+        return _RATE_CACHE[key]
+    hidden = _probe_hidden(dtype=dtype, n=n, d=d)
+    probes: dict[int, tuple[mx.array, mx.array]] = {}
+
+    def measure(tile: int) -> float:
+        if tile not in probes:
+            w = (mx.random.normal((tile, d)) * 0.05).astype(dtype)
+            targets = mx.random.randint(0, tile, (n,))
+            mx.eval(w, targets)
+            probes[tile] = (w, targets)
+            # Metal JIT compiles on the first dispatch at a new tile, and GPU clocks/
+            # caches are cold — this dispatch is deliberately unmeasured.
+            lse, tgt = forward(hidden, w, targets, row_tiles=row_tiles, tile=tile,
+                               rate_macs_per_s=None)
+            mx.eval(lse, tgt)
+        w, targets = probes[tile]
         t0 = time.perf_counter()
-        lse, tgt = forward(hidden, w, targets, row_tiles=row_tiles, tile=probe_tile,
+        lse, tgt = forward(hidden, w, targets, row_tiles=row_tiles, tile=tile,
                            rate_macs_per_s=None)
         mx.eval(lse, tgt)
-        elapsed = time.perf_counter() - t0
-    rate = SAFETY_FACTOR * (n * probe_tile * d) / max(elapsed, 1e-9)
+        return time.perf_counter() - t0
+
+    start_tile = min(probe_tile_for(n=n, d=d), v)
+    rate = SAFETY_FACTOR * calibrate(measure=measure, n=n, d=d, v=v, start_tile=start_tile)
+    _RATE_CACHE[key] = rate
+    return rate
+
+
+def calibrated_rate_quantized(*, row_tiles: int, dtype: mx.Dtype, n: int, d: int, v: int) -> float:
+    """Same ramped, sustained-load calibration as `calibrated_rate`, but the probe head is
+    quantized (int4, group_size=64 — the only configuration `forward_quantized` supports)
+    and measured through `forward_quantized`. This is the calibration path production
+    code uses for the quantized kernel."""
+    key = ("quantized", row_tiles, str(dtype), _n_bucket(n))
+    if key in _RATE_CACHE:
+        return _RATE_CACHE[key]
+    hidden = _probe_hidden(dtype=dtype, n=n, d=d)
+    probes: dict[int, tuple[QuantSpec, mx.array]] = {}
+
+    def measure(tile: int) -> float:
+        if tile not in probes:
+            w = (mx.random.normal((tile, d)) * 0.05).astype(dtype)
+            targets = mx.random.randint(0, tile, (n,))
+            w_q, scales, biases = mx.quantize(w, group_size=64, bits=4)
+            mx.eval(w_q, scales, biases, targets)
+            q = QuantSpec(w_q=w_q, scales=scales, biases=biases, group_size=64, bits=4)
+            probes[tile] = (q, targets)
+            # Metal JIT compiles on the first dispatch at a new tile, and GPU clocks/
+            # caches are cold — this dispatch is deliberately unmeasured.
+            lse, tgt = forward_quantized(hidden, q, targets, row_tiles=row_tiles, tile=tile,
+                                         rate_macs_per_s=None)
+            mx.eval(lse, tgt)
+        q, targets = probes[tile]
+        t0 = time.perf_counter()
+        lse, tgt = forward_quantized(hidden, q, targets, row_tiles=row_tiles, tile=tile,
+                                     rate_macs_per_s=None)
+        mx.eval(lse, tgt)
+        return time.perf_counter() - t0
+
+    start_tile = min(probe_tile_for(n=n, d=d), v)
+    rate = SAFETY_FACTOR * calibrate(measure=measure, n=n, d=d, v=v, start_tile=start_tile)
     _RATE_CACHE[key] = rate
     return rate

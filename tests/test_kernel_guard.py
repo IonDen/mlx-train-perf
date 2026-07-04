@@ -1,6 +1,9 @@
+from collections.abc import Callable
+
 import mlx.core as mx
 import pytest
 
+from mlx_train_perf.core.kernel import launch
 from mlx_train_perf.core.kernel.launch import (
     calibrated_rate,
     check_budget,
@@ -48,3 +51,51 @@ def test_forward_with_calibrated_rate_runs_small_shape() -> None:
     rate = calibrated_rate(row_tiles=4, dtype=mx.bfloat16, n=64, d=32, v=1000)
     lse, _tgt = forward(hidden, w, t, row_tiles=4, tile=1000, rate_macs_per_s=rate)
     assert bool(mx.isfinite(lse).all().item())
+
+
+def _count_calibrate_calls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> Callable[[], int]:
+    """Monkeypatches launch.calibrate with a call-counting wrapper (same signature) and
+    resets the module rate cache so the count reflects only THIS test's calls — a test
+    that could pass on a warm cache from another test's key would be unable to fail."""
+    monkeypatch.setattr(launch, "_RATE_CACHE", {})
+    calls = 0
+    real_calibrate = launch.calibrate
+
+    def counting_calibrate(
+        *, measure: Callable[[int], float], n: int, d: int, v: int, start_tile: int,
+        max_stages: int = 3,
+    ) -> float:
+        nonlocal calls
+        calls += 1
+        return real_calibrate(
+            measure=measure, n=n, d=d, v=v, start_tile=start_tile, max_stages=max_stages,
+        )
+
+    monkeypatch.setattr(launch, "calibrate", counting_calibrate)
+    return lambda: calls
+
+
+@pytest.mark.metal
+def test_calibrated_rate_dense_positive_and_cache_hit_skips_calibration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    call_count = _count_calibrate_calls(monkeypatch)
+    r1 = launch.calibrated_rate(row_tiles=4, dtype=mx.bfloat16, n=64, d=64, v=1024)
+    r2 = launch.calibrated_rate(row_tiles=4, dtype=mx.bfloat16, n=64, d=64, v=1024)
+    assert r1 > 0
+    assert r1 == r2                 # cache hit returns the identical value
+    assert call_count() == 1        # ... without a second calibration run
+
+
+@pytest.mark.metal
+def test_calibrated_rate_quantized_positive_and_cache_hit_skips_calibration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    call_count = _count_calibrate_calls(monkeypatch)
+    r1 = launch.calibrated_rate_quantized(row_tiles=4, dtype=mx.bfloat16, n=64, d=64, v=1024)
+    r2 = launch.calibrated_rate_quantized(row_tiles=4, dtype=mx.bfloat16, n=64, d=64, v=1024)
+    assert r1 > 0
+    assert r1 == r2                 # cache hit returns the identical value
+    assert call_count() == 1        # ... without a second calibration run
