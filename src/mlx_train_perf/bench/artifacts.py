@@ -39,6 +39,7 @@ CODE_SHA_DEPS: tuple[Path, ...] = tuple(
         "bench/worker.py",
         "core/loss.py",
         "core/chunked.py",
+        "core/naive.py",
         "core/kernel/launch.py",
         "core/kernel/dispatch.py",
         "core/kernel/source.py",
@@ -85,8 +86,14 @@ def run_identity(**kw: object) -> dict[str, object]:
     version (informational only), plus whatever identity-relevant kwargs the caller
     supplies (condition kind, grid point, dtype, impl, tile/chunk, session_id, ...). Two
     calls returning equal dicts describe the SAME run in every way that matters for
-    reuse; any difference is what `result_is_fresh` treats as staleness."""
-    return {
+    reuse; any difference is what `result_is_fresh` treats as staleness.
+
+    A caller kwarg that happens to reuse one of THIS function's own internal field names
+    (e.g. a condition param literally named `code_sha`) would otherwise silently hijack
+    that field via `{**internal, **kw}` -- caught here by checking for overlap against
+    `internal`'s own keys directly, so the guard can never drift out of sync with the
+    field list (unlike a separately maintained reserved-name constant)."""
+    internal: dict[str, object] = {
         "schema_version": SCHEMA_VERSION,
         "mlx_version": _installed_mlx_version(),
         "mlx_lm_version": _installed_mlx_lm_version(),
@@ -94,8 +101,14 @@ def run_identity(**kw: object) -> dict[str, object]:
         "macos": platform.mac_ver()[0],
         "code_sha": _code_sha(CODE_SHA_DEPS),
         "package_version": version("mlx-train-perf"),
-        **kw,
     }
+    collision = set(kw) & internal.keys()
+    if collision:
+        raise BenchInputError(
+            f"condition params must not use reserved identity key(s) {sorted(collision)} "
+            "-- computed internally by run_identity"
+        )
+    return {**internal, **kw}
 
 
 def condition_identity(
