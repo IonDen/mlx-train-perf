@@ -1,18 +1,18 @@
 """Bench worker: the subprocess entry point for exactly one `Condition`, invoked by
 `runner.run_conditions` as `python -m mlx_train_perf.bench.worker --config <path>`.
 
-Guardrail-reassert note for the FUTURE `train_step` condition kind (Task 17 -- recorded
-here now so that task doesn't have to re-derive it): `mlx_lm.tuner.trainer.train()` raises
-the wired limit to the device max AT ENTRY
-(site-packages/mlx_lm/tuner/trainer.py:229-230) and then blocks until the training loop
-finishes. A worker that calls `install_guardrails()` once before `train()` and again after
-it returns protects nothing in between -- the stricter cap is silently overridden for the
-entire run. The re-assert has to live INSIDE the loop: the loss callable handed to
-`train(...)` calls `install_guardrails()` on its own first invocation (a one-shot flag),
-and the worker records the OBSERVED wired limit mid-run in its artifact so a cap
-regression is visible rather than assumed away (drive the step loop manually instead of
-calling `train()` if that callback point proves awkward). 0.1.0 only implements the
-`loss_layer` kind below, which never calls `train()`, so this hazard does not apply yet.
+Guardrail-reassert note for the training-step condition kind, which lands with the
+end-to-end benches: `mlx_lm.tuner.trainer.train()` raises the wired limit to the device
+max AT ENTRY (site-packages/mlx_lm/tuner/trainer.py:229) and then blocks until the
+training loop finishes. A worker that calls `install_guardrails()` once before `train()`
+and again after it returns protects nothing in between -- the stricter cap is silently
+overridden for the entire run. The re-assert has to live INSIDE the loop: the loss
+callable handed to `train(...)` calls `install_guardrails()` on its own first invocation
+(a one-shot flag), and the worker records the OBSERVED wired limit mid-run in its
+artifact so a cap regression is visible rather than assumed away (drive the step loop
+manually instead of calling `train()` if that callback point proves awkward). 0.1.0 only
+implements the `loss_layer` kind below, which never calls `train()`, so this hazard does
+not apply yet.
 """
 import argparse
 import json
@@ -23,7 +23,7 @@ from typing import Literal, cast
 
 import mlx.core as mx
 
-from mlx_train_perf.bench.artifacts import run_identity, write_result
+from mlx_train_perf.bench.artifacts import condition_identity, write_result
 from mlx_train_perf.core.guards import install_guardrails
 from mlx_train_perf.core.loss import DenseHead, HeadRef, QuantizedHead, linear_cross_entropy
 from mlx_train_perf.errors import LaunchBudgetError, MlxTrainPerfError
@@ -115,7 +115,7 @@ def main(argv: list[str] | None = None) -> int:
 
     install_guardrails()  # FIRST -- before any allocation this condition makes
 
-    ident = run_identity(kind=kind, session_id=session_id, **params)
+    ident = condition_identity(kind=kind, session_id=session_id, params=params)
     if kind != "loss_layer":
         # Deliberately uncaught: an unsupported kind is a program error (a bad Condition
         # was constructed), not a recorded run outcome -- it crashes this worker process

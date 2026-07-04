@@ -13,15 +13,16 @@ from pathlib import Path
 
 import pytest
 
-from mlx_train_perf.bench import artifacts, worker
+from mlx_train_perf.bench import artifacts, runner, worker
 from mlx_train_perf.bench.artifacts import (
+    condition_identity,
     new_session_id,
     result_is_fresh,
     run_identity,
     write_result,
 )
 from mlx_train_perf.bench.runner import Condition, report, run_conditions
-from mlx_train_perf.errors import LaunchBudgetError, MlxTrainPerfError
+from mlx_train_perf.errors import BenchInputError, LaunchBudgetError, MlxTrainPerfError
 
 # --- Task 14 brief's mandated Step 1 tests (verbatim) -----------------------------
 
@@ -72,9 +73,43 @@ def test_run_identity_carries_environment_facts_and_caller_kwargs() -> None:
     assert ident["mlx_version"]
     assert ident["machine"]
     assert ident["macos"] or ident["macos"] == ""  # mac_ver() can be '' off-macOS
+    assert ident["code_sha"]
     assert ident["package_version"]
     assert ident["model"] == "m"
     assert ident["session_id"] == "s1"
+
+
+def test_code_sha_changes_when_a_dep_file_changes_and_flips_freshness(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`result_is_fresh` must NOT serve a stale artifact after a measured-path file
+    changes -- an installed `importlib.metadata.version` is hatch-vcs tag-derived and
+    only refreshes on an explicit reinstall (NOT on every `uv sync`), so it alone cannot
+    catch this. `code_sha` is computed over a DECLARED dep list (monkeypatched here to an
+    isolated tmp file so the test never touches the real source tree)."""
+    dep = tmp_path / "fake_dep.py"
+    dep.write_text("VALUE = 1\n")
+    monkeypatch.setattr(artifacts, "CODE_SHA_DEPS", (dep,))
+
+    ident_before = run_identity(model="m", session_id="s1")
+    p = tmp_path / "r.json"
+    write_result(p, ident_before, "ok", g_mac_per_s=1.0)
+    assert result_is_fresh(p, ident_before)
+
+    dep.write_text("VALUE = 2\n")  # byte-change the "measured path" dependency
+    ident_after = run_identity(model="m", session_id="s1")
+    assert ident_after["code_sha"] != ident_before["code_sha"]
+    assert not result_is_fresh(p, ident_after)
+
+
+def test_condition_identity_rejects_reserved_param_key_kind() -> None:
+    with pytest.raises(BenchInputError, match="kind"):
+        condition_identity(kind="loss_layer", session_id="s1", params={"kind": "oops"})
+
+
+def test_condition_identity_rejects_reserved_param_key_session_id() -> None:
+    with pytest.raises(BenchInputError, match="session_id"):
+        condition_identity(kind="loss_layer", session_id="s1", params={"session_id": "oops"})
 
 
 def test_installed_mlx_lm_version_is_none_when_absent(
@@ -98,13 +133,33 @@ def test_write_result_is_atomic_no_tmp_file_left_behind(tmp_path: Path) -> None:
 # --- report(): same-session ratio computed when identities otherwise match --------
 
 
+def test_ratio_label_and_value_none_on_non_numeric_or_missing_wall_time() -> None:
+    assert runner._ratio_label_and_value("kernel", "naive", None, 1.0) is None
+    assert runner._ratio_label_and_value("kernel", "naive", "n/a", 1.0) is None
+
+
+def test_ratio_label_and_value_none_on_zero_wall_time() -> None:
+    assert runner._ratio_label_and_value("kernel", "naive", 0.0, 1.0) is None
+
+
 def test_report_computes_ratio_within_one_session(tmp_path: Path) -> None:
     a, b = tmp_path / "a.json", tmp_path / "b.json"
     write_result(a, run_identity(model="m", impl="kernel", session_id="s1"), "ok", wall_s=1.0)
     write_result(b, run_identity(model="m", impl="naive", session_id="s1"), "ok", wall_s=4.0)
     rep = report([a, b])
     assert rep["cross_session_excluded"] == []
-    assert rep["ratios"] == {"kernel/naive": pytest.approx(4.0)}
+    # keyed by MEASURED speed (naive is 4x slower), not alphabetical order
+    assert rep["ratios"] == {"naive/kernel": pytest.approx(4.0)}
+
+
+def test_report_ratio_direction_is_by_measured_speed_not_alphabetical(tmp_path: Path) -> None:
+    a, b = tmp_path / "a.json", tmp_path / "b.json"
+    # "chunked" sorts BEFORE "kernel" alphabetically, but chunked is the SLOWER impl here
+    # -- an alphabetical convention would silently mislabel this comparison's direction.
+    write_result(a, run_identity(model="m", impl="chunked", session_id="s1"), "ok", wall_s=4.0)
+    write_result(b, run_identity(model="m", impl="kernel", session_id="s1"), "ok", wall_s=1.0)
+    rep = report([a, b])
+    assert rep["ratios"] == {"chunked/kernel": pytest.approx(4.0)}
 
 
 def test_report_skips_pairs_with_the_same_impl(tmp_path: Path) -> None:
@@ -160,7 +215,7 @@ def test_run_conditions_skips_fresh_without_spawning_a_subprocess(
     session_id = new_session_id()
     condition = _tiny_loss_layer("naive_tiny")
     out_path = tmp_path / f"{condition.name}.json"
-    ident = run_identity(kind=condition.kind, session_id=session_id, **condition.params)
+    ident = condition_identity(kind=condition.kind, session_id=session_id, params=condition.params)
     write_result(out_path, ident, "ok", wall_s=0.01, g_mac_per_s=1.0)
 
     def _must_not_spawn(*_args: object, **_kwargs: object) -> None:
@@ -180,6 +235,35 @@ def test_run_conditions_records_error_envelope_on_worker_crash(tmp_path: Path) -
     assert data["status"] == "error"
     assert data["error_type"]
     assert data["error_msg"]
+
+
+def test_run_conditions_reserved_param_key_is_a_typed_error(tmp_path: Path) -> None:
+    bad = Condition(name="bad", kind="loss_layer", params={"kind": "oops"})
+    with pytest.raises(BenchInputError):
+        run_conditions([bad], tmp_path, session_id="s1")
+
+
+def test_run_conditions_records_error_when_worker_exits_zero_without_artifact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stub worker standing in for the real one: exits cleanly but writes nothing --
+    e.g. a worker that silently swallowed its own crash. Must be recorded as an error,
+    not treated as an implicit success just because the process exited 0."""
+    stub = tmp_path / "silent_stub_worker.py"
+    stub.write_text("import sys\nsys.exit(0)\n")
+
+    def _spawn_stub(config_path: Path) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, str(stub), "--config", str(config_path)],
+            capture_output=True, text=True, check=False,
+        )
+
+    monkeypatch.setattr(runner, "_spawn_worker", _spawn_stub)
+    condition = _tiny_loss_layer("silent_stub")
+    paths = run_conditions([condition], tmp_path, session_id=new_session_id())
+    data = json.loads(paths[0].read_text())
+    assert data["status"] == "error"
+    assert data["error_type"] == "WorkerExitedWithoutArtifact"
 
 
 # --- worker.py: pure(ish) measurement + CLI shell, tiny shapes, no Metal marker ----
@@ -204,6 +288,16 @@ def test_run_loss_layer_quantized_chunked_runs() -> None:
 def test_run_loss_layer_unknown_dtype_is_typed_error() -> None:
     with pytest.raises(MlxTrainPerfError):
         worker.run_loss_layer({"n": 8, "d": 4, "v": 16, "dtype": "bogus", "impl": "naive"})
+
+
+def test_worker_main_reserved_param_key_is_a_typed_error(tmp_path: Path) -> None:
+    cfg = tmp_path / "config.json"
+    cfg.write_text(json.dumps({
+        "kind": "loss_layer", "params": {"session_id": "oops"}, "session_id": "s1",
+        "out": str(tmp_path / "r.json"),
+    }))
+    with pytest.raises(BenchInputError):
+        worker.main(["--config", str(cfg)])
 
 
 def test_worker_main_writes_ok_artifact(tmp_path: Path) -> None:

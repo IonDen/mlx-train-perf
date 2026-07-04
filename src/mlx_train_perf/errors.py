@@ -32,3 +32,7 @@ class AdapterError(MlxTrainPerfError):
 
 class MissingDependencyError(MlxTrainPerfError):
     """A lazily-imported optional dependency is absent."""
+
+
+class BenchInputError(MlxTrainPerfError):
+    """Bench condition input validation failure (e.g. a reserved identity param key)."""
