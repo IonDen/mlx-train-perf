@@ -106,7 +106,7 @@ def _dense_probe_inputs() -> list[mx.array]:
 def _capture_generated_msl(
     msl_body: str, *, header: str, input_names: Sequence[str], inputs: Sequence[mx.array],
     output_names: Sequence[str], output_shapes: Sequence[tuple[int, ...]],
-    output_dtypes: Sequence[mx.Dtype],
+    output_dtypes: Sequence[mx.Dtype], atomic_outputs: bool,
 ) -> str:
     """Launch `msl_body` once, at the tiny probe shape, as a real kernel with
     `verbose=True`, and return the cleaned MSL text the JIT actually compiled.
@@ -118,7 +118,16 @@ def _capture_generated_msl(
     grid/threadgroup shape, but a body with a genuinely different output contract (e.g.
     the backward kernel's single `d_hidden_out`) needs its own declaration too. The
     probe's own leading dimension (row count) must match `_PROBE_N` for a caller reusing
-    the default output shapes to stay valid."""
+    the default output shapes to stay valid.
+
+    `atomic_outputs` must match what the real kernel is built with: it changes the
+    OUTPUT's generated type (`device atomic<T>*` vs plain `device T*` -- see
+    `core/kernel/source.py`'s d_w derivation comment), so a probe of an atomic-output body
+    (e.g. `build_backward_dw_source`) with this left False would recompile the WRONG
+    generated MSL. `init_value=0.0` is passed unconditionally for the probe launch itself
+    (harmless for non-atomic bodies, since the probe's fixed grid always covers every
+    probe-shape output element; required for atomic bodies, whose accumulate primitives
+    need a defined starting value rather than uninitialized memory)."""
     kernel = cast(
         _MetalKernel,
         mx.fast.metal_kernel(
@@ -127,6 +136,7 @@ def _capture_generated_msl(
             output_names=list(output_names),
             source=msl_body,
             header=header,
+            atomic_outputs=atomic_outputs,
         ),
     )
     with _capture_fd_stdout() as buf:
@@ -137,6 +147,7 @@ def _capture_generated_msl(
             threadgroup=(32, 8, 1),
             output_shapes=list(output_shapes),
             output_dtypes=list(output_dtypes),
+            init_value=0.0,
             verbose=True,
         )
         mx.eval(out)
@@ -158,6 +169,7 @@ def compiled_ceiling(
     output_names: Sequence[str] | None = None,
     output_shapes: Sequence[tuple[int, ...]] | None = None,
     output_dtypes: Sequence[mx.Dtype] | None = None,
+    atomic_outputs: bool = False,
 ) -> int:
     """Compile-time register-pressure telltale for a kernel body (see the module
     docstring for exact semantics -- diagnostic only, never a performance verdict).
@@ -198,6 +210,20 @@ def compiled_ceiling(
             output_shapes=[(n, d)],
             output_dtypes=[mx.float32],
         )
+
+    ...and the d_w kernel needs both the output triple AND `atomic_outputs=True` (its
+    single `d_w_out` output is a native Metal `device atomic<float>*`, not a plain
+    `device float*` -- omitting this would recompile the WRONG generated MSL)::
+
+        compiled_ceiling(
+            build_backward_dw_source(4),
+            input_names=["hidden", "w", "targets", "offs", "lse", "cotangent"],
+            inputs=[hidden, w, targets, offs, lse, cotangent],
+            output_names=["d_w_out"],
+            output_shapes=[(v, d)],
+            output_dtypes=[mx.float32],
+            atomic_outputs=True,
+        )
     """
     if (input_names is None) != (inputs is None):
         raise ValueError(
@@ -231,6 +257,7 @@ def compiled_ceiling(
     msl = _capture_generated_msl(
         msl_body, header=header, input_names=names, inputs=probe_inputs,
         output_names=out_names, output_shapes=out_shapes, output_dtypes=out_dtypes,
+        atomic_outputs=atomic_outputs,
     )
     device = Metal.MTLCreateSystemDefaultDevice()
     options = Metal.MTLCompileOptions.new()

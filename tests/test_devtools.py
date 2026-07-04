@@ -6,6 +6,7 @@ import pytest
 from mlx_train_perf.core.kernel.source import (
     QUANT_HELPERS,
     build_backward_dhidden_source,
+    build_backward_dw_source,
     build_dense_source,
     build_quant_source,
 )
@@ -149,4 +150,33 @@ def test_backward_dhidden_kernel_ceiling_is_plausible() -> None:
         output_dtypes=[mx.float32],
     )
     print(f"backward d_hidden RT=4 compiled ceiling (observed): {ceiling}")
+    assert 0 < ceiling <= 1024
+
+
+@pytest.mark.metal
+def test_backward_dw_kernel_ceiling_is_plausible() -> None:
+    # The d_w kernel's output is ATOMIC-typed (`device atomic<float>*`, not plain
+    # `device float*`) -- this is the capability `atomic_outputs=True` exists for. Same
+    # (hidden, w, targets, offs, lse, cotangent) input contract as d_hidden minus
+    # d_hidden_in (d_w needs no cross-tile accumulator chain -- see source.py's derivation
+    # comment), and the output is a single (v, d) fp32 d_w_out.
+    n, d, v = 8, 32, 16
+    mx.random.seed(2)
+    hidden = mx.random.normal((n, d)).astype(mx.bfloat16)
+    w = (mx.random.normal((v, d)) * 0.05).astype(mx.bfloat16)
+    targets = mx.random.randint(0, v, (n,))
+    offs = mx.array([0, v], dtype=mx.uint32)
+    lse = mx.full((n,), float("-inf"), dtype=mx.float32)
+    cotangent = mx.full((n,), 1.0 / n, dtype=mx.float32)
+    mx.eval(hidden, w, targets, offs, lse, cotangent)
+    ceiling = compiled_ceiling(
+        build_backward_dw_source(4),
+        input_names=["hidden", "w", "targets", "offs", "lse", "cotangent"],
+        inputs=[hidden, w, targets, offs, lse, cotangent],
+        output_names=["d_w_out"],
+        output_shapes=[(v, d)],
+        output_dtypes=[mx.float32],
+        atomic_outputs=True,
+    )
+    print(f"backward d_w RT=4 compiled ceiling (observed): {ceiling}")
     assert 0 < ceiling <= 1024
