@@ -53,6 +53,25 @@ def test_kernel_rejects_unsupported_hidden_dtype() -> None:
     assert "chunked" in str(ei.value)
 
 
+def test_explicit_kernel_impl_rejects_unsupported_hidden_dtype_same_as_auto() -> None:
+    # pins the interpretive call that impl="kernel" gates identically to "auto" -- both
+    # attempt the kernel and both refuse the same unsupported config, rather than an
+    # explicit "kernel" request bypassing the support gate.
+    _, head, _ = _dense()
+    with pytest.raises(UnsupportedHeadError) as ei:
+        resolve_impl(head=head, dtype=mx.float16, n=512, impl="kernel")
+    assert "chunked" in str(ei.value)
+
+
+def test_explicit_kernel_impl_refuses_unverified_mlx_same_as_auto(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("mlx_train_perf._compat._installed_mlx_version", lambda: "0.99.0")
+    _, head, _ = _dense()
+    with pytest.raises(UnverifiedMlxError):
+        resolve_impl(head=head, dtype=mx.float32, n=512, impl="kernel")
+
+
 def test_kernel_rejects_quantized_bits_other_than_4() -> None:
     q = QuantizedHead(w_q=mx.zeros((8, 8), dtype=mx.uint32), scales=mx.ones((8, 1)),
                       biases=mx.zeros((8, 1)), group_size=64, bits=8)  # bits=8 unsupported
@@ -99,6 +118,17 @@ def test_target_out_of_range_is_typed_error() -> None:
     hidden, head, _ = _dense()
     with pytest.raises(LossInputError):
         linear_cross_entropy(hidden, head, mx.full((32,), 100, dtype=mx.int32), impl="naive")
+
+
+def test_targets_non_integer_dtype_is_typed_error() -> None:
+    # a float targets array truncates through the 0<=t<V range check instead of failing
+    # cleanly, then errors deeper (e.g. inside take_along_axis/the kernel) with a much
+    # less clear message -- catch it up front, naming the offending dtype.
+    hidden, head, _ = _dense()
+    targets = mx.zeros((32,), dtype=mx.float32)
+    with pytest.raises(LossInputError) as ei:
+        linear_cross_entropy(hidden, head, targets, impl="naive")
+    assert "float32" in str(ei.value)
 
 
 def test_hidden_wrong_ndim_is_typed_error() -> None:
@@ -283,7 +313,8 @@ def test_kernel_impl_nonuniform_cotangent_parity(monkeypatch: pytest.MonkeyPatch
 
 
 @pytest.mark.metal
-def test_kernel_impl_quantized_head_d_hidden_parity() -> None:
+def test_kernel_impl_quantized_head_d_hidden_parity(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("mlx_train_perf._compat._installed_mlx_version", lambda: "0.31.2")
     mx.random.seed(23)
     n, d, v = 64, 128, 1024
     hidden = mx.random.normal((n, d)).astype(mx.bfloat16)
@@ -305,6 +336,42 @@ def test_kernel_impl_quantized_head_d_hidden_parity() -> None:
     # test_chunked.py's quantized d_hidden gate); the 2e-2 placeholder was never this loose
     # in practice.
     assert mx.abs(g.astype(mx.float32) - r.astype(mx.float32)).max().item() < 4e-5
+
+
+@pytest.mark.metal
+def test_kernel_impl_quantized_forward_value_parity_and_no_aux_leak(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Quantized twin of test_kernel_impl_forward_value_parity_and_no_aux_leak:
+    `_kernel_nll_quantized`'s `return lse - tgt, lse, tgt` line is otherwise never checked
+    by VALUE through the public API -- the launch-level quantized parity tests recompute
+    lse-tgt themselves, and the gradient parity test above never reads nll at all, so a
+    sign/scale flip there would escape every other net."""
+    monkeypatch.setattr("mlx_train_perf._compat._installed_mlx_version", lambda: "0.31.2")
+    mx.random.seed(23)
+    n, d, v = 64, 128, 1024
+    hidden = mx.random.normal((n, d)).astype(mx.bfloat16)
+    w = (mx.random.normal((v, d)) * 0.05).astype(mx.bfloat16)
+    targets = mx.random.randint(0, v, (n,))
+    w_q, scales, biases = mx.quantize(w, group_size=64, bits=4)
+    qhead = QuantizedHead(w_q=w_q, scales=scales, biases=biases)
+    w_dq = mx.dequantize(w_q, scales, biases, group_size=64, bits=4)
+    ref = naive_linear_ce(hidden, w_dq, targets)
+
+    out = linear_cross_entropy(hidden, qhead, targets, impl="kernel", reduction="none")
+    assert isinstance(out, mx.array) and out.shape == (64,)  # noqa: PT018 — single array, no aux tuple
+    # measured worst 3.5644e-3 -> pin 9e-3 (~2.6x margin); same bf16-dequant-rounding class
+    # test_kernel_quant_parity.py documents at 8e-3 for the equivalent launch-level check
+    # (mx.dequantize's own MSL kernel rounds scale*nib+bias in bf16 before either oracle
+    # reads it).
+    assert mx.abs(out - ref).max().item() < 9e-3
+    for red, expect in (("mean", ref.mean()), ("sum", ref.sum())):
+        got = linear_cross_entropy(hidden, qhead, targets, impl="kernel", reduction=red)
+        # measured worst mean 3.8862e-4 -> pin 1e-3 (~2.6x); measured worst sum 2.4872e-2
+        # -> pin 6e-2 (~2.4x) -- summing (vs averaging) the per-row error over all n rows
+        # doesn't cancel it out, so "sum" needs a proportionally looser gate.
+        tol = 1e-3 if red == "mean" else 6e-2
+        assert got.shape == () and abs(got.item() - expect.item()) < tol  # noqa: PT018
 
 
 @pytest.mark.metal

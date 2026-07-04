@@ -140,6 +140,11 @@ def _validate_inputs(*, hidden: mx.array, head: HeadRef, targets: mx.array) -> N
         raise LossInputError(
             f"targets shape {targets.shape} must match hidden's leading dims {leading}"
         )
+    if not mx.issubdtype(targets.dtype, mx.integer):
+        # A float targets array truncates silently through the 0<=t<V range check below
+        # (and through take_along_axis / the kernel's uint cast deeper in), rather than
+        # failing cleanly — catch it here, naming the offending dtype.
+        raise LossInputError(f"targets must be an integer dtype, got {targets.dtype}")
     d = hidden.shape[-1]
     if isinstance(head, DenseHead):
         if head.weight.shape[-1] != d:
