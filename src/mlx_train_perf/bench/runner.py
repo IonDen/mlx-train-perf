@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
-from mlx_train_perf.bench.artifacts import result_is_fresh, run_identity, write_result
+from mlx_train_perf.bench.artifacts import condition_identity, result_is_fresh, write_result
 
 _STDERR_TAIL_CHARS = 4000  # enough to see the failing assertion/traceback, not a full dump
 
@@ -42,7 +42,9 @@ def run_conditions(
     paths: list[Path] = []
     for condition in conditions:
         out_path = out_dir / f"{condition.name}.json"
-        ident = run_identity(kind=condition.kind, session_id=session_id, **condition.params)
+        ident = condition_identity(
+            kind=condition.kind, session_id=session_id, params=condition.params,
+        )
         paths.append(out_path)
         if result_is_fresh(out_path, ident):
             continue
@@ -69,6 +71,14 @@ def run_conditions(
                     out_path, ident, "error", error_type="WorkerCrashed",
                     error_msg=stderr_tail, returncode=proc.returncode,
                 )
+            elif not out_path.exists():
+                # A clean exit that wrote nothing is still a sweep-level failure (e.g. a
+                # worker that swallowed its own crash) -- recorded the same way, so a
+                # later resume still sees this condition as stale and retries it.
+                write_result(
+                    out_path, ident, "error", error_type="WorkerExitedWithoutArtifact",
+                    error_msg="worker exited 0 without writing an artifact", returncode=0,
+                )
         finally:
             config_path.unlink(missing_ok=True)
     return paths
@@ -85,11 +95,30 @@ def _group_key(identity: dict[str, object]) -> tuple[tuple[str, object], ...]:
     return tuple(sorted((k, v) for k, v in identity.items() if k not in ("impl", "session_id")))
 
 
+def _ratio_label_and_value(
+    impl_a: object, impl_b: object, wall_a: object, wall_b: object,
+) -> tuple[str, float] | None:
+    """Direction is by MEASURED speed (`f"{slower_impl}/{faster_impl}"`, value = slower
+    `wall_s` / faster `wall_s`) -- never by the impls' alphabetical name order, which is
+    an accident of spelling and not a proxy for which one actually ran slower. `None`
+    when either wall time is missing or non-numeric (can't rank), or one is zero (can't
+    divide by it)."""
+    if not (isinstance(wall_a, int | float) and isinstance(wall_b, int | float)):
+        return None
+    if not wall_a or not wall_b:
+        return None
+    if wall_a >= wall_b:
+        slower_impl, slower_wall, faster_impl, faster_wall = impl_a, wall_a, impl_b, wall_b
+    else:
+        slower_impl, slower_wall, faster_impl, faster_wall = impl_b, wall_b, impl_a, wall_a
+    return f"{slower_impl}/{faster_impl}", slower_wall / faster_wall
+
+
 def report(paths: list[Path]) -> dict[str, object]:
-    """Aggregate a set of artifacts into pairwise `impl` ratios (by `wall_s`) at each
-    shared grid point. A pair that shares a grid point but NOT a `session_id` is a
-    cross-machine/cross-run comparison -- refused, and named in `cross_session_excluded`,
-    rather than silently blended into `ratios`."""
+    """Aggregate a set of artifacts into pairwise `impl` ratios at each shared grid
+    point (direction/magnitude: see `_ratio_label_and_value`). A pair that shares a grid
+    point but NOT a `session_id` is a cross-machine/cross-run comparison -- refused, and
+    named in `cross_session_excluded`, rather than silently blended into `ratios`."""
     entries: list[dict[str, object]] = []
     for p in paths:
         try:
@@ -113,20 +142,14 @@ def report(paths: list[Path]) -> dict[str, object]:
                 impl_a, impl_b = ident_a.get("impl"), ident_b.get("impl")
                 if impl_a == impl_b:
                     continue  # a genuine re-run of the same impl, not a comparison
-                lo, hi = sorted((str(impl_a), str(impl_b)))
-                label = f"{lo}/{hi}"
                 if ident_a.get("session_id") != ident_b.get("session_id"):
                     cross_session_excluded.append({
                         "impl_a": impl_a, "session_a": ident_a.get("session_id"),
                         "impl_b": impl_b, "session_b": ident_b.get("session_id"),
                     })
                     continue
-                wall_lo = a.get("wall_s") if str(impl_a) == lo else b.get("wall_s")
-                wall_hi = b.get("wall_s") if str(impl_b) == hi else a.get("wall_s")
-                if (
-                    isinstance(wall_lo, int | float)
-                    and isinstance(wall_hi, int | float)
-                    and wall_lo
-                ):
-                    ratios[label] = wall_hi / wall_lo
+                result = _ratio_label_and_value(impl_a, impl_b, a.get("wall_s"), b.get("wall_s"))
+                if result is not None:
+                    label, value = result
+                    ratios[label] = value
     return {"ratios": ratios, "cross_session_excluded": cross_session_excluded}
