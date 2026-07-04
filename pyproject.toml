@@ -71,6 +71,18 @@ module = ["numpy", "numpy.*"]
 follow_imports = "skip"
 ignore_missing_imports = true
 
+[[tool.mypy.overrides]]
+# `mlx/` ships both a compiled `core.cpython-*.so` AND a `core/` stub directory as
+# siblings, which confuses mypy's package resolution for sibling packages: `mlx.nn`'s
+# `from .layers import *` re-export resolves to a bare `types.ModuleType` under
+# `--strict` (verified: `reveal_type(mlx.nn)` -> "types.ModuleType", not an error in
+# mlx.nn's own source). `follow_imports = "skip"` treats `nn.*` as `Any` at usage sites
+# instead of surfacing that resolution artifact as spurious attr-defined/name-defined
+# errors on every `nn.Linear` / `nn.Module` reference.
+module = ["mlx.nn", "mlx.nn.*"]
+follow_imports = "skip"
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 addopts = "-ra"
 markers = [
