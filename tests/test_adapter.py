@@ -11,6 +11,7 @@ from mlx import nn
 
 pytest.importorskip("mlx_lm")
 
+import mlx_lm
 from mlx_lm.models import llama, qwen3
 from mlx_lm.tuner import trainer as t
 
@@ -264,3 +265,30 @@ def test_loss_fn_reflects_live_weight_updates() -> None:
 
     assert abs(loss_after.item() - loss_before.item()) > 1e-6
     assert abs(loss_after.item() - stock_after.item()) < 1e-5
+
+
+# ---------------------------------------------------------------------------
+# Gated smoke test: real (pre-downloaded) quantized model, one live training step.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.smoke
+def test_real_model_one_train_step() -> None:
+    """--run-smoke: one `nn.value_and_grad` step through `make_loss_fn`'s resolved impl
+    on a real quantized model -- loss and grads finite, peak memory under the session
+    wired cap (`conftest._memory_guard`). Model: mlx-community/Qwen3-8B-4bit, expected to
+    already be present in the local Hugging Face cache -- this test does not fetch it."""
+    model, _tokenizer = mlx_lm.load("mlx-community/Qwen3-8B-4bit")
+    mx.random.seed(7)
+    batch = mx.random.randint(0, model.args.vocab_size, (1, 64))
+    lengths = mx.array([[0, 64]])
+    loss_fn = make_loss_fn(model)  # impl="auto" -> kernel on this (verified) mlx
+
+    def scalar_loss(m: nn.Module) -> mx.array:
+        loss, _ = loss_fn(m, batch, lengths)
+        return loss
+
+    loss, grads = nn.value_and_grad(model, scalar_loss)(model)
+    mx.eval(loss, grads)
+
+    assert mx.isfinite(loss).item()
+    assert mx.get_peak_memory() < 20 * 1024**3  # matches the session wired cap
