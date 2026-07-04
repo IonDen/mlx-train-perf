@@ -153,12 +153,16 @@ def test_dw_parity_vs_chunked_backward_oracle(
 
 
 def test_dw_parity_is_stable_across_repeated_runs() -> None:
-    """Atomics reorder float additions run to run, so d_w is bit-level non-deterministic
-    (see the module-level comment above). This test runs the deepest-reduction case in the
-    grid (n=8192 -- the shape that showed measurable run-to-run SPREAD during tolerance
-    measurement, unlike the shallower-n shapes which landed bit-identical across repeats)
-    5 times and asserts every run stays under the pinned tolerance -- proving the
-    tolerance is robust to run-to-run nondeterminism, not just lucky on one run."""
+    """Atomics reorder float additions run to run, so d_w's raw OUTPUT is bit-level
+    non-deterministic (see the module-level comment above) -- individual entries can and
+    do flip between runs at every shape. What this test actually exercises is the
+    max-diff-vs-oracle METRIC: this test runs the deepest-reduction case in the grid
+    (n=8192 -- the shape whose max-diff metric showed measurable run-to-run spread during
+    tolerance measurement, unlike the shallower-n shapes whose max-diff metric read
+    identically across repeats despite their own underlying entries also not being
+    bit-identical) 5 times and asserts every run's metric stays under the pinned
+    tolerance -- proving the tolerance is robust to run-to-run nondeterminism, not just
+    lucky on one run."""
     mx.random.seed(5)
     n, d, v, tile, row_tiles = 8192, 32, 1024, 1024, 2
     hidden = mx.random.normal((n, d)).astype(mx.float32)
