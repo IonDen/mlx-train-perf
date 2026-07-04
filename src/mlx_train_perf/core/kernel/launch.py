@@ -215,8 +215,13 @@ def backward_dw(
     calling the same atomic kernel repeatedly and observing zero bleed-through between
     calls), so each launch outputs only its own (tcols, d) fp32 slice and the launcher
     assembles the full (v, d) buffer with `mx.concatenate` — the same pattern
-    `chunked_backward`'s own trainable-head branch already uses. The fp32 accumulator is
-    cast down to `w.dtype` exactly once, after every tile launch.
+    `chunked_backward`'s own trainable-head branch already uses. Each tile's fp32
+    accumulator is cast down to `w.dtype` BEFORE it is appended to the chunk list (not
+    after the final concatenate): every chunk is already the COMPLETE final gradient for
+    its disjoint rows (no further cross-chunk accumulation ever touches it), so per-chunk
+    rounding commutes with concatenation — bit-identical to casting the concatenated
+    whole — while halving the transient concat buffer's footprint (fp32 (v, d) -> bf16
+    (v, d) at concat time, ~2.49 GB instead of ~4.98 GB at the production shape).
 
     Backward recomputes logits tile-wise AND scatter-accumulates into d_w — roughly 2x the
     forward's per-tile MAC count, same accounting `backward_dhidden` uses — so
@@ -244,8 +249,8 @@ def backward_dw(
             output_dtypes=[mx.float32],
             init_value=0.0,
         )
-        chunks.append(d_w_tile)
-    return mx.concatenate(chunks, axis=0).astype(w.dtype)
+        chunks.append(d_w_tile.astype(w.dtype))
+    return mx.concatenate(chunks, axis=0)
 
 
 @functools.cache
