@@ -13,11 +13,11 @@ here.
 Sanity-anchored (not tolerance-pinned) against the mlx-train-perf-spike gate
 measurements at production shape (n=8192, V=151936, D=4096, bf16, M1 Max 32 GB): the
 kernel loss term is negligible next to naive's, and the naive loss term's own
-coefficient is directly measured against a persisted gate artifact (see
-`Calibration.naive_loss_bytes_per_nv`'s docstring for the derivation) -- matching
-`results/gate_*.json` within ~15% at production shape. The remaining calibration
-constants are honest analytic placeholders a later, real-measurement task is expected
-to replace.
+coefficient is fit to a persisted gate artifact at that shape (see
+`Calibration.naive_loss_bytes_per_nv`'s docstring for the derivation and its known
+limits -- it is an empirical fit to one anchor, not a validated buffer decomposition,
+and does not extrapolate linearly to smaller n). The remaining calibration constants
+are honest analytic placeholders a later, real-measurement task is expected to replace.
 
 Known limits (not modeled in 0.1.0): full fine-tuning (`lora_rank == 0`) only adds the
 loss layer's own `d_w` term to the loss component -- the BASE MODEL's own weight
@@ -134,17 +134,16 @@ def _weights_bytes(shape: ModelShape, dtype_size: int) -> int:
     `quant_group` set), prices the WHOLE model at the quantized rate (`bits/8 +
     4/group`; the `4` is one bf16 scale + one bf16 bias per group) -- not just the head.
 
-    Controller ruling (task-13 review item 2, supersedes an earlier head-only reading
-    of the brief's ambiguous formula): real mlx-community 4-bit checkpoints quantize the
-    whole model via `mlx_lm.convert`'s uniform `nn.quantize(model, group_size, bits)`,
-    not just the output projection. Pricing only the head at the quantized rate left
-    the (dominant) body layers priced at `dtype_size` -- a phantom cost that, at
-    flagship scale (~8B params, int4), adds roughly 11 GB the checkpoint never actually
-    carries, and would cause the planner to refuse configs that genuinely fit. This is
-    an approximation: a handful of per-parameter exemptions (norms, biases) are real but
-    negligible next to a multi-billion-parameter body, so they're ignored rather than
-    separately modeled. A later measured-vs-predicted gate validates this against a
-    real quantized checkpoint."""
+    Real mlx-community 4-bit checkpoints quantize the whole model via `mlx_lm.convert`'s
+    uniform `nn.quantize(model, group_size, bits)`, not just the output projection --
+    pricing only the head at the quantized rate would leave the (dominant) body layers
+    priced at `dtype_size`, a phantom cost that, at flagship scale (~8B params, int4),
+    adds roughly 11 GB the checkpoint never actually carries, and would cause the
+    planner to refuse configs that genuinely fit. This is an approximation: a handful of
+    per-parameter exemptions (norms, biases) are real but negligible next to a
+    multi-billion-parameter body, so they're ignored rather than separately modeled. A
+    later measured-vs-predicted gate validates this against a real quantized
+    checkpoint."""
     p_total = shape.param_count()
     if shape.quant_bits is None or shape.quant_group is None:
         return p_total * dtype_size
@@ -185,9 +184,10 @@ def _head_trainable(cfg: TrainConfig) -> bool:
 def _loss_bytes(cfg: TrainConfig, shape: ModelShape, calib: Calibration) -> int:
     n = cfg.batch * cfg.seq_len
     if cfg.impl == "naive":
-        # Calibrated (task-13 review item 3): see Calibration.naive_loss_bytes_per_nv's
-        # docstring for the measured derivation against a persisted gate artifact -- the
-        # brief's literal `n*V*4*2` under-modeled it by ~1.9x at production shape.
+        # naive_loss_bytes_per_nv is an empirical fit to a single production-shape
+        # anchor (see Calibration.naive_loss_bytes_per_nv's docstring) -- accurate at
+        # that shape but known not to extrapolate linearly to smaller n, where it
+        # over-predicts (the conservative, safe direction for this planner).
         base = int(calib.naive_loss_bytes_per_nv * n * shape.vocab)
     elif cfg.impl == "chunked":
         base = n * _CHUNK_TILE * 4 * 3

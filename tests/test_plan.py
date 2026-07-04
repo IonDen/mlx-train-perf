@@ -188,11 +188,14 @@ def test_naive_loss_within_15pct_of_measured_gate_artifact() -> None:
     Calibration.naive_loss_bytes_per_nv): converting to bytes, measured ~=
     18.547 * 1024**3 ~= 19,914,689,610. Holding the (separate, unchanged by this item)
     d_w term V*D*4*2 = 4,978,638,848 fixed, the remaining ~14,936,050,762 bytes divided
-    by n*V = 1,244,659,712 gives ~12.0 bytes per (n, V) pair -- 3 fp32 (N,V)-shaped
-    buffers under MLX's naive autodiff (logits, softmax probabilities, d_logits), not
-    the 2 the brief's literal formula assumed. Body-shape fields (layers/intermediate/
-    heads/kv_heads) are irrelevant to the "loss" component and set to 1 to keep this
-    test isolated to exactly what the artifact measured.
+    by n*V = 1,244,659,712 gives ~12.0 bytes per (n, V) pair. This is an EMPIRICAL FIT to
+    this one anchor, not a validated buffer-by-buffer decomposition -- at this exact
+    shape 2*D == n, so the d_w term and the n*V coefficient are not separately
+    identifiable from this point alone (see
+    test_naive_estimate_is_conservative_at_smaller_n for the cross-check against a
+    second artifact at a different n). Body-shape fields (layers/intermediate/heads/
+    kv_heads) are irrelevant to the "loss" component and set to 1 to keep this test
+    isolated to exactly what the artifact measured.
     """
     shape = ModelShape(vocab=151936, hidden=4096, layers=1, intermediate=1, heads=1,
                        kv_heads=1, tied=False, quant_bits=None, quant_group=None)
@@ -202,3 +205,27 @@ def test_naive_loss_within_15pct_of_measured_gate_artifact() -> None:
     _, comp = estimate_peak(shape, cfg, calib)
     measured_bytes = 18.547 * 1024**3
     assert abs(comp["loss"] - measured_bytes) / measured_bytes < 0.15
+
+
+def test_naive_estimate_is_conservative_at_smaller_n() -> None:
+    """task-13 re-review: the naive coefficient (Calibration.naive_loss_bytes_per_nv)
+    is fit to ONE production-shape anchor (n=8192, gate_naive_n8192.json) and is known
+    NOT to extrapolate linearly -- the sibling artifact gate_naive_n2048.json (same
+    code path, reference-only, never executed by this project) measures n=2048,
+    V=151936, D=4096, bf16, marginal_peak_gb=4.057 (~4,356,170,580 bytes), while this
+    planner's formula (12.0*n*V + the d_w term) predicts ~8,712,617,984 bytes there --
+    about 2x too high, and a single non-negative linear coefficient cannot fit both the
+    n=2048 and n=8192 anchors exactly (solving for both forces a negative intercept).
+    Pinning the direction of that miss: the estimate must OVER-predict, never
+    under-predict, at a shape smaller than the calibration anchor -- the safe direction
+    for a planner whose job is to steer callers away from the discouraged naive path,
+    not reassure them it fits when it might not.
+    """
+    shape = ModelShape(vocab=151936, hidden=4096, layers=1, intermediate=1, heads=1,
+                       kv_heads=1, tied=False, quant_bits=None, quant_group=None)
+    calib = load_calibration()
+    cfg = TrainConfig(batch=1, seq_len=2048, dtype="bfloat16", lora_rank=0, lora_layers=0,
+                      grad_checkpoint=True, impl="naive")
+    _, comp = estimate_peak(shape, cfg, calib)
+    measured_bytes = 4.057 * 1024**3
+    assert comp["loss"] >= measured_bytes
