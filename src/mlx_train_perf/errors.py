@@ -36,3 +36,8 @@ class MissingDependencyError(MlxTrainPerfError):
 
 class BenchInputError(MlxTrainPerfError):
     """Bench condition input validation failure (e.g. a reserved identity param key)."""
+
+
+class RegisterProbeError(MlxTrainPerfError):
+    """Standalone MSL recompile for the register-pressure probe failed: a bad capture,
+    a Metal compiler error, or an unexpected number of compiled kernel functions."""
