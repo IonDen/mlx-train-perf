@@ -1,4 +1,5 @@
-"""MSL source builder for the dense fused-CE kernel (RT-parameterized).
+"""MSL source builder for the fused-CE kernel family (RT-parameterized): a dense variant
+and an int4/gs64 dequant-in-kernel quantized variant.
 
 `_SOURCE_V2E` is a VERBATIM port of `mlx-train-perf-spike/kernel_v2e.py:10-151`'s
 `_SOURCE` (the RT=4, 4x4 simdgroup-matrix-tile variant). `_DENSE_TEMPLATE` derives from
@@ -8,6 +9,11 @@ per-simdgroup row-block height, `8 * row_tiles`). Everything else — the `fm`/`
 mapping and the col-tile count (always 4, i.e. a fixed 32-column block) — is INVARIANT
 and untouched. `build_dense_source(2)` reconstructs the RT=2 variant, structurally
 equivalent to `mlx-train-perf-spike/kernel_v2d.py`'s `_SOURCE` (measured 879.2 G MAC/s).
+
+`_QUANT_TEMPLATE` derives from `_DENSE_TEMPLATE` by swapping the B-fragment's `w` reads
+for a quantized dequant-in-register load and register-hoisting the per-group scale/bias
+(see the comment above `_QUANT_TEMPLATE` for the hoisted-load contract). `build_quant_source`
+applies the same two RT sentinels as `build_dense_source`.
 
 Sentinel substitution uses chained `str.replace`, never an f-string or `.format()`: the
 MSL body is full of C++ braces, so an f-string would need every literal `{`/`}` escaped
@@ -201,11 +207,22 @@ inline float mtp_dq4(const device uint* wq_row, const device S* sc_row,
 }
 """
 
-# Quant variant, derived from the (still-sentineled) dense template by replacing ONLY the
+# Quant variant, derived from the (still-sentineled) dense template by replacing the
 # B-fragment loads: the dense `wp0[ct]`/`wp1[ct]` device-T pointers into `w` become plain
-# row indices `c0[ct]`/`c1[ct]` (clamped identically), and every B load dequantizes via
-# `mtp_dq4` instead of a straight cast. Everything else (the A/hidden side, the lane
-# mapping, the epilogue) is untouched.
+# row indices `c0[ct]`/`c1[ct]` (clamped identically). Everything else (the A/hidden side,
+# the lane mapping, the epilogue) is untouched.
+#
+# The hot-loop B load is REGISTER-HOISTED rather than calling `mtp_dq4` per element: a
+# per-group `sc`/`bi` device load costs the same whether the group is about to repeat for
+# 8 more MMA iterations or not, so it is fetched once per 64-column group into thread-local
+# registers (`hsc0`/`hbi0`/`hsc1`/`hbi1`) at the uniform group-boundary branch
+# `(d0 & 63u) == 0u` (correct because `d0` is 8-aligned and `fm < 8`, so every k in
+# [d0, d0+8) shares group `d0 >> 6` for 8 consecutive iterations) and the per-column-block
+# `wq` row pointers (`wq0`/`wq1`) are hoisted next to `c0`/`c1` so the hot loop does only a
+# word load + shift + mask + fma per B element. Measured: per-element `sc`/`bi` device
+# re-fetch cost 1363.4 -> 2019.5 G MAC/s at row_tiles=4 (int4/gs64, bf16, production
+# shape). `mtp_dq4` stays for the guarded d-tail (cold path; never taken when d % 64 == 0,
+# but the tail block must still compile), so `QUANT_HELPERS` stays a required header.
 _QUANT_TEMPLATE = (
     _DENSE_TEMPLATE.replace(
         "        const device T* wp0[4];\n"
@@ -253,6 +270,62 @@ _QUANT_TEMPLATE = (
         "                B[ct].thread_elements()[1] = (db < d) ? mtp_dq4(wq + (size_t)c1[ct] * (d >> 3),\n"
         "                                                     sc + (size_t)c1[ct] * (d >> 6),\n"
         "                                                     bi + (size_t)c1[ct] * (d >> 6), db) : 0.0f;\n"
+        "            }",
+    )
+    # Register-hoist deltas below: block-scope declarations, hoisted `wq` row pointers,
+    # the group-boundary reload, and the hot-loop B-fragment swap. None of these four
+    # target strings contains an RT_COUNT/ROWS_PER_BLOCK sentinel, so applying them at the
+    # template level (pre-substitution) is equivalent to applying them post-substitution.
+    .replace(
+        "    uint cl = tcols - 1;",
+        "    uint cl = tcols - 1;\n"
+        "    uint sh = 4 * fm;\n"
+        "    float hsc0[4]; float hbi0[4]; float hsc1[4]; float hbi1[4];\n"
+        "    const device uint* wq0[4];\n"
+        "    const device uint* wq1[4];",
+    )
+    .replace(
+        "        for (uint ct = 0; ct < 4; ++ct) {\n"
+        "            c0[ct] = v0 + metal::min(cc + 8 * ct + fn, cl);\n"
+        "            c1[ct] = v0 + metal::min(cc + 8 * ct + fn + 1, cl);\n"
+        "        }",
+        "        for (uint ct = 0; ct < 4; ++ct) {\n"
+        "            c0[ct] = v0 + metal::min(cc + 8 * ct + fn, cl);\n"
+        "            c1[ct] = v0 + metal::min(cc + 8 * ct + fn + 1, cl);\n"
+        "            wq0[ct] = wq + (size_t)c0[ct] * (d >> 3);\n"
+        "            wq1[ct] = wq + (size_t)c1[ct] * (d >> 3);\n"
+        "        }",
+    )
+    .replace(
+        "        for (uint d0 = 0; d0 < dfull; d0 += 8) {\n",
+        "        for (uint d0 = 0; d0 < dfull; d0 += 8) {\n"
+        "            if ((d0 & 63u) == 0u) {\n"
+        "                uint g = d0 >> 6;\n"
+        "                #pragma clang loop unroll(full)\n"
+        "                for (uint ct = 0; ct < 4; ++ct) {\n"
+        "                    hsc0[ct] = (float)sc[(size_t)c0[ct] * (d >> 6) + g];\n"
+        "                    hbi0[ct] = (float)bi[(size_t)c0[ct] * (d >> 6) + g];\n"
+        "                    hsc1[ct] = (float)sc[(size_t)c1[ct] * (d >> 6) + g];\n"
+        "                    hbi1[ct] = (float)bi[(size_t)c1[ct] * (d >> 6) + g];\n"
+        "                }\n"
+        "            }\n",
+    )
+    .replace(
+        "            #pragma clang loop unroll(full)\n"
+        "            for (uint ct = 0; ct < 4; ++ct) {\n"
+        "                B[ct].thread_elements()[0] = mtp_dq4(wq + (size_t)c0[ct] * (d >> 3),\n"
+        "                                                     sc + (size_t)c0[ct] * (d >> 6),\n"
+        "                                                     bi + (size_t)c0[ct] * (d >> 6), d0 + fm);\n"
+        "                B[ct].thread_elements()[1] = mtp_dq4(wq + (size_t)c1[ct] * (d >> 3),\n"
+        "                                                     sc + (size_t)c1[ct] * (d >> 6),\n"
+        "                                                     bi + (size_t)c1[ct] * (d >> 6), d0 + fm);\n"
+        "            }",
+        "            #pragma clang loop unroll(full)\n"
+        "            for (uint ct = 0; ct < 4; ++ct) {\n"
+        "                B[ct].thread_elements()[0] ="
+        " (float)((wq0[ct][d0 >> 3] >> sh) & 0xFu) * hsc0[ct] + hbi0[ct];\n"
+        "                B[ct].thread_elements()[1] ="
+        " (float)((wq1[ct][d0 >> 3] >> sh) & 0xFu) * hsc1[ct] + hbi1[ct];\n"
         "            }",
     )
 )
