@@ -18,6 +18,10 @@ class LossInputError(MlxTrainPerfError):
     """Shape/dtype/target-range validation failure at the loss boundary."""
 
 
+class PlanInputError(MlxTrainPerfError):
+    """Shape/config validation failure in the fit planner (e.g. an unrecognized dtype)."""
+
+
 class DoesNotFitError(MlxTrainPerfError):
     """Planner verdict: predicted peak exceeds the memory budget."""
 

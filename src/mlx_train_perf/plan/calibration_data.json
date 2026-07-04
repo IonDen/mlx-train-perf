@@ -1,0 +1,9 @@
+{
+  "act_bytes_per_token_layer": 512.0,
+  "optimizer_bytes_per_param": 8.0,
+  "overhead_frac": 0.10,
+  "provenance": {
+    "machine": "arm64-M1Max-32GB", "macos": "26.5.1", "mlx_version": "0.31.2",
+    "measured_date": "UNMEASURED-analytic-default (Task 17 replaces this)"
+  }
+}
