@@ -32,7 +32,7 @@ import contextlib
 import os
 import re
 import tempfile
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from typing import IO, cast
 
 import mlx.core as mx
@@ -89,9 +89,9 @@ def _capture_fd_stdout() -> Iterator[IO[str]]:
             os.close(saved)
 
 
-def _capture_generated_msl(msl_body: str, *, header: str) -> str:
-    """Launch `msl_body` once, at the tiny probe shape, as a real kernel with
-    `verbose=True`, and return the cleaned MSL text the JIT actually compiled."""
+def _dense_probe_inputs() -> list[mx.array]:
+    """Tiny, valid probe data for the dense forward kernel's fixed 6-input contract --
+    the default `compiled_ceiling` falls back to when no custom contract is supplied."""
     mx.random.seed(0)
     hidden = mx.random.normal((_PROBE_N, _PROBE_D)).astype(mx.bfloat16)
     w = mx.random.normal((_PROBE_V, _PROBE_D)).astype(mx.bfloat16)
@@ -100,11 +100,26 @@ def _capture_generated_msl(msl_body: str, *, header: str) -> str:
     lse = mx.full((_PROBE_N,), float("-inf"), dtype=mx.float32)
     tgt = mx.zeros((_PROBE_N,), dtype=mx.float32)
     mx.eval(hidden, w, targets, offs, lse, tgt)
+    return [hidden, w, targets, offs, lse, tgt]
+
+
+def _capture_generated_msl(
+    msl_body: str, *, header: str, input_names: Sequence[str], inputs: Sequence[mx.array]
+) -> str:
+    """Launch `msl_body` once, at the tiny probe shape, as a real kernel with
+    `verbose=True`, and return the cleaned MSL text the JIT actually compiled.
+
+    `input_names`/`inputs` supply the kernel's buffer contract and matching tiny probe
+    data -- every kernel body this project ships so far (dense forward, quantized
+    forward) writes the same `(lse_out, tgt_out)` fp32 outputs from a bf16 `T` template
+    at this same tiny grid/threadgroup shape, so only the INPUT side needs to vary across
+    contracts; the probe's own leading dimension (row count) must match `_PROBE_N` for
+    those two fixed-shape outputs to stay valid."""
     kernel = cast(
         _MetalKernel,
         mx.fast.metal_kernel(
             name="mtp_regpressure_probe",
-            input_names=_INPUT_NAMES,
+            input_names=list(input_names),
             output_names=_OUTPUT_NAMES,
             source=msl_body,
             header=header,
@@ -112,7 +127,7 @@ def _capture_generated_msl(msl_body: str, *, header: str) -> str:
     )
     with _capture_fd_stdout() as buf:
         out = kernel(
-            inputs=[hidden, w, targets, offs, lse, tgt],
+            inputs=list(inputs),
             template=[("T", mx.bfloat16)],
             grid=(32, 8, 1),
             threadgroup=(32, 8, 1),
@@ -130,17 +145,45 @@ def _capture_generated_msl(msl_body: str, *, header: str) -> str:
     return _prepare_msl(raw)
 
 
-def compiled_ceiling(msl_body: str, *, header: str = "") -> int:
+def compiled_ceiling(
+    msl_body: str,
+    *,
+    header: str = "",
+    input_names: Sequence[str] | None = None,
+    inputs: Sequence[mx.array] | None = None,
+) -> int:
     """Compile-time register-pressure telltale for a kernel body (see the module
     docstring for exact semantics -- diagnostic only, never a performance verdict).
 
     Launches `msl_body` once at a tiny shape to capture the real JIT-generated MSL,
     recompiles it standalone through PyObjC's Metal bindings, and returns
     `MTLComputePipelineState.maxTotalThreadsPerThreadgroup` for the resulting pipeline.
-    `header` is forwarded to the probe launch's `mx.fast.metal_kernel(header=...)` for
-    bodies that need helper functions declared outside the kernel (as the quantized
-    kernel's dequantize helper does).
+
+    Defaults to the dense forward kernel's own 6-input contract (`hidden, w, targets,
+    offs, lse_in, tgt_in`) and matching tiny probe data when `input_names`/`inputs` are
+    omitted -- this is what every dense-body call exercises. A body declaring a DIFFERENT
+    kernel contract (a different buffer list, a different helper-function dependency)
+    needs both `input_names` (the body's declared buffer names, in order) and `inputs`
+    (already-`mx.eval`'d tiny `mx.array`s, one per name, in the same order) supplied
+    together -- they are validated as a pair, never one without the other. `header` is
+    forwarded to the probe launch's `mx.fast.metal_kernel(header=...)` for bodies that
+    declare helper functions outside the kernel. For example, the quantized kernel's
+    8-input contract needs its own probe data (`wq`/`sc`/`bi` built via `mx.quantize`)
+    and its dequantize helper's header::
+
+        compiled_ceiling(
+            build_quant_source(4),
+            header=QUANT_HELPERS,
+            input_names=["hidden", "wq", "sc", "bi", "targets", "offs", "lse_in", "tgt_in"],
+            inputs=[hidden, wq, sc, bi, targets, offs, lse_in, tgt_in],
+        )
     """
+    if (input_names is None) != (inputs is None):
+        raise ValueError(
+            "input_names and inputs must be supplied together (a custom kernel contract "
+            "needs both its buffer names and matching probe data), or both omitted to use "
+            "the dense forward kernel's default contract"
+        )
     try:
         import Metal  # noqa: PLC0415
     except ImportError as exc:
@@ -148,18 +191,22 @@ def compiled_ceiling(msl_body: str, *, header: str = "") -> int:
             "pyobjc-framework-Metal is required for the register-pressure probe; "
             'install the optional "probe" extra (pip install "mlx-train-perf[probe]")'
         ) from exc
-    msl = _capture_generated_msl(msl_body, header=header)
+    names = list(input_names) if input_names is not None else _INPUT_NAMES
+    probe_inputs = list(inputs) if inputs is not None else _dense_probe_inputs()
+    msl = _capture_generated_msl(msl_body, header=header, input_names=names, inputs=probe_inputs)
     device = Metal.MTLCreateSystemDefaultDevice()
     options = Metal.MTLCompileOptions.new()
     library, compile_error = device.newLibraryWithSource_options_error_(msl, options, None)
     if library is None:  # pragma: no cover -- tripwire; only reachable if the capture+
         # prelude assembly produces MSL the standalone compiler rejects.
         raise RegisterProbeError(f"standalone MSL recompile failed: {compile_error}")
-    names = list(library.functionNames())
-    if len(names) != 1:  # pragma: no cover -- tripwire; the probe always launches exactly
-        # one kernel function per call.
-        raise RegisterProbeError(f"expected exactly one compiled kernel function, got {names}")
-    function = library.newFunctionWithName_(names[0])
+    function_names = list(library.functionNames())
+    if len(function_names) != 1:  # pragma: no cover -- tripwire; the probe always
+        # launches exactly one kernel function per call.
+        raise RegisterProbeError(
+            f"expected exactly one compiled kernel function, got {function_names}"
+        )
+    function = library.newFunctionWithName_(function_names[0])
     pipeline_state, pso_error = device.newComputePipelineStateWithFunction_error_(function, None)
     if pipeline_state is None:  # pragma: no cover -- tripwire; a function that compiled
         # into a library always yields a valid pipeline state.

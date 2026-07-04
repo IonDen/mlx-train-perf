@@ -1,8 +1,9 @@
 import builtins
 
+import mlx.core as mx
 import pytest
 
-from mlx_train_perf.core.kernel.source import build_dense_source
+from mlx_train_perf.core.kernel.source import QUANT_HELPERS, build_dense_source, build_quant_source
 from mlx_train_perf.devtools.regpressure import (
     _prepare_msl,
     _strip_banner_and_fences,
@@ -60,6 +61,15 @@ def test_missing_pyobjc_is_precise_error(monkeypatch: pytest.MonkeyPatch) -> Non
     assert "probe" in str(ei.value)
 
 
+def test_input_names_and_inputs_must_be_supplied_together() -> None:
+    # Both are pure validation failures -- neither reaches the `import Metal` guard, so
+    # this stays in the default lane (no GPU/pyobjc needed to observe the ValueError).
+    with pytest.raises(ValueError, match="supplied together"):
+        compiled_ceiling("out[0] = 1.0f;", input_names=["a"])
+    with pytest.raises(ValueError, match="supplied together"):
+        compiled_ceiling("out[0] = 1.0f;", inputs=[mx.zeros((1,))])
+
+
 @pytest.mark.metal
 def test_dense_v2e_ceiling_matches_spike_measurement() -> None:
     # spike-measured compiled ceilings: v2e (RT=4) -> 448, v2d (RT=2) -> 640
@@ -67,3 +77,31 @@ def test_dense_v2e_ceiling_matches_spike_measurement() -> None:
     # wrapper so shapes/template refs resolve (port the spike script's shell verbatim).
     assert compiled_ceiling(build_dense_source(4)) == 448
     assert compiled_ceiling(build_dense_source(2)) == 640
+
+
+@pytest.mark.metal
+def test_quantized_kernel_ceiling_is_plausible() -> None:
+    # The quantized kernel has a DIFFERENT 8-input contract (hidden, wq, sc, bi, targets,
+    # offs, lse_in, tgt_in) than the dense default (6 inputs, no wq/sc/bi) -- this is the
+    # capability the parameterized `input_names`/`inputs` args exist for. No number from
+    # this repo's measured history is hard-pinned here: that history was never measured
+    # through this exact probe path, only through the earlier (different kernel family)
+    # E3 experiment. The observed value is logged for the record.
+    n, d, v = 8, 64, 16  # d must be a group_size(64) multiple for a valid quantized probe
+    mx.random.seed(1)
+    hidden = mx.random.normal((n, d)).astype(mx.bfloat16)
+    w = (mx.random.normal((v, d)) * 0.05).astype(mx.bfloat16)
+    wq, sc, bi = mx.quantize(w, group_size=64, bits=4)
+    targets = mx.random.randint(0, v, (n,))
+    offs = mx.array([0, v], dtype=mx.uint32)
+    lse = mx.full((n,), float("-inf"), dtype=mx.float32)
+    tgt = mx.zeros((n,), dtype=mx.float32)
+    mx.eval(hidden, wq, sc, bi, targets, offs, lse, tgt)
+    ceiling = compiled_ceiling(
+        build_quant_source(4),
+        header=QUANT_HELPERS,
+        input_names=["hidden", "wq", "sc", "bi", "targets", "offs", "lse_in", "tgt_in"],
+        inputs=[hidden, wq, sc, bi, targets, offs, lse, tgt],
+    )
+    print(f"quantized RT=4 compiled ceiling (observed): {ceiling}")
+    assert 0 < ceiling <= 1024
