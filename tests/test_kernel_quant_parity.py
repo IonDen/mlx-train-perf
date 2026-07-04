@@ -39,14 +39,17 @@ def _qdata_fp32(n: int, d: int, v: int) -> tuple[mx.array, QuantSpec, mx.array, 
     return hidden, q, targets, w_dq
 
 
+@pytest.mark.parametrize("row_tiles", [2, 4])
 @pytest.mark.parametrize(("n", "d", "v", "tile"), [
     (64, 64, 1024, 256), (64, 128, 1024, 333), (65, 192, 1027, 256), (128, 64, 8192, 1024),
 ])
-def test_parity_vs_dequantize_then_kernel_oracle(n: int, d: int, v: int, tile: int) -> None:
+def test_parity_vs_dequantize_then_kernel_oracle(
+    n: int, d: int, v: int, tile: int, row_tiles: int,
+) -> None:
     hidden, q, targets, w_dq = _qdata(n, d, v)
-    lse_o, tgt_o = forward(hidden, w_dq, targets, row_tiles=4, tile=tile,
+    lse_o, tgt_o = forward(hidden, w_dq, targets, row_tiles=row_tiles, tile=tile,
                            rate_macs_per_s=GENEROUS_RATE)
-    lse_q, tgt_q = forward_quantized(hidden, q, targets, row_tiles=4, tile=tile,
+    lse_q, tgt_q = forward_quantized(hidden, q, targets, row_tiles=row_tiles, tile=tile,
                                      rate_macs_per_s=GENEROUS_RATE)
     # RED at 1e-6 measured up to 2.8682e-3 (n=65,d=192,v=1027,tile=256) — NOT a nibble/
     # group/row-stride bug: tests/test_quant_layout.py independently pins the layout, and
@@ -68,11 +71,12 @@ def test_parity_vs_dequantize_then_kernel_oracle(n: int, d: int, v: int, tile: i
     assert mx.abs((lse_q - tgt_q) - ref).max().item() < 8e-3
 
 
+@pytest.mark.parametrize("row_tiles", [2, 4])
 @pytest.mark.parametrize(("n", "d", "v", "tile"), [
     (64, 64, 1024, 256), (64, 128, 1024, 333), (65, 192, 1027, 256), (128, 64, 8192, 1024),
 ])
 def test_dequant_correctness_lock_fp32_head_no_bf16_rounding(
-    n: int, d: int, v: int, tile: int,
+    n: int, d: int, v: int, tile: int, row_tiles: int,
 ) -> None:
     """DEQUANT-CORRECTNESS LOCK — bf16-rounding-free anchor for nibble/group/row-stride
     math. `test_parity_vs_dequantize_then_kernel_oracle`'s 8e-3 gate is desensitized: both
@@ -86,8 +90,8 @@ def test_dequant_correctness_lock_fp32_head_no_bf16_rounding(
     would slip past the bf16-desensitized gate above.
     """
     hidden, q, targets, w_dq = _qdata_fp32(n, d, v)
-    lse_o, tgt_o = forward(hidden, w_dq, targets, row_tiles=4, tile=tile,
+    lse_o, tgt_o = forward(hidden, w_dq, targets, row_tiles=row_tiles, tile=tile,
                            rate_macs_per_s=GENEROUS_RATE)
-    lse_q, tgt_q = forward_quantized(hidden, q, targets, row_tiles=4, tile=tile,
+    lse_q, tgt_q = forward_quantized(hidden, q, targets, row_tiles=row_tiles, tile=tile,
                                      rate_macs_per_s=GENEROUS_RATE)
     assert mx.abs((lse_q - tgt_q) - (lse_o - tgt_o)).max().item() < 1e-5
