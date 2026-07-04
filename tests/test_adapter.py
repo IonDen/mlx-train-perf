@@ -217,6 +217,57 @@ def test_loss_and_ntoks_match_stock_with_fully_masked_row() -> None:
     assert abs(ours.item() - stock.item()) < 1e-5
 
 
+def test_loss_and_ntoks_match_stock_with_all_rows_fully_masked() -> None:
+    """Every row masked out (ntoks == 0 for the whole batch): stock `default_loss`
+    divides by a zero `ntoks` and produces `nan` -- not an exception. This pins that
+    our adapter matches that exact crash-parity behavior (nan loss, ntoks == 0) rather
+    than, say, silently returning 0 or raising."""
+    model = _tiny_llama()
+    mx.random.seed(1)
+    batch = mx.random.randint(0, 256, (2, 12))
+    lengths = mx.array([[20, 7], [20, 7]])  # offset=20 > seq len -- every row masked
+
+    loss_fn = make_loss_fn(model, impl="chunked")
+    ours, ntoks_ours = loss_fn(model, batch, lengths)
+    stock, ntoks_stock = t.default_loss(model, batch, lengths)
+
+    assert int(ntoks_ours.item()) == 0
+    assert int(ntoks_stock.item()) == 0
+    assert mx.isnan(ours).item()
+    assert mx.isnan(stock).item()
+
+
+def test_loss_and_ntoks_match_stock_with_quantized_head() -> None:
+    """Quantized-head parity: our adapter runs `mx.quantized_matmul` directly against
+    the packed int4 head (see `make_chunked_quantized`); the stock side uses a plain
+    dense `nn.Linear` head whose weight is the DEQUANTIZED reconstruction of the exact
+    same quantized weights, sharing the same trunk object so only the head mechanism
+    differs. Measured exactly 0.0 on this seed/shape (fp32, single chunk, vocab=256 <<
+    the 8192 chunk tile) -- matching core's own test_kernel_quant_parity.py precedent of
+    still pinning a small headroom tolerance rather than asserting exact equality even
+    when the measured diff is literally 0.0."""
+    model = _tiny_llama()
+    model.lm_head = model.lm_head.to_quantized(group_size=64, bits=4)
+
+    stock_model = _tiny_llama()
+    stock_model.model = model.model  # share the trunk object: isolates the head only
+    stock_model.lm_head.weight = mx.dequantize(
+        model.lm_head.weight, model.lm_head.scales, model.lm_head.biases,
+        group_size=model.lm_head.group_size, bits=model.lm_head.bits,
+    )
+
+    mx.random.seed(1)
+    batch = mx.random.randint(0, 256, (2, 12))
+    lengths = mx.array([[0, 12], [0, 7]])
+
+    loss_fn = make_loss_fn(model, impl="chunked")
+    ours, ntoks_ours = loss_fn(model, batch, lengths)
+    stock, ntoks_stock = t.default_loss(stock_model, batch, lengths)
+
+    assert int(ntoks_ours.item()) == int(ntoks_stock.item())
+    assert abs(ours.item() - stock.item()) < 1e-5
+
+
 def test_masked_positions_contribute_zero_gradient() -> None:
     """Masked tokens contribute zero loss AND zero gradient. Deterministic construction:
     token 254 sits at input position 1 (0-based) and token 255 at input position 4;
