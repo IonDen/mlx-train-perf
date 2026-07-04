@@ -112,6 +112,14 @@ def test_condition_identity_rejects_reserved_param_key_session_id() -> None:
         condition_identity(kind="loss_layer", session_id="s1", params={"session_id": "oops"})
 
 
+def test_run_identity_rejects_param_colliding_with_internal_field() -> None:
+    """`_RESERVED_PARAM_KEYS` only covers `kind`/`session_id` -- this is the deeper,
+    self-maintaining guard: ANY caller kwarg reusing one of `run_identity`'s OWN internal
+    field names (e.g. `code_sha`) must be rejected, not silently hijack that field."""
+    with pytest.raises(BenchInputError, match="code_sha"):
+        run_identity(model="m", code_sha="HIJACKED")
+
+
 def test_installed_mlx_lm_version_is_none_when_absent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -192,9 +200,12 @@ def test_report_ignores_non_ok_and_corrupt_entries(tmp_path: Path) -> None:
 
 
 def _tiny_loss_layer(name: str, impl: str = "naive") -> Condition:
+    # n*d*v large enough that `g_mac_per_s` (rounded to 3 decimals in `run_loss_layer`)
+    # doesn't round away to 0.000 under subprocess-dispatch overhead noise -- still a
+    # trivially fast shape (no Metal JIT, sub-millisecond compute either way).
     return Condition(
         name=name, kind="loss_layer",
-        params={"n": 8, "d": 4, "v": 16, "dtype": "float32", "impl": impl, "reps": 1},
+        params={"n": 64, "d": 64, "v": 128, "dtype": "float32", "impl": impl, "reps": 1},
     )
 
 
@@ -266,11 +277,46 @@ def test_run_conditions_records_error_when_worker_exits_zero_without_artifact(
     assert data["error_type"] == "WorkerExitedWithoutArtifact"
 
 
+def test_run_conditions_stale_artifact_not_served_as_ok_when_worker_fails_silently(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A STALE artifact (old `session_id`, so identity mismatches -- exactly why the
+    worker gets spawned at all) must not be left in place and reported as this run's
+    truth if the worker that was supposed to replace it fails silently (exits 0, writes
+    nothing). Reproduces the exact scenario: stale artifact with `wall_s=999.0` under an
+    old session, a silently-failing stub worker -- the recorded result must be the
+    error envelope, never the stale `"ok"`."""
+    condition = _tiny_loss_layer("stale_then_silent")
+    out_path = tmp_path / f"{condition.name}.json"
+    stale_ident = condition_identity(
+        kind=condition.kind, session_id="OLD_SESSION", params=condition.params,
+    )
+    write_result(out_path, stale_ident, "ok", wall_s=999.0)
+
+    stub = tmp_path / "silent_stub_worker2.py"
+    stub.write_text("import sys\nsys.exit(0)\n")
+
+    def _spawn_stub(config_path: Path) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, str(stub), "--config", str(config_path)],
+            capture_output=True, text=True, check=False,
+        )
+
+    monkeypatch.setattr(runner, "_spawn_worker", _spawn_stub)
+    paths = run_conditions([condition], tmp_path, session_id=new_session_id())
+    data = json.loads(paths[0].read_text())
+    assert data["status"] == "error"
+    assert data["error_type"] == "WorkerExitedWithoutArtifact"
+    assert data.get("wall_s") != 999.0
+
+
 # --- worker.py: pure(ish) measurement + CLI shell, tiny shapes, no Metal marker ----
 
 
 def test_run_loss_layer_dense_naive_reports_expected_fields() -> None:
-    fields = worker.run_loss_layer({"n": 8, "d": 4, "v": 16, "dtype": "float32",
+    # shape large enough that `g_mac_per_s` (rounded to 3 decimals) doesn't round away
+    # to 0.000 under call-overhead noise at a truly tiny n/d/v -- see `_tiny_loss_layer`.
+    fields = worker.run_loss_layer({"n": 64, "d": 64, "v": 128, "dtype": "float32",
                                     "impl": "naive", "reps": 1})
     assert fields["wall_s"] > 0
     assert len(fields["wall_s_all"]) == 1

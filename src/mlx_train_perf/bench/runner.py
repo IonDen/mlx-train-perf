@@ -48,6 +48,12 @@ def run_conditions(
         paths.append(out_path)
         if result_is_fresh(out_path, ident):
             continue
+        # By definition stale (missing, corrupt, an old error/refusal, or an identity
+        # mismatch) -- remove it BEFORE spawning so `out_path.exists()` after the worker
+        # returns means exactly "THIS worker wrote it". Without this, a worker that fails
+        # silently (exits 0, writes nothing) would leave the stale artifact in place and
+        # the sweep would report someone else's old "ok" result as this run's truth.
+        out_path.unlink(missing_ok=True)
 
         config = {
             "kind": condition.kind, "params": condition.params, "session_id": session_id,
