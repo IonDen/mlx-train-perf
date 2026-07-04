@@ -12,11 +12,19 @@ here.
 
 Sanity-anchored (not tolerance-pinned) against the mlx-train-perf-spike gate
 measurements at production shape (n=8192, V=151936, D=4096, bf16, M1 Max 32 GB): the
-head-only weight terms below land in the same ballpark as the measured resident sizes
-(quantized int4/gs64 head ~0.39 GB, dense/dequantized bf16 head ~1.22 GB), and the kernel
-loss term is negligible next to naive's -- matching the direction (not the exact digits)
-of `results/gate_*.json`. The calibration constants are the only numbers a later,
-real-measurement task is expected to replace.
+kernel loss term is negligible next to naive's, and the naive loss term's own
+coefficient is directly measured against a persisted gate artifact (see
+`Calibration.naive_loss_bytes_per_nv`'s docstring for the derivation) -- matching
+`results/gate_*.json` within ~15% at production shape. The remaining calibration
+constants are honest analytic placeholders a later, real-measurement task is expected
+to replace.
+
+Known limits (not modeled in 0.1.0): full fine-tuning (`lora_rank == 0`) only adds the
+loss layer's own `d_w` term to the loss component -- the BASE MODEL's own weight
+gradient and optimizer state (the dominant cost for full-FT, since every parameter is
+trainable, not just a low-rank adapter) are not modeled anywhere in this planner.
+Estimates for `lora_rank == 0` configs are therefore optimistic; `lora_rank > 0`
+(LoRA/QLoRA) is the case this planner actually models end to end.
 """
 from collections.abc import Iterator
 from dataclasses import dataclass, replace
@@ -122,21 +130,25 @@ def _dtype_bytes(dtype: str) -> int:
 
 
 def _weights_bytes(shape: ModelShape, dtype_size: int) -> int:
-    """`P_total x dtype_size`, or -- for a quantized model (`quant_bits`/`quant_group`
-    set) -- the output-projection ('head') matrix priced at the quantized rate
-    (`bits/8 + 4/group`; the `4` is one bf16 scale + one bf16 bias per group) with the
-    rest of the model (body layers, norms, and the embedding when untied) left at
-    `dtype_size`. This models THIS project's own scope -- a quantized or dense HeadRef
-    swapped into an otherwise dtype-uniform loss layer -- rather than a general
-    whole-model quantization sweep; it is what the quantized-head measured anchor in
-    this module's docstring sanity-checks against."""
+    """`P_total x dtype_size` for a dense model. For a quantized model (`quant_bits`/
+    `quant_group` set), prices the WHOLE model at the quantized rate (`bits/8 +
+    4/group`; the `4` is one bf16 scale + one bf16 bias per group) -- not just the head.
+
+    Controller ruling (task-13 review item 2, supersedes an earlier head-only reading
+    of the brief's ambiguous formula): real mlx-community 4-bit checkpoints quantize the
+    whole model via `mlx_lm.convert`'s uniform `nn.quantize(model, group_size, bits)`,
+    not just the output projection. Pricing only the head at the quantized rate left
+    the (dominant) body layers priced at `dtype_size` -- a phantom cost that, at
+    flagship scale (~8B params, int4), adds roughly 11 GB the checkpoint never actually
+    carries, and would cause the planner to refuse configs that genuinely fit. This is
+    an approximation: a handful of per-parameter exemptions (norms, biases) are real but
+    negligible next to a multi-billion-parameter body, so they're ignored rather than
+    separately modeled. A later measured-vs-predicted gate validates this against a
+    real quantized checkpoint."""
     p_total = shape.param_count()
     if shape.quant_bits is None or shape.quant_group is None:
         return p_total * dtype_size
-    p_head = shape.vocab * shape.hidden
-    p_rest = p_total - p_head - (0 if shape.tied else p_head)
-    head_bytes = p_head * (shape.quant_bits / 8 + 4 / shape.quant_group)
-    return int(p_rest * dtype_size + head_bytes)
+    return int(p_total * (shape.quant_bits / 8 + 4 / shape.quant_group))
 
 
 def _lora_param_count(cfg: TrainConfig, shape: ModelShape) -> int:
@@ -170,10 +182,13 @@ def _head_trainable(cfg: TrainConfig) -> bool:
     return cfg.lora_rank == 0
 
 
-def _loss_bytes(cfg: TrainConfig, shape: ModelShape) -> int:
+def _loss_bytes(cfg: TrainConfig, shape: ModelShape, calib: Calibration) -> int:
     n = cfg.batch * cfg.seq_len
     if cfg.impl == "naive":
-        base = n * shape.vocab * 4 * 2
+        # Calibrated (task-13 review item 3): see Calibration.naive_loss_bytes_per_nv's
+        # docstring for the measured derivation against a persisted gate artifact -- the
+        # brief's literal `n*V*4*2` under-modeled it by ~1.9x at production shape.
+        base = int(calib.naive_loss_bytes_per_nv * n * shape.vocab)
     elif cfg.impl == "chunked":
         base = n * _CHUNK_TILE * 4 * 3
     elif cfg.impl == "kernel":
@@ -199,7 +214,7 @@ def estimate_peak(
         "lora": _lora_bytes(cfg, shape),
         "optimizer": _optimizer_bytes(cfg, shape, calib),
         "activations": _activation_bytes(cfg, shape, calib),
-        "loss": _loss_bytes(cfg, shape),
+        "loss": _loss_bytes(cfg, shape, calib),
     }
     subtotal = sum(components.values())
     predicted_peak = int(subtotal * (1 + calib.overhead_frac))

@@ -2,8 +2,9 @@
   "act_bytes_per_token_layer": 512.0,
   "optimizer_bytes_per_param": 8.0,
   "overhead_frac": 0.10,
+  "naive_loss_bytes_per_nv": 12.0,
   "provenance": {
     "machine": "arm64-M1Max-32GB", "macos": "26.5.1", "mlx_version": "0.31.2",
-    "measured_date": "UNMEASURED-analytic-default (Task 17 replaces this)"
+    "measured_date": "act_bytes_per_token_layer, optimizer_bytes_per_param, and overhead_frac are placeholders pending measured calibration. naive_loss_bytes_per_nv was measured 2026-07-03 from a persisted production-shape benchmark artifact (n=8192, V=151936, D=4096, bf16)."
   }
 }
