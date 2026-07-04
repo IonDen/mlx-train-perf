@@ -650,7 +650,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "mlx", specifier = ">=0.31.2" },
-    { name = "mlx-lm", marker = "extra == 'mlx-lm'", specifier = "==0.31.3" },
+    { name = "mlx-lm", marker = "extra == 'mlx-lm'", specifier = ">=0.31.3,<0.32" },
     { name = "pyobjc-framework-metal", marker = "extra == 'probe'" },
     { name = "transformers", marker = "extra == 'mlx-lm'", specifier = ">=5.0,<5.13" },
 ]
@@ -660,7 +660,7 @@ provides-extras = ["mlx-lm", "probe"]
 dev = [
     { name = "basedpyright" },
     { name = "hypothesis" },
-    { name = "mlx-lm", specifier = "==0.31.3" },
+    { name = "mlx-lm", specifier = ">=0.31.3,<0.32" },
     { name = "mypy" },
     { name = "pyobjc-framework-metal" },
     { name = "pytest", specifier = ">=8" },

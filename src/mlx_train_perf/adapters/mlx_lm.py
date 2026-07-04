@@ -110,7 +110,8 @@ def _head_from_module(module: nn.Module) -> HeadRef:
     if isinstance(module, nn.QuantizedLinear):
         return _quantized_head(module)
     if isinstance(module, nn.Linear):
-        trainable = "weight" in module.trainable_parameters()
+        # nn.Module.trainable_parameters is itself untyped in mlx's source.
+        trainable = "weight" in module.trainable_parameters()  # type: ignore[no-untyped-call]
         return DenseHead(weight=module.weight, trainable=trainable)
     raise AdapterError(
         f"unsupported head module type {type(module).__name__!r}; expected "
@@ -123,7 +124,8 @@ def _tied_head_from_embedding(embedding: nn.Module) -> HeadRef:
     if isinstance(embedding, nn.QuantizedEmbedding):
         return _quantized_head(embedding)
     if isinstance(embedding, nn.Embedding):
-        trainable = "weight" in embedding.trainable_parameters()
+        # nn.Module.trainable_parameters is itself untyped in mlx's source.
+        trainable = "weight" in embedding.trainable_parameters()  # type: ignore[no-untyped-call]
         return tied_head(embedding.weight, trainable=trainable)
     raise AdapterError(
         f"unsupported embedding module type {type(embedding).__name__!r}; expected "

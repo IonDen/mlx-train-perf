@@ -26,7 +26,7 @@ classifiers = [
 # transformers 5.13's auto_factory.py:680 requires an actual class object there
 # (AttributeError: 'str' object has no attribute '__module__'). Verified clean on
 # 5.0.0/5.4.0/5.8.0/5.11.0/5.12.0; verified broken on 5.13.0.
-mlx-lm = ["mlx-lm==0.31.3", "transformers>=5.0,<5.13"]
+mlx-lm = ["mlx-lm>=0.31.3,<0.32", "transformers>=5.0,<5.13"]
 probe = ["pyobjc-framework-Metal"]
 
 [project.scripts]
@@ -41,7 +41,7 @@ dev = [
     # transformers>=5.13 breaks `import mlx_lm` (see the mlx-lm extra above for the
     # verified-broken/verified-clean version detail); pinned here too since dev installs
     # both groups.
-    "mlx-lm==0.31.3", "transformers>=5.0,<5.13", "pyobjc-framework-Metal",
+    "mlx-lm>=0.31.3,<0.32", "transformers>=5.0,<5.13", "pyobjc-framework-Metal",
 ]
 
 [tool.ruff]
@@ -72,16 +72,16 @@ follow_imports = "skip"
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
-# `mlx/` ships both a compiled `core.cpython-*.so` AND a `core/` stub directory as
-# siblings, which confuses mypy's package resolution for sibling packages: `mlx.nn`'s
-# `from .layers import *` re-export resolves to a bare `types.ModuleType` under
-# `--strict` (verified: `reveal_type(mlx.nn)` -> "types.ModuleType", not an error in
-# mlx.nn's own source). `follow_imports = "skip"` treats `nn.*` as `Any` at usage sites
-# instead of surfacing that resolution artifact as spurious attr-defined/name-defined
-# errors on every `nn.Linear` / `nn.Module` reference.
+# `mlx/nn/__init__.py` re-exports its public API via `from .layers import *` with no
+# `__all__` -- under `--strict`'s `no_implicit_reexport`, mypy doesn't treat that as a
+# legitimate re-export, so `nn.Module` / `nn.Linear` / etc. fail as "not defined" / "has
+# no attribute" at every call site (verified: `reveal_type(mlx.nn)` -> a bare
+# `types.ModuleType`, not an error in mlx.nn's own source). `implicit_reexport = true`
+# fixes exactly that resolution gap while still fully attribute-checking `nn.*` (e.g. a
+# typo'd `nn.QuantizedLinaer` is still caught) -- unlike `follow_imports = "skip"`,
+# which would also treat `nn.*` as `Any` and silently swallow that kind of typo.
 module = ["mlx.nn", "mlx.nn.*"]
-follow_imports = "skip"
-ignore_missing_imports = true
+implicit_reexport = true
 
 [tool.pytest.ini_options]
 addopts = "-ra"
