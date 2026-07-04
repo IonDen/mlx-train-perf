@@ -104,23 +104,27 @@ def _dense_probe_inputs() -> list[mx.array]:
 
 
 def _capture_generated_msl(
-    msl_body: str, *, header: str, input_names: Sequence[str], inputs: Sequence[mx.array]
+    msl_body: str, *, header: str, input_names: Sequence[str], inputs: Sequence[mx.array],
+    output_names: Sequence[str], output_shapes: Sequence[tuple[int, ...]],
+    output_dtypes: Sequence[mx.Dtype],
 ) -> str:
     """Launch `msl_body` once, at the tiny probe shape, as a real kernel with
     `verbose=True`, and return the cleaned MSL text the JIT actually compiled.
 
     `input_names`/`inputs` supply the kernel's buffer contract and matching tiny probe
-    data -- every kernel body this project ships so far (dense forward, quantized
-    forward) writes the same `(lse_out, tgt_out)` fp32 outputs from a bf16 `T` template
-    at this same tiny grid/threadgroup shape, so only the INPUT side needs to vary across
-    contracts; the probe's own leading dimension (row count) must match `_PROBE_N` for
-    those two fixed-shape outputs to stay valid."""
+    data; `output_names`/`output_shapes`/`output_dtypes` supply the OUTPUT side the same
+    way -- most kernel bodies this project ships (dense forward, quantized forward) write
+    the same `(lse_out, tgt_out)` fp32 outputs from a bf16 `T` template at this same tiny
+    grid/threadgroup shape, but a body with a genuinely different output contract (e.g.
+    the backward kernel's single `d_hidden_out`) needs its own declaration too. The
+    probe's own leading dimension (row count) must match `_PROBE_N` for a caller reusing
+    the default output shapes to stay valid."""
     kernel = cast(
         _MetalKernel,
         mx.fast.metal_kernel(
             name="mtp_regpressure_probe",
             input_names=list(input_names),
-            output_names=_OUTPUT_NAMES,
+            output_names=list(output_names),
             source=msl_body,
             header=header,
         ),
@@ -131,8 +135,8 @@ def _capture_generated_msl(
             template=[("T", mx.bfloat16)],
             grid=(32, 8, 1),
             threadgroup=(32, 8, 1),
-            output_shapes=[(_PROBE_N,), (_PROBE_N,)],
-            output_dtypes=[mx.float32, mx.float32],
+            output_shapes=list(output_shapes),
+            output_dtypes=list(output_dtypes),
             verbose=True,
         )
         mx.eval(out)
@@ -151,6 +155,9 @@ def compiled_ceiling(
     header: str = "",
     input_names: Sequence[str] | None = None,
     inputs: Sequence[mx.array] | None = None,
+    output_names: Sequence[str] | None = None,
+    output_shapes: Sequence[tuple[int, ...]] | None = None,
+    output_dtypes: Sequence[mx.Dtype] | None = None,
 ) -> int:
     """Compile-time register-pressure telltale for a kernel body (see the module
     docstring for exact semantics -- diagnostic only, never a performance verdict).
@@ -159,17 +166,19 @@ def compiled_ceiling(
     recompiles it standalone through PyObjC's Metal bindings, and returns
     `MTLComputePipelineState.maxTotalThreadsPerThreadgroup` for the resulting pipeline.
 
-    Defaults to the dense forward kernel's own 6-input contract (`hidden, w, targets,
-    offs, lse_in, tgt_in`) and matching tiny probe data when `input_names`/`inputs` are
-    omitted -- this is what every dense-body call exercises. A body declaring a DIFFERENT
-    kernel contract (a different buffer list, a different helper-function dependency)
-    needs both `input_names` (the body's declared buffer names, in order) and `inputs`
-    (already-`mx.eval`'d tiny `mx.array`s, one per name, in the same order) supplied
-    together -- they are validated as a pair, never one without the other. `header` is
-    forwarded to the probe launch's `mx.fast.metal_kernel(header=...)` for bodies that
+    Defaults to the dense forward kernel's own 6-input, 2-output contract (`hidden, w,
+    targets, offs, lse_in, tgt_in` -> `lse_out, tgt_out`) and matching tiny probe data
+    when the contract args are omitted -- this is what every dense-body call exercises. A
+    body declaring a DIFFERENT kernel contract (a different buffer list, a different
+    output shape/dtype, a different helper-function dependency) needs both `input_names`
+    (the body's declared input buffer names, in order) and `inputs` (already-`mx.eval`'d
+    tiny `mx.array`s, one per name, in the same order) supplied together, and/or both
+    `output_names`/`output_shapes`/`output_dtypes` (the body's declared output buffers)
+    supplied together -- each trio/pair is validated together, never partially. `header`
+    is forwarded to the probe launch's `mx.fast.metal_kernel(header=...)` for bodies that
     declare helper functions outside the kernel. For example, the quantized kernel's
-    8-input contract needs its own probe data (`wq`/`sc`/`bi` built via `mx.quantize`)
-    and its dequantize helper's header::
+    8-input contract (same 2-output contract as the default) needs its own probe data
+    (`wq`/`sc`/`bi` built via `mx.quantize`) and its dequantize helper's header::
 
         compiled_ceiling(
             build_quant_source(4),
@@ -177,12 +186,31 @@ def compiled_ceiling(
             input_names=["hidden", "wq", "sc", "bi", "targets", "offs", "lse_in", "tgt_in"],
             inputs=[hidden, wq, sc, bi, targets, offs, lse_in, tgt_in],
         )
+
+    ...while the backward kernel's single `d_hidden_out` output needs the output triple
+    supplied too::
+
+        compiled_ceiling(
+            build_backward_dhidden_source(4),
+            input_names=["hidden", "w", "targets", "offs", "lse", "cotangent", "d_hidden_in"],
+            inputs=[hidden, w, targets, offs, lse, cotangent, d_hidden_in],
+            output_names=["d_hidden_out"],
+            output_shapes=[(n, d)],
+            output_dtypes=[mx.float32],
+        )
     """
     if (input_names is None) != (inputs is None):
         raise ValueError(
             "input_names and inputs must be supplied together (a custom kernel contract "
             "needs both its buffer names and matching probe data), or both omitted to use "
             "the dense forward kernel's default contract"
+        )
+    output_args = (output_names, output_shapes, output_dtypes)
+    if any(a is not None for a in output_args) and not all(a is not None for a in output_args):
+        raise ValueError(
+            "output_names, output_shapes, and output_dtypes must be supplied together (a "
+            "custom kernel contract needs its full output declaration), or all omitted to "
+            "use the dense forward kernel's default (lse_out, tgt_out) contract"
         )
     try:
         import Metal  # noqa: PLC0415
@@ -193,7 +221,17 @@ def compiled_ceiling(
         ) from exc
     names = list(input_names) if input_names is not None else _INPUT_NAMES
     probe_inputs = list(inputs) if inputs is not None else _dense_probe_inputs()
-    msl = _capture_generated_msl(msl_body, header=header, input_names=names, inputs=probe_inputs)
+    out_names = list(output_names) if output_names is not None else _OUTPUT_NAMES
+    out_shapes = (
+        list(output_shapes) if output_shapes is not None else [(_PROBE_N,), (_PROBE_N,)]
+    )
+    out_dtypes = (
+        list(output_dtypes) if output_dtypes is not None else [mx.float32, mx.float32]
+    )
+    msl = _capture_generated_msl(
+        msl_body, header=header, input_names=names, inputs=probe_inputs,
+        output_names=out_names, output_shapes=out_shapes, output_dtypes=out_dtypes,
+    )
     device = Metal.MTLCreateSystemDefaultDevice()
     options = Metal.MTLCompileOptions.new()
     library, compile_error = device.newLibraryWithSource_options_error_(msl, options, None)

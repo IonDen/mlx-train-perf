@@ -20,7 +20,12 @@ from typing import cast
 import mlx.core as mx
 
 from mlx_train_perf.core.chunked import QuantSpec
-from mlx_train_perf.core.kernel.source import QUANT_HELPERS, build_dense_source, build_quant_source
+from mlx_train_perf.core.kernel.source import (
+    QUANT_HELPERS,
+    build_backward_dhidden_source,
+    build_dense_source,
+    build_quant_source,
+)
 from mlx_train_perf.errors import LaunchBudgetError, UnsupportedHeadError
 
 MAX_DISPATCH_SECONDS = 1.0
@@ -91,6 +96,73 @@ def forward(
             output_dtypes=[mx.float32, mx.float32],
         )
     return lse, tgt
+
+
+@functools.cache
+def _backward_dhidden_kernel(row_tiles: int) -> _MetalKernel:
+    kernel = mx.fast.metal_kernel(
+        name=f"mtp_bwd_dhidden_rt{row_tiles}",
+        input_names=["hidden", "w", "targets", "offs", "lse", "cotangent", "d_hidden_in"],
+        output_names=["d_hidden_out"],
+        source=build_backward_dhidden_source(row_tiles),
+    )
+    return cast(_MetalKernel, kernel)
+
+
+def backward_dhidden(
+    hidden: mx.array,
+    w: mx.array,
+    targets: mx.array,
+    lse: mx.array,
+    tgt: mx.array,  # noqa: ARG001 — d_hidden's math needs only lse (see source.py's
+    # derivation comment); accepted for interface parity with the (lse, tgt) residual
+    # pair `forward` saves and the combined `launch.backward` call step 3+ introduces.
+    cotangent: mx.array,
+    *,
+    row_tiles: int,
+    tile: int,
+    rate_macs_per_s: float | None,
+) -> mx.array:
+    """d_hidden-only backward (Task 16b step 2, v0-correct — frozen/QLoRA head path).
+
+    d_hidden = cotangent * sum_j (P_ij - onehot(j == targets_i)) * w_j, with P_ij
+    regenerated tile-wise from the SAVED lse residual (never recomputed) — see
+    `core/kernel/source.py`'s derivation comment for the full math, cross-checked against
+    `core.chunked.chunked_backward` (the proven oracle) before this kernel was written.
+
+    Chained vocab-tile launches accumulate d_hidden across tiles exactly like `forward`
+    chains lse/tgt: full buffers + in-kernel offsets, never a Python-side slice into a
+    chained launch (measured 1.22 GB of retained copies otherwise — see
+    user-metal-kernels workflow-and-gotchas.md). The fp32 accumulator is cast down to
+    `hidden.dtype` exactly once, after the last tile launch.
+
+    Backward recomputes logits tile-wise AND scatter-accumulates into d_hidden — roughly
+    2x the forward's per-tile MAC count — so `check_budget` is called at half the supplied
+    rate: this scales BOTH the per-dispatch and total-time projections by the same 2x
+    factor `check_budget`'s own n*tile*d / n*v*d model uses for the forward.
+    """
+    n, d = hidden.shape
+    v = w.shape[0]
+    if rate_macs_per_s is not None:
+        check_budget(n=n, d=d, v=v, tile=tile, rate_macs_per_s=rate_macs_per_s / 2.0)
+    rows = 8 * row_tiles
+    row_blocks = (n + rows - 1) // rows
+    kernel = _backward_dhidden_kernel(row_tiles)
+    d_hidden = mx.zeros((n, d), dtype=mx.float32)
+    ct32 = cotangent.astype(mx.float32)
+    tg_y = min(8, row_blocks)
+    for v0 in range(0, v, tile):
+        v1 = min(v0 + tile, v)
+        offs = mx.array([v0, v1], dtype=mx.uint32)
+        (d_hidden,) = kernel(
+            inputs=[hidden, w, targets, offs, lse, ct32, d_hidden],
+            template=[("T", hidden.dtype)],
+            grid=(32, row_blocks, 1),
+            threadgroup=(32, tg_y, 1),
+            output_shapes=[(n, d)],
+            output_dtypes=[mx.float32],
+        )
+    return d_hidden.astype(hidden.dtype)
 
 
 @functools.cache

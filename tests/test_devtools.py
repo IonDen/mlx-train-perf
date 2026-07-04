@@ -3,7 +3,12 @@ import builtins
 import mlx.core as mx
 import pytest
 
-from mlx_train_perf.core.kernel.source import QUANT_HELPERS, build_dense_source, build_quant_source
+from mlx_train_perf.core.kernel.source import (
+    QUANT_HELPERS,
+    build_backward_dhidden_source,
+    build_dense_source,
+    build_quant_source,
+)
 from mlx_train_perf.devtools.regpressure import (
     _prepare_msl,
     _strip_banner_and_fences,
@@ -70,6 +75,17 @@ def test_input_names_and_inputs_must_be_supplied_together() -> None:
         compiled_ceiling("out[0] = 1.0f;", inputs=[mx.zeros((1,))])
 
 
+def test_output_contract_args_must_be_supplied_together() -> None:
+    # Same validated-triple pattern as input_names/inputs -- a partial output override is
+    # ambiguous (which of the 3 pieces the caller forgot is not recoverable).
+    with pytest.raises(ValueError, match="supplied together"):
+        compiled_ceiling("out[0] = 1.0f;", output_names=["out"])
+    with pytest.raises(ValueError, match="supplied together"):
+        compiled_ceiling("out[0] = 1.0f;", output_shapes=[(1,)])
+    with pytest.raises(ValueError, match="supplied together"):
+        compiled_ceiling("out[0] = 1.0f;", output_dtypes=[mx.float32])
+
+
 @pytest.mark.metal
 def test_dense_v2e_ceiling_matches_spike_measurement() -> None:
     # spike-measured compiled ceilings: v2e (RT=4) -> 448, v2d (RT=2) -> 640
@@ -104,4 +120,33 @@ def test_quantized_kernel_ceiling_is_plausible() -> None:
         inputs=[hidden, wq, sc, bi, targets, offs, lse, tgt],
     )
     print(f"quantized RT=4 compiled ceiling (observed): {ceiling}")
+    assert 0 < ceiling <= 1024
+
+
+@pytest.mark.metal
+def test_backward_dhidden_kernel_ceiling_is_plausible() -> None:
+    # The v0-correct backward kernel has a DIFFERENT contract on BOTH sides: inputs add
+    # lse/cotangent/d_hidden_in (fixed fp32, not templated on T), and the OUTPUT is a
+    # single (rows, d) fp32 d_hidden_out -- not the dense forward's (lse_out, tgt_out)
+    # pair. This is the capability the parameterized output_names/output_shapes/
+    # output_dtypes args exist for (same precedent as the quantized input contract above).
+    n, d, v = 8, 32, 16
+    mx.random.seed(2)
+    hidden = mx.random.normal((n, d)).astype(mx.bfloat16)
+    w = (mx.random.normal((v, d)) * 0.05).astype(mx.bfloat16)
+    targets = mx.random.randint(0, v, (n,))
+    offs = mx.array([0, v], dtype=mx.uint32)
+    lse = mx.full((n,), float("-inf"), dtype=mx.float32)
+    cotangent = mx.full((n,), 1.0 / n, dtype=mx.float32)
+    d_hidden_in = mx.zeros((n, d), dtype=mx.float32)
+    mx.eval(hidden, w, targets, offs, lse, cotangent, d_hidden_in)
+    ceiling = compiled_ceiling(
+        build_backward_dhidden_source(4),
+        input_names=["hidden", "w", "targets", "offs", "lse", "cotangent", "d_hidden_in"],
+        inputs=[hidden, w, targets, offs, lse, cotangent, d_hidden_in],
+        output_names=["d_hidden_out"],
+        output_shapes=[(n, d)],
+        output_dtypes=[mx.float32],
+    )
+    print(f"backward d_hidden RT=4 compiled ceiling (observed): {ceiling}")
     assert 0 < ceiling <= 1024

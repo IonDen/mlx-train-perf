@@ -338,3 +338,80 @@ def build_quant_source(row_tiles: int) -> str:
     return _QUANT_TEMPLATE.replace("RT_COUNT", str(row_tiles)).replace(
         "ROWS_PER_BLOCK", str(8 * row_tiles)
     )
+
+
+# ---------------------------------------------------------------------------------------
+# Backward (d_hidden-only) kernel -- Task 16b step 2. v0-CORRECT: a simple simdgroup-per-
+# row accumulation, no simdgroup_matrix tiling. Speed is explicitly out of scope for this
+# rung (perf rungs land in later steps); this body exists to prove the derivation and the
+# chained-tile-launch accumulator protocol, not to compete with the forward's MMA rate.
+#
+# Math (derived from d(nll_i)/d(hidden_i) by hand, then cross-checked against
+# core/chunked.py::chunked_backward -- the proven oracle -- BEFORE this body was written):
+#   nll_i = lse_i - tgt_i,  tgt_i = logit_i,target_i,  logit_i,j = hidden_i . w_j
+#   P_i,j = exp(logit_i,j - lse_i)      (regenerated per vocab tile; lse_i is the SAVED
+#                                        residual, deliberately never recomputed here)
+#   d(nll_i)/d(hidden_i) = sum_j (P_i,j - onehot(j == target_i)) * w_j
+#   d_hidden_i = cotangent_i * d(nll_i)/d(hidden_i)
+# accumulated ACROSS chained vocab-tile launches, the SAME feed-forward protocol as the
+# forward's lse_in/lse_out chaining (full buffers + in-kernel offsets, never a Python-side
+# slice into a chained launch). d_hidden has no cross-ROW-BLOCK accumulation (unlike d_w's
+# step 3), so this body needs no atomics / split-K partials.
+#
+# d_hidden_in/d_hidden_out are FIXED fp32 buffers, never templated on T: chaining the
+# accumulator in the hidden/weight dtype (bf16) would re-round on every tile launch --
+# exactly the mixed-precision bug chunked_backward's own docstring warns against. The
+# launcher casts down to hidden.dtype exactly once, after the last tile launch.
+#
+# ROWS_PER_BLOCK reuses `build_dense_source`'s row-block sizing convention (8 * row_tiles)
+# so this body stays launch-compatible with the SAME grid/threadgroup arithmetic
+# `launch.forward` already uses -- a later perf rung can swap the body without touching the
+# launcher's dispatch shape. Internally, though, ROWS_PER_BLOCK rows are processed
+# SEQUENTIALLY by one simdgroup (all 32 lanes cooperating on one row at a time via
+# `simd_sum`), not in parallel across an fm/fn MMA lane split -- v0-correct, deliberately
+# not tiled for throughput.
+_BACKWARD_DHIDDEN_TEMPLATE = """
+    uint ygroup = thread_position_in_grid.y;      // row-block index
+    uint lane = thread_position_in_threadgroup.x;  // 0..31 == simd lane
+    uint n = hidden_shape[0];
+    uint d = hidden_shape[1];
+    uint v0 = offs[0];
+    uint tcols = offs[1] - v0;
+    uint r0 = ygroup * ROWS_PER_BLOCK;
+    if (r0 >= n) return;
+
+    for (uint rt = 0; rt < ROWS_PER_BLOCK; ++rt) {
+        uint row = r0 + rt;
+        if (row >= n) continue;
+        uint tgt_col = (uint)targets[row];
+        float ct_row = cotangent[row];
+        float lse_row = lse[row];
+        const device T* hrow = hidden + (size_t)row * d;
+        const device float* dh_in_row = d_hidden_in + (size_t)row * d;
+        device float* dh_row = d_hidden_out + (size_t)row * d;
+
+        for (uint c = 0; c < tcols; ++c) {
+            const device T* wrow = w + (size_t)(v0 + c) * d;
+            float part = 0.0f;
+            for (uint i = lane; i < d; i += 32) {
+                part += (float)hrow[i] * (float)wrow[i];
+            }
+            float logit = metal::simd_sum(part);
+            float onehot = (tgt_col == v0 + c) ? 1.0f : 0.0f;
+            float coeff = (metal::exp(logit - lse_row) - onehot) * ct_row;
+            for (uint i = lane; i < d; i += 32) {
+                float prev = (c == 0) ? dh_in_row[i] : dh_row[i];
+                dh_row[i] = prev + coeff * (float)wrow[i];
+            }
+        }
+    }
+"""
+
+
+def build_backward_dhidden_source(row_tiles: int) -> str:
+    """MSL function body for the d_hidden-only backward kernel. RT in {2, 4}, same
+    row-block-sizing convention as `build_dense_source` (see the comment above this
+    function for the full derivation and design rationale)."""
+    if row_tiles not in (2, 4):
+        raise ValueError(f"row_tiles must be 2 or 4, got {row_tiles}")
+    return _BACKWARD_DHIDDEN_TEMPLATE.replace("ROWS_PER_BLOCK", str(8 * row_tiles))
