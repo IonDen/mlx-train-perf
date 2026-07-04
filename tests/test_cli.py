@@ -105,6 +105,19 @@ def test_apply_quant_override_sets_bits_and_default_group() -> None:
     assert overridden.quant_group == 64
 
 
+def test_apply_quant_override_preserves_config_derived_group() -> None:
+    """A config.json that already carries non-default quantization metadata
+    (group_size=32) must keep that group size when --quant-bits overrides the bit
+    width -- silently flipping it to the fixed 64 default would understate the
+    quantized weights bytes (rate 4/8 + 4/32 vs 4/8 + 4/64), producing an
+    over-optimistic fit verdict."""
+    shape = ModelShape(vocab=1000, hidden=64, layers=2, intermediate=128, heads=4,
+                        kv_heads=2, tied=False, quant_bits=8, quant_group=32)
+    overridden = _apply_quant_override(shape, 4)
+    assert overridden.quant_bits == 4
+    assert overridden.quant_group == 32
+
+
 def test_plan_quant_bits_flows_through_to_weights_component(tmp_path: Path) -> None:
     base = main(["plan", "--config", str(_config(tmp_path)), "--batch", "1",
                  "--seq-len", "512", "--lora-rank", "8", "--json"])
@@ -311,3 +324,14 @@ def test_bench_end_to_end_subprocess(tmp_path: Path) -> None:
 
 def test_bench_unsupported_suite_tool_error_exit_two(tmp_path: Path) -> None:
     assert main(["bench", "--suite", "bogus-suite", "--out", str(tmp_path)]) == 2
+
+
+def test_bench_help_documents_exit_code_policy(capsys: pytest.CaptureFixture[str]) -> None:
+    """The exit-1 policy (both 'error' and 'refused' count as non-ok) must be visible in
+    `bench -h`, not only in the module docstring. `main` catches argparse's own
+    `SystemExit(0)` for `-h`, so this asserts on the return code, not a raised exception."""
+    rc = main(["bench", "-h"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "error" in out
+    assert "refused" in out

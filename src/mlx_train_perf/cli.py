@@ -53,13 +53,18 @@ def _load_model_shape(config_path: str) -> ModelShape:
 
 def _apply_quant_override(shape: ModelShape, quant_bits: int | None) -> ModelShape:
     """`None` is a passthrough (the shape's own config-derived quantization metadata, if
-    any, is left alone). A given `quant_bits` overrides both fields together -- pricing
-    at the quantized rate needs both `quant_bits` and `quant_group` set (see
-    `estimate._weights_bytes`), so a bits-only override gets the project's fixed default
-    group size rather than leaving `quant_group` inconsistently `None`."""
+    any, is left alone). A given `quant_bits` overrides the bit width; the group size is
+    preserved from the config when the shape already carries one (a config.json with its
+    own `quantization.group_size` is ground truth and must not be silently overwritten --
+    e.g. a real gs=32 checkpoint flipped to the fixed gs=64 default would understate the
+    quantized weights bytes and produce an over-optimistic fit verdict). Only a shape
+    with NO quantization metadata at all (`quant_group is None`) falls back to the
+    project's fixed default group size, since pricing at the quantized rate needs both
+    `quant_bits` and `quant_group` set (see `estimate._weights_bytes`)."""
     if quant_bits is None:
         return shape
-    return replace(shape, quant_bits=quant_bits, quant_group=_DEFAULT_QUANT_GROUP)
+    quant_group = shape.quant_group if shape.quant_group is not None else _DEFAULT_QUANT_GROUP
+    return replace(shape, quant_bits=quant_bits, quant_group=quant_group)
 
 
 def _train_config_from_args(
@@ -205,7 +210,11 @@ def _add_plan_parser(subparsers: "argparse._SubParsersAction[argparse.ArgumentPa
 
 
 def _add_bench_parser(subparsers: "argparse._SubParsersAction[argparse.ArgumentParser]") -> None:
-    bench = subparsers.add_parser("bench", help="run the benchmark harness")
+    bench = subparsers.add_parser(
+        "bench", help="run the benchmark harness",
+        description="Run the benchmark harness. Exit 1 covers both an 'error' and a "
+                     "'refused' condition status -- neither is a clean 'ok' result.",
+    )
     bench.add_argument("--suite", required=True, choices=_BENCH_SUITES, help="bench suite")
     bench.add_argument("--out", required=True, help="output directory for result artifacts")
     bench.add_argument("--n", type=int, nargs="+", default=[512, 2048, 8192],
