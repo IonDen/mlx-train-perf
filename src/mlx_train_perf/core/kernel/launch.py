@@ -23,6 +23,7 @@ from mlx_train_perf.core.chunked import QuantSpec
 from mlx_train_perf.core.kernel.source import (
     QUANT_HELPERS,
     build_backward_dhidden_source,
+    build_backward_dw_source,
     build_dense_source,
     build_quant_source,
 )
@@ -163,6 +164,88 @@ def backward_dhidden(
             output_dtypes=[mx.float32],
         )
     return d_hidden.astype(hidden.dtype)
+
+
+@functools.cache
+def _backward_dw_kernel(row_tiles: int) -> _MetalKernel:
+    kernel = mx.fast.metal_kernel(
+        name=f"mtp_bwd_dw_rt{row_tiles}",
+        input_names=["hidden", "w", "targets", "offs", "lse", "cotangent"],
+        output_names=["d_w_out"],
+        source=build_backward_dw_source(row_tiles),
+        atomic_outputs=True,
+    )
+    return cast(_MetalKernel, kernel)
+
+
+def backward_dw(
+    hidden: mx.array,
+    w: mx.array,
+    targets: mx.array,
+    lse: mx.array,
+    tgt: mx.array,  # noqa: ARG001 — d_w's math needs only lse (see source.py's derivation
+    # comment); accepted for interface parity with the (lse, tgt) residual pair `forward`
+    # saves and the combined `launch.backward` call step 3+ introduces — same convention
+    # as `backward_dhidden`'s unused `tgt`.
+    cotangent: mx.array,
+    *,
+    row_tiles: int,
+    tile: int,
+    rate_macs_per_s: float | None,
+) -> mx.array:
+    """d_w (trainable-head) backward (Task 16b step 3, v0-correct).
+
+    d_w[j,:] = sum_i (P_ij - onehot(j == targets_i)) * cotangent_i * hidden_i,:, with
+    P_ij regenerated tile-wise from the SAVED lse residual (never recomputed) — see
+    `core/kernel/source.py`'s derivation comment for the full math, cross-checked against
+    `core.chunked.chunked_backward` (the proven oracle) before this kernel was written.
+
+    Cross-ROW-BLOCK accumulation (many context-row chunks contending on the same d_w
+    column slice) is the ONE mechanism d_w needs that d_hidden doesn't — ground-truthed
+    correct in Task 16b step 1 (scripts/ground_truth_atomic_outputs.py) via
+    `atomic_outputs=True` + `atomic_fetch_add_explicit` on a native Metal
+    `device atomic<float>*` output. This makes the result BIT-LEVEL NON-DETERMINISTIC
+    run to run (atomics reorder float additions) — see
+    tests/test_kernel_backward_parity.py's repeated-run tolerance test.
+
+    Unlike `backward_dhidden`, tile launches need NO input-output accumulator chain: each
+    vocab tile's d_w rows are structurally DISJOINT from every other tile's rows (a
+    ground-truthed finding, not an assumption — `mx.fast.metal_kernel` allocates a
+    genuinely fresh, independently-`init_value`'d output on every call, confirmed by
+    calling the same atomic kernel repeatedly and observing zero bleed-through between
+    calls), so each launch outputs only its own (tcols, d) fp32 slice and the launcher
+    assembles the full (v, d) buffer with `mx.concatenate` — the same pattern
+    `chunked_backward`'s own trainable-head branch already uses. The fp32 accumulator is
+    cast down to `w.dtype` exactly once, after every tile launch.
+
+    Backward recomputes logits tile-wise AND scatter-accumulates into d_w — roughly 2x the
+    forward's per-tile MAC count, same accounting `backward_dhidden` uses — so
+    `check_budget` is called at half the supplied rate.
+    """
+    n, d = hidden.shape
+    v = w.shape[0]
+    if rate_macs_per_s is not None:
+        check_budget(n=n, d=d, v=v, tile=tile, rate_macs_per_s=rate_macs_per_s / 2.0)
+    rows = 8 * row_tiles
+    row_blocks = (n + rows - 1) // rows
+    kernel = _backward_dw_kernel(row_tiles)
+    ct32 = cotangent.astype(mx.float32)
+    tg_y = min(8, row_blocks)
+    chunks: list[mx.array] = []
+    for v0 in range(0, v, tile):
+        v1 = min(v0 + tile, v)
+        offs = mx.array([v0, v1], dtype=mx.uint32)
+        (d_w_tile,) = kernel(
+            inputs=[hidden, w, targets, offs, lse, ct32],
+            template=[("T", hidden.dtype)],
+            grid=(32, row_blocks, 1),
+            threadgroup=(32, tg_y, 1),
+            output_shapes=[(v1 - v0, d)],
+            output_dtypes=[mx.float32],
+            init_value=0.0,
+        )
+        chunks.append(d_w_tile)
+    return mx.concatenate(chunks, axis=0).astype(w.dtype)
 
 
 @functools.cache

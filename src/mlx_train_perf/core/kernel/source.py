@@ -415,3 +415,94 @@ def build_backward_dhidden_source(row_tiles: int) -> str:
     if row_tiles not in (2, 4):
         raise ValueError(f"row_tiles must be 2 or 4, got {row_tiles}")
     return _BACKWARD_DHIDDEN_TEMPLATE.replace("ROWS_PER_BLOCK", str(8 * row_tiles))
+
+
+# ---------------------------------------------------------------------------------------
+# Backward (d_w) kernel -- Task 16b step 3. v0-CORRECT, same simdgroup-per-row style as
+# `build_backward_dhidden_source`: no simdgroup_matrix tiling, speed explicitly deferred.
+#
+# Math (derived from d(nll_i)/d(w_j) by hand, then cross-checked against
+# core/chunked.py::chunked_backward -- the proven oracle -- BEFORE this body was written):
+#   P_i,j = exp(logit_i,j - lse_i)      (regenerated per vocab tile from the SAVED lse
+#                                        residual, exactly as build_backward_dhidden_source
+#                                        does -- never recomputed from scratch)
+#   d(nll_i)/d(w_j)     = (P_i,j - onehot(j == target_i)) * hidden_i
+#   d_w_j               = sum_i cotangent_i * d(nll_i)/d(w_j)
+# matches chunked_backward's `g32 = (p - onehot) * ct[:, None]` then `g.T @ hidden` exactly
+# (d_w[j,:] = sum_i g[i,j] * hidden[i,:]). `tgt` (the raw target-logit residual) never
+# appears here either, same as d_hidden's derivation -- only `lse` is needed.
+#
+# THE ONE NEW MECHANISM vs d_hidden: d_hidden accumulates PER ROW (each context row i is
+# owned by exactly one row-block -- no cross-row-block contention). d_w accumulates PER
+# VOCAB COLUMN j, and EVERY row-block (a different chunk of context rows) contributes to
+# the SAME d_w[j,:] slice -- genuine cross-row-block contention, exactly what Task 16b
+# Step 1 ground-truthed (scripts/ground_truth_atomic_outputs.py): `atomic_outputs=True` +
+# `atomic_fetch_add_explicit(&out[idx], val, memory_order_relaxed)` on a native Metal
+# `device atomic<float>*` output -- plain assignment fails to compile against it.
+#
+# BUFFER-PERSISTENCE DESIGN (ground-truthed BEFORE writing this body, in a throwaway
+# script mirroring scripts/ground_truth_atomic_outputs.py's mechanism, per the task's
+# instruction not to guess): `mx.fast.metal_kernel` allocates a genuinely FRESH output
+# buffer on every call (re-applying `init_value` every time) -- there is no persistent /
+# mutable-across-calls buffer, confirmed by calling the SAME atomic kernel repeatedly with
+# different row-block counts and seeing each call's result depend ONLY on its own inputs
+# (zero bleed-through). Given that, and given each vocab TILE's d_w rows are structurally
+# DISJOINT from every other tile's rows (column j belongs to exactly one tile), the design
+# needs no `d_w_in`/`d_w_out` accumulator chain at all (unlike d_hidden's cross-TILE
+# chaining, which is real because the SAME row is revisited by every tile): each tile
+# launch outputs ONLY its own (tcols, d) fp32 slice (`atomic_outputs=True`,
+# `init_value=0.0`), contended ACROSS ROW-BLOCKS within that one launch, and the launcher
+# assembles the full (v, d) buffer with a plain `mx.concatenate` across tiles -- the exact
+# pattern `chunked_backward`'s own trainable-head branch already uses
+# (`d_w_chunks.append(g.T @ hidden)` then `mx.concatenate(d_w_chunks, axis=0)`). This also
+# means `v0` is used ONLY to compute the ABSOLUTE column index for the target/onehot
+# comparison and for indexing into `w` -- never to offset the OUTPUT address, which stays
+# tile-local (`c * d + i`, `c` in `[0, tcols)`).
+#
+# d_w_out is a FIXED fp32 atomic output, never templated on T -- same fp32-accumulator
+# rule as d_hidden_in/d_hidden_out. The launcher casts the concatenated result down to
+# `w.dtype` exactly once, after every tile launch.
+_BACKWARD_DW_TEMPLATE = """
+    uint ygroup = thread_position_in_grid.y;      // row-block index (context rows)
+    uint lane = thread_position_in_threadgroup.x;  // 0..31 == simd lane
+    uint n = hidden_shape[0];
+    uint d = hidden_shape[1];
+    uint v0 = offs[0];
+    uint tcols = offs[1] - v0;
+    uint r0 = ygroup * ROWS_PER_BLOCK;
+    if (r0 >= n) return;
+
+    for (uint rt = 0; rt < ROWS_PER_BLOCK; ++rt) {
+        uint row = r0 + rt;
+        if (row >= n) continue;
+        uint tgt_col = (uint)targets[row];
+        float ct_row = cotangent[row];
+        float lse_row = lse[row];
+        const device T* hrow = hidden + (size_t)row * d;
+
+        for (uint c = 0; c < tcols; ++c) {
+            const device T* wrow = w + (size_t)(v0 + c) * d;
+            float part = 0.0f;
+            for (uint i = lane; i < d; i += 32) {
+                part += (float)hrow[i] * (float)wrow[i];
+            }
+            float logit = metal::simd_sum(part);
+            float onehot = (tgt_col == v0 + c) ? 1.0f : 0.0f;
+            float coeff = (metal::exp(logit - lse_row) - onehot) * ct_row;
+            for (uint i = lane; i < d; i += 32) {
+                atomic_fetch_add_explicit(&d_w_out[c * d + i], coeff * (float)hrow[i],
+                                          metal::memory_order_relaxed);
+            }
+        }
+    }
+"""
+
+
+def build_backward_dw_source(row_tiles: int) -> str:
+    """MSL function body for the d_w backward kernel. RT in {2, 4}, same row-block-sizing
+    convention as `build_dense_source`/`build_backward_dhidden_source` (see the comment
+    above this function for the full derivation, the cross-row-block atomics mechanism,
+    and the ground-truthed buffer-persistence design)."""
+    if row_tiles not in (2, 4):
+        raise ValueError(f"row_tiles must be 2 or 4, got {row_tiles}")
+    return _BACKWARD_DW_TEMPLATE.replace("ROWS_PER_BLOCK", str(8 * row_tiles))
