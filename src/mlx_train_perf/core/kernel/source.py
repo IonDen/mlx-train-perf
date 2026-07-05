@@ -418,6 +418,200 @@ def build_backward_dhidden_source(row_tiles: int) -> str:
 
 
 # ---------------------------------------------------------------------------------------
+# Backward (d_hidden-only) MMA kernel -- Task 16b step 4. The frozen/QLoRA-head PERF rung:
+# same math and same (hidden, w, targets, lse, cotangent) -> d_hidden contract as the v0
+# scalar kernel above, but restructured as a fused pair of simdgroup-matrix GEMMs sharing
+# the weight tile, so the dominant cost (regenerating logits) runs at the forward's MMA
+# rate instead of v0's zero-reuse scalar rate.
+#
+#   d_hidden_i = cotangent_i * sum_j (P_i,j - onehot(j == target_i)) * w_j,
+#   P_i,j = exp(logit_i,j - lse_i),   logit_i,j = hidden_i . w_j   (lse is the SAVED
+#                                                                   forward residual)
+#
+# factors, per vocab sub-tile (32 columns == vsub), into:
+#   GEMM-A  logit_block(32rows x 32vsub) = H_block(32rows x d) @ W_sub(32vsub x d)^T
+#           -- EXACTLY the forward's 4x4 `simdgroup_float8x8` accumulation over d; reused
+#           verbatim via `_GEMM_A_LOGIT_REGEN` (sliced out of `_DENSE_TEMPLATE`).
+#   P-form  g = (exp(logit - lse_row) - onehot) * cot_row, applied in place to the C tiles'
+#           per-lane `thread_elements()` (a pure elementwise map -- no data moves between
+#           lanes), masking columns past tcols to 0 so the clamp-duplicated tail the logit
+#           regen loaded contributes nothing to GEMM-B (0 * w == 0).
+#   GEMM-B  d_hidden(32rows x d) += G(32rows x 32vsub) @ W_sub(32vsub x d)
+#           -- a SECOND MMA with the vocab as the contraction axis, streaming the (32 x d)
+#           output over d in 8-column slices. This is the genuinely new structure.
+#
+# GEMM-B's output structure -- the design choice the perf hinges on: it is the SIMPLEST
+# correct one that gets GEMM-A onto MMA. Each lane owns a fixed, disjoint set of d_hidden
+# elements ((fm, fn) bijectively partition the 8x8 output tile -- verified against Apple's
+# shipped `steel/gemm/mma.h::BaseMMAFrag<8,8>::get_coord`, which returns {fn, fm} so the
+# lane's two elements sit at (row=fm, col=fn) and (row=fm, col=fn+1)). So d_hidden needs NO
+# atomics (unlike d_w's cross-row-block contention): each lane read-modify-writes ONLY its
+# own elements, in DEVICE memory, serially across vsub blocks -- the accumulator chains
+# vsub-to-vsub the way the forward chains lse tile-to-tile (first vsub reads the cross-
+# launch input accumulator `d_hidden_in`, later vsubs read back what this same lane just
+# wrote to `d_hidden_out` -- same-thread program order, no barrier). The cost is heavy
+# device read-modify-write traffic (the full (32 x d) accumulator is re-read/re-written per
+# vsub); a d-slice split across simdgroups through threadgroup memory would cut that, but
+# whether GEMM-B's traffic actually dominates is a MEASURED question for a later rung, not
+# something to pre-optimize here -- correctness of GEMM-A-on-MMA is this rung's deliverable.
+#
+# d_hidden_in/d_hidden_out stay FIXED fp32 buffers, never templated on T (chaining the
+# accumulator in bf16 would re-round every vsub -- the mixed-precision bug the v0 kernel and
+# chunked_backward both guard against); the launcher casts to hidden.dtype once at the end.
+# Register economics: G lives in the 4x4 C tiles (32 fp32/lane -- the family-independent
+# optimum), reused in place from GEMM-A, plus one transient output tile Db + one weight tile
+# Wb per (d-slice, row-tile). Measured (devtools/regpressure.py, mlx 0.31.2 / M1 Max): the
+# fused kernel compiles at the forward's OWN ceiling -- 448 (RT=4) / 640 (RT=2), no drop --
+# because reusing the C tiles in place for G and streaming a single transient output tile
+# keeps peak per-lane register state flat. The ceiling is a register-pressure telltale only,
+# never a rate verdict (the measured production rate is the verdict) -- see the regpressure
+# module docstring.
+
+# GEMM-A reused VERBATIM from the forward: the exact vocab-tile `cc` loop that accumulates
+# the 4x4 `simdgroup_float8x8` logit block C[rt][ct] over d (full-chunks + one guarded
+# tail). Sliced from `_DENSE_TEMPLATE` by stable anchors -- the pre-`cc`-loop `uint cl`
+# declaration through the byte just before the forward's online-LSE epilogue -- so it stays
+# byte-identical to the forward and keeps the RT_COUNT sentinels the builder substitutes.
+_GEMM_A_LOGIT_REGEN = _DENSE_TEMPLATE[
+    _DENSE_TEMPLATE.index("    uint cl = tcols - 1;\n") : _DENSE_TEMPLATE.index("        // epilogue:")
+]
+
+# Backward-specific prologue: like the forward's, it caches h[rt] (for GEMM-A) and tg[rt]
+# (for the onehot), but drops the forward's online-LSE state (m/s/tv/ht) and adds the
+# per-row SAVED residual lse_r[rt] and cotangent cot_r[rt] the P-formation needs. ROWS_PER_
+# BLOCK / RT_COUNT are the same sentinels build_dense_source uses.
+_BACKWARD_DHIDDEN_MMA_PROLOGUE = """
+    uint ygroup = thread_position_in_grid.y;      // row-block index
+    uint lane = thread_position_in_threadgroup.x;  // 0..31 == simd lane
+    uint n = hidden_shape[0];
+    uint d = hidden_shape[1];
+    uint v0 = offs[0];
+    uint tcols = offs[1] - v0;
+    uint r0 = ygroup * ROWS_PER_BLOCK;
+    if (r0 >= n) return;
+
+    uint fm = 4 * ((lane >> 4) & 1) + 2 * ((lane >> 2) & 1) + ((lane >> 1) & 1);
+    uint fn = 4 * ((lane >> 3) & 1) + 2 * (lane & 1);
+
+    const device T* h[RT_COUNT];
+    uint tg[RT_COUNT];
+    float lse_r[RT_COUNT], cot_r[RT_COUNT];
+    #pragma clang loop unroll(full)
+    for (uint rt = 0; rt < RT_COUNT; ++rt) {
+        uint row = r0 + fm + 8 * rt;
+        h[rt] = hidden + (size_t)metal::min(row, n - 1) * d;
+        tg[rt] = (row < n) ? (uint)targets[row] : 0xFFFFFFFFu;
+        lse_r[rt] = (row < n) ? lse[row] : 0.0f;
+        cot_r[rt] = (row < n) ? cotangent[row] : 0.0f;
+    }
+"""
+
+# P-formation + GEMM-B, spliced in where the forward's epilogue was (still inside the `cc`
+# loop `_GEMM_A_LOGIT_REGEN` opened; the trailing `}` here closes it). See the block comment
+# above build_backward_dhidden_mma_source for the derivation and the fragment layout.
+_BACKWARD_DHIDDEN_MMA_GEMMB = """        // P-formation: regenerated logit tile C[rt][ct] -> gradient coefficient g, in place
+        // in simdgroup-matrix state. Columns past tcols (clamp-duplicated by the logit
+        // regen) are masked to 0 so GEMM-B ignores them.
+        #pragma clang loop unroll(full)
+        for (uint rt = 0; rt < RT_COUNT; ++rt) {
+            #pragma clang loop unroll(full)
+            for (uint ct = 0; ct < 4; ++ct) {
+                uint col0 = cc + 8 * ct + fn;
+                uint col1 = cc + 8 * ct + fn + 1;
+                float g0 = (col0 < tcols)
+                    ? (metal::exp(C[rt][ct].thread_elements()[0] - lse_r[rt])
+                       - ((tg[rt] == v0 + col0) ? 1.0f : 0.0f)) * cot_r[rt]
+                    : 0.0f;
+                float g1 = (col1 < tcols)
+                    ? (metal::exp(C[rt][ct].thread_elements()[1] - lse_r[rt])
+                       - ((tg[rt] == v0 + col1) ? 1.0f : 0.0f)) * cot_r[rt]
+                    : 0.0f;
+                C[rt][ct].thread_elements()[0] = g0;
+                C[rt][ct].thread_elements()[1] = g1;
+            }
+        }
+        // GEMM-B: d_hidden(rows x d) += G(rows x 32) @ W_sub(32 x d). C now holds G; W_sub's
+        // fragment maps fragment-row fm -> vocab-in-chunk, fragment-col fn -> d-column
+        // (mirror of GEMM-A's B load, contraction axis swapped from d to vocab). Each lane
+        // read-modify-writes ONLY its own output elements; the accumulator chains vsub-to-
+        // vsub -- the first vsub reads the cross-launch input accumulator d_hidden_in, later
+        // vsubs read back d_hidden_out. The read is a per-value ternary (not a chosen
+        // pointer): d_hidden_in is a `const device float*` input, so it cannot alias the
+        // mutable d_hidden_out output pointer -- same value-select the v0 kernel uses.
+        uint dfo = d & ~7u;
+        for (uint d0d = 0; d0d < dfo; d0d += 8) {
+            #pragma clang loop unroll(full)
+            for (uint rt = 0; rt < RT_COUNT; ++rt) {
+                metal::simdgroup_float8x8 Db = metal::make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+                #pragma clang loop unroll(full)
+                for (uint ct = 0; ct < 4; ++ct) {
+                    metal::simdgroup_float8x8 Wb;
+                    const device T* wr = w + (size_t)(v0 + metal::min(cc + 8 * ct + fm, cl)) * d;
+                    Wb.thread_elements()[0] = (float)wr[d0d + fn];
+                    Wb.thread_elements()[1] = (float)wr[d0d + fn + 1];
+                    metal::simdgroup_multiply_accumulate(Db, C[rt][ct], Wb, Db);
+                }
+                uint row = r0 + fm + 8 * rt;
+                if (row < n) {
+                    size_t base = (size_t)row * d + d0d + fn;
+                    float p0 = (cc == 0) ? d_hidden_in[base] : d_hidden_out[base];
+                    float p1 = (cc == 0) ? d_hidden_in[base + 1] : d_hidden_out[base + 1];
+                    d_hidden_out[base] = p0 + Db.thread_elements()[0];
+                    d_hidden_out[base + 1] = p1 + Db.thread_elements()[1];
+                }
+            }
+        }
+        if (dfo < d) {                                // single guarded d-tail slice
+            #pragma clang loop unroll(full)
+            for (uint rt = 0; rt < RT_COUNT; ++rt) {
+                metal::simdgroup_float8x8 Db = metal::make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+                #pragma clang loop unroll(full)
+                for (uint ct = 0; ct < 4; ++ct) {
+                    metal::simdgroup_float8x8 Wb;
+                    const device T* wr = w + (size_t)(v0 + metal::min(cc + 8 * ct + fm, cl)) * d;
+                    uint ca = dfo + fn;
+                    uint cb = dfo + fn + 1;
+                    Wb.thread_elements()[0] = (ca < d) ? (float)wr[ca] : 0.0f;
+                    Wb.thread_elements()[1] = (cb < d) ? (float)wr[cb] : 0.0f;
+                    metal::simdgroup_multiply_accumulate(Db, C[rt][ct], Wb, Db);
+                }
+                uint row = r0 + fm + 8 * rt;
+                if (row < n) {
+                    size_t rbase = (size_t)row * d;
+                    uint ca = dfo + fn;
+                    uint cb = dfo + fn + 1;
+                    if (ca < d) {
+                        float p = (cc == 0) ? d_hidden_in[rbase + ca] : d_hidden_out[rbase + ca];
+                        d_hidden_out[rbase + ca] = p + Db.thread_elements()[0];
+                    }
+                    if (cb < d) {
+                        float p = (cc == 0) ? d_hidden_in[rbase + cb] : d_hidden_out[rbase + cb];
+                        d_hidden_out[rbase + cb] = p + Db.thread_elements()[1];
+                    }
+                }
+            }
+        }
+    }
+"""
+
+_BACKWARD_DHIDDEN_MMA_TEMPLATE = (
+    _BACKWARD_DHIDDEN_MMA_PROLOGUE + _GEMM_A_LOGIT_REGEN + _BACKWARD_DHIDDEN_MMA_GEMMB
+)
+
+
+def build_backward_dhidden_mma_source(row_tiles: int) -> str:
+    """MSL function body for the fused two-GEMM d_hidden-only backward kernel (Task 16b
+    step 4). RT in {2, 4}, same row-block-sizing convention as `build_dense_source`; the
+    logit-regeneration GEMM is reused verbatim from the forward (see the block comment above
+    for the full derivation, the fragment layout, and the GEMM-B output-structure choice)."""
+    if row_tiles not in (2, 4):
+        raise ValueError(f"row_tiles must be 2 or 4, got {row_tiles}")
+    return _BACKWARD_DHIDDEN_MMA_TEMPLATE.replace("RT_COUNT", str(row_tiles)).replace(
+        "ROWS_PER_BLOCK", str(8 * row_tiles)
+    )
+
+
+# ---------------------------------------------------------------------------------------
 # Backward (d_w) kernel -- Task 16b step 3. v0-CORRECT, same simdgroup-per-row style as
 # `build_backward_dhidden_source`: no simdgroup_matrix tiling, speed explicitly deferred.
 #

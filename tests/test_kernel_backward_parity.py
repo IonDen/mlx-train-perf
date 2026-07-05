@@ -16,7 +16,12 @@ import mlx.core as mx
 import pytest
 
 from mlx_train_perf.core.chunked import chunked_backward
-from mlx_train_perf.core.kernel.launch import backward_dhidden, backward_dw, forward
+from mlx_train_perf.core.kernel.launch import (
+    backward_dhidden,
+    backward_dhidden_mma,
+    backward_dw,
+    forward,
+)
 
 pytestmark = pytest.mark.metal
 
@@ -91,6 +96,111 @@ def test_dhidden_output_shape_and_dtype_match_hidden() -> None:
     lse, tgt = forward(hidden, w, targets, row_tiles=4, tile=128, rate_macs_per_s=GENEROUS_RATE)
     d_hidden = backward_dhidden(hidden, w, targets, lse, tgt, ct, row_tiles=4, tile=128,
                                 rate_macs_per_s=GENEROUS_RATE)
+    assert d_hidden.shape == hidden.shape
+    assert d_hidden.dtype == hidden.dtype
+    assert bool(mx.isfinite(d_hidden.astype(mx.float32)).all().item())
+
+
+# ---------------------------------------------------------------------------------------
+# d_hidden MMA kernel (Task 16b step 4): the frozen-path perf rung. Same math and same
+# (hidden, w, targets, lse, cotangent) -> d_hidden contract as the v0 scalar kernel, but
+# fused as two simdgroup-matrix GEMMs -- GEMM-A regenerates logits (the forward's inner
+# loop, reused verbatim), then GEMM-B contracts the softmax-weighted coefficients against
+# the same weight tile to accumulate d_hidden. Two independent parity anchors: the pure-MLX
+# `chunked_backward` oracle AND the already-proven v0 scalar kernel (two kernels, one truth).
+
+
+@pytest.mark.parametrize(("n", "d", "v", "tile"), CASES)
+@pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16])
+@pytest.mark.parametrize("row_tiles", [2, 4])
+def test_dhidden_mma_parity_vs_chunked_backward_oracle(
+    n: int, d: int, v: int, tile: int, dtype: mx.Dtype, row_tiles: int,
+) -> None:
+    mx.random.seed(3)
+    hidden = mx.random.normal((n, d)).astype(dtype)
+    w = (mx.random.normal((v, d)) * 0.05).astype(dtype)
+    targets = mx.random.randint(0, v, (n,))
+    targets[0] = 0                          # planted: first column
+    targets[1] = v - 1                      # planted: last column
+    targets[2] = min(tile, v) - 1           # planted: first-tile boundary
+    ct = _nonuniform_cotangent(n)
+
+    lse, tgt = forward(hidden, w, targets, row_tiles=row_tiles, tile=tile,
+                       rate_macs_per_s=GENEROUS_RATE)
+
+    ours = backward_dhidden_mma(hidden, w, targets, lse, tgt, ct, row_tiles=row_tiles,
+                                tile=tile, rate_macs_per_s=GENEROUS_RATE)
+
+    def mm(v0: int, v1: int) -> mx.array:
+        return (hidden @ w[v0:v1].T).astype(mx.float32)
+
+    w_chunk: Callable[[int, int], mx.array] = lambda a, b: w[a:b]  # noqa: E731
+    ref, d_w = chunked_backward(
+        hidden=hidden, matmul_chunk=mm, w_chunk=w_chunk, targets=targets, lse=lse,
+        cotangent=ct, v=v, chunk_size=tile, head_trainable=False,
+    )
+    assert d_w is None
+    # RED gate was step 2's own d_hidden pins (2e-6 fp32 / 5e-3 bf16). GEMM-A and GEMM-B both
+    # accumulate fp32 in simdgroup-matrix hardware state (bf16 inputs are cast to float per
+    # fragment element before every MMA), so the MMA kernel sits in the SAME reduction-order-
+    # noise class as the v0 scalar kernel -- and MEASURES it: over this FULL grid (both
+    # row_tiles, planted boundary targets, nonuniform cotangent) the worst diffs are
+    # 7.152557373046875e-07 (fp32, row_tiles=2, n=8192,d=32,v=1024,tile=1024) and 0.001953125
+    # (bf16, row_tiles=2, n=64,d=32,v=1000,tile=250) -- essentially identical to step 2's own
+    # measured worsts (8.05e-07 / 0.001953125), the bf16 side being dominated by the ORACLE's
+    # bf16 g @ w matmul (the kernel keeps that product in fp32, so it is the MORE precise
+    # side). Pin fp32 2e-6 (~2.8x margin) and bf16 5e-3 (~2.6x margin) -- the same pins step 2
+    # measured for this identical noise class.
+    tol = 2e-6 if dtype == mx.float32 else 5e-3
+    assert mx.abs(ours.astype(mx.float32) - ref.astype(mx.float32)).max().item() < tol
+
+
+@pytest.mark.parametrize(("n", "d", "v", "tile"), CASES)
+@pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16])
+@pytest.mark.parametrize("row_tiles", [2, 4])
+def test_dhidden_mma_agrees_with_v0_scalar_kernel(
+    n: int, d: int, v: int, tile: int, dtype: mx.Dtype, row_tiles: int,
+) -> None:
+    # Two kernels, one truth: the MMA kernel and the proven v0 scalar kernel consume the
+    # IDENTICAL (hidden, w, targets, lse, cotangent) and must agree. Both accumulate fp32,
+    # so this is a tighter gate than either-vs-oracle -- it isolates the MMA restructuring
+    # from the oracle's own (bf16) rounding.
+    mx.random.seed(3)
+    hidden = mx.random.normal((n, d)).astype(dtype)
+    w = (mx.random.normal((v, d)) * 0.05).astype(dtype)
+    targets = mx.random.randint(0, v, (n,))
+    targets[0] = 0
+    targets[1] = v - 1
+    targets[2] = min(tile, v) - 1
+    ct = _nonuniform_cotangent(n)
+
+    lse, tgt = forward(hidden, w, targets, row_tiles=row_tiles, tile=tile,
+                       rate_macs_per_s=GENEROUS_RATE)
+    v0_out = backward_dhidden(hidden, w, targets, lse, tgt, ct, row_tiles=row_tiles,
+                              tile=tile, rate_macs_per_s=GENEROUS_RATE)
+    mma_out = backward_dhidden_mma(hidden, w, targets, lse, tgt, ct, row_tiles=row_tiles,
+                                   tile=tile, rate_macs_per_s=GENEROUS_RATE)
+    # Measured worst over the full grid: 8.046627044677734e-07 (fp32, row_tiles=2,
+    # n=128,d=64,v=8192,tile=1024) and 0.0009765625 (bf16, row_tiles=2,
+    # n=8192,d=32,v=1024,tile=1024). Both are pure fp32/bf16 reduction-order noise between two
+    # fp32-accumulating structures (v0's scalar simd_sum dot vs the MMA's simdgroup-matrix
+    # accumulation) -- the bf16 cross-check is TIGHTER than either-vs-oracle because both
+    # sides keep the g @ w product in fp32 (only the final cast to bf16 rounds). Pin fp32 2e-6
+    # (~2.5x) and bf16 3e-3 (~3x).
+    tol = 2e-6 if dtype == mx.float32 else 3e-3
+    assert mx.abs(v0_out.astype(mx.float32) - mma_out.astype(mx.float32)).max().item() < tol
+
+
+def test_dhidden_mma_output_shape_and_dtype_match_hidden() -> None:
+    mx.random.seed(4)
+    n, d, v = 33, 16, 128
+    hidden = mx.random.normal((n, d)).astype(mx.bfloat16)
+    w = (mx.random.normal((v, d)) * 0.05).astype(mx.bfloat16)
+    targets = mx.random.randint(0, v, (n,))
+    ct = mx.full((n,), 1.0 / n)
+    lse, tgt = forward(hidden, w, targets, row_tiles=4, tile=128, rate_macs_per_s=GENEROUS_RATE)
+    d_hidden = backward_dhidden_mma(hidden, w, targets, lse, tgt, ct, row_tiles=4, tile=128,
+                                    rate_macs_per_s=GENEROUS_RATE)
     assert d_hidden.shape == hidden.shape
     assert d_hidden.dtype == hidden.dtype
     assert bool(mx.isfinite(d_hidden.astype(mx.float32)).all().item())
