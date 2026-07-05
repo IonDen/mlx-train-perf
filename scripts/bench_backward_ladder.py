@@ -1,55 +1,80 @@
-"""Per-rung bench for the backward ladder (Task 16b, step 4 prerequisite).
+"""Per-rung bench for the backward ladder (Task 16b, step 4/5 — the STOP-table bench).
 
 Conditions (subprocess-per-condition -- own MLX allocator state, no cross-condition
 buffer retention):
 
-  staged_vjp_frozen     -- DenseHead(trainable=False) through `linear_cross_entropy`'s
-                           `impl="chunked"` custom_function, `mx.value_and_grad` w.r.t.
-                           hidden ONLY (argnums=(0,)). `core.chunked.make_chunked_dense`'s
-                           vjp unconditionally computes a d_w cotangent too (it does not
-                           branch on `head.trainable`), but since nothing downstream ever
+  chunked_fallback_frozen / chunked_fallback_trainable
+                        -- DenseHead through `linear_cross_entropy`'s `impl="chunked"`
+                           custom_function: the FULLY-CHUNKED fallback (chunked forward
+                           AND chunked vjp — no fused kernel anywhere in this path).
+                           `mx.value_and_grad` w.r.t. hidden ONLY (argnums=(0,)) for
+                           frozen, w.r.t. (hidden, w) (argnums=(0, 1)) for trainable --
+                           `core.chunked.make_chunked_dense`'s vjp unconditionally
+                           computes a d_w cotangent too (it does not branch on
+                           `head.trainable`), but since nothing downstream ever
                            references or `mx.eval`s that cotangent under argnums=(0,),
                            MLX's lazy scheduler never executes that branch -- confirmed
                            empirically (a throwaway probe measured a ~3.9x wall-time gap
                            between argnums=(0,) and argnums=(0,1) against an identical
-                           vjp body with a deliberately expensive d_w branch). This is the
-                           SAME mechanism `mlx-train-perf-spike/gate_trainstep.py`'s own
-                           `staged`/`staged_frozen` conditions relied on, routed through
-                           the shipped library entry point instead of spike-local
-                           custom_functions. Re-measures the gate's staged-frozen baseline
-                           same-session.
-  staged_vjp_trainable  -- DenseHead(trainable=True), `value_and_grad` w.r.t. (hidden, w)
-                           (argnums=(0, 1)) -- the shared vjp's d_w branch is genuinely
-                           evaluated this time. Re-measures the gate's staged-trainable
-                           baseline same-session.
-  kernel_dhidden_v0     -- `backward_dhidden` ALONE. `forward` runs once, UNMEASURED
-                           (setup only, outside the timed/peak window) to produce the
-                           real (lse, tgt) residual the backward kernel needs; then the
-                           backward kernel's OWN rate is ramped (`ramp_tile_and_rate`,
-                           below) -- its v0 rate is UNKNOWN and must never be assumed
-                           from the forward's measured rate -- and the timed loop runs
-                           ONLY the backward dispatch at the tile the ramp converged to.
+                           vjp body with a deliberately expensive d_w branch).
+                           RENAMED from `staged_vjp_frozen`/`staged_vjp_trainable`
+                           (mislabel found by the production run: `impl="chunked"` is
+                           NOT the shipping staged mechanism -- it is the chunked
+                           fallback, whose fully-streamed FORWARD reads 8.5/7.9 GB, not
+                           the gate's 2.47 GB, precisely because it never touches the
+                           fused kernel forward at all).
+  staged_kernel_frozen / staged_kernel_trainable
+                        -- the SAME `_staged_fn` wiring, `impl="kernel"` instead: the
+                           REAL shipping staged mechanism (fused kernel forward +
+                           chunked vjp backward, via `loss.py`'s `_kernel_nll_dense`).
+                           This is the actual incumbent the fused MMA backward rung
+                           competes against. A dedicated honesty-guard test (see
+                           tests/test_bench_backward_ladder.py) proves this resolves to
+                           `Resolution.impl == "kernel"`, never silently falling back to
+                           chunked the way the ORIGINAL staged_vjp_* mislabel did.
+  kernel_dhidden_v0     -- `backward_dhidden` (the v0, zero-reuse-scalar kernel) ALONE.
+  kernel_dhidden_mma    -- `backward_dhidden_mma` (the fused two-GEMM MMA kernel,
+                           step 4, committed + review-approved) ALONE, same ramp
+                           discipline as kernel_dhidden_v0. THIS is the new number the
+                           STOP table is built from -- the direct MMA-vs-chunked
+                           backward comparison partner is `chunked_dhidden_alone`,
+                           below (both share one kernel forward's saved lse/tgt).
   kernel_dw_v0          -- `backward_dw` ALONE, same ramp discipline.
-  kernel_backward_v0_combined -- d_hidden + d_w run back to back (the real trainable-
-                           path cost of the two current, UNFUSED v0 kernels -- each pays
-                           its own full logit-regeneration cost; see
+  kernel_backward_v0_combined -- d_hidden + d_w (v0 kernels) run back to back (the real
+                           trainable-path cost of the two current, UNFUSED v0 kernels --
+                           each pays its own full logit-regeneration cost; see
                            `macs_for_condition`'s docstring for why this is 4x base MACs,
-                           not the ~2x a future fused kernel would achieve).
+                           not the ~2x a future fused kernel would achieve). Kept as-is:
+                           its refusals are the v0 baseline row for the STOP table.
+  chunked_dhidden_alone -- `core.chunked.chunked_backward` (the proven chunked backward,
+                           `head_trainable=False`) ALONE, on the SAME saved (lse, tgt)
+                           residual a kernel forward produced -- the direct wall+memory
+                           comparison partner for `kernel_dhidden_mma`. No launch guard
+                           (pure MLX, no `check_budget` anywhere on this path).
+
+`kernel_dhidden_v0`/`kernel_dhidden_mma`/`kernel_dw_v0`/`kernel_backward_v0_combined`:
+`forward` runs once, UNMEASURED (setup only, outside the timed/peak window) to produce
+the real (lse, tgt) residual the backward kernel needs; the backward kernel's OWN rate is
+then ramped (`ramp_tile_and_rate`, below) -- its rate is UNKNOWN and must never be
+assumed from the forward's -- and the timed loop runs ONLY the backward dispatch at the
+tile the ramp converged to. `chunked_dhidden_alone` shares this same "one forward, then
+time only the backward" discipline, just with no ramp (pure MLX has no launch budget).
 
 Each condition writes its own JSON artifact to `_artifacts/bench_backward_ladder/` the
 instant it finishes (`mlx_train_perf.bench.artifacts.write_result` -- atomic tmp+rename),
 and resume skips a condition whose artifact identity is fresh
 (`mlx_train_perf.bench.artifacts.run_identity`/`result_is_fresh` -- `code_sha` there is
 computed over `CODE_SHA_DEPS`, which already covers `core/kernel/launch.py` and
-`core/kernel/source.py` (BOTH backward builders/launchers: `build_backward_dhidden_source`
-+ `build_backward_dw_source`, `backward_dhidden` + `backward_dw`) plus `core/loss.py` and
-`core/chunked.py` (the staged-vjp path). `CODE_SHA_DEPS` deliberately excludes ad hoc
-bench scripts under `scripts/` though, so this script's identity ALSO carries its own
+`core/kernel/source.py` (all THREE backward builders/launchers: `build_backward_dhidden_
+source` + `build_backward_dhidden_mma_source` + `build_backward_dw_source`,
+`backward_dhidden` + `backward_dhidden_mma` + `backward_dw`) plus `core/loss.py` and
+`core/chunked.py` (the staged/chunked-vjp paths). `CODE_SHA_DEPS` deliberately excludes ad
+hoc bench scripts under `scripts/` though, so this script's identity ALSO carries its own
 `script_sha()` (same convention `ground_truth_atomic_outputs.py` established) -- without
-it, an edit to THIS script's OWN measurement logic (the exact `ramp_tile_and_rate`
-MAC-accounting fix below) would not invalidate a stale artifact. An interruption loses at
-most one condition's run. A `LaunchBudgetError` refusal (either during ramp-driven setup
-or the final timed dispatch) IS a result -- recorded, not a crash.
+it, an edit to THIS script's OWN measurement logic would not invalidate a stale artifact.
+An interruption loses at most one condition's run. A `LaunchBudgetError` refusal (either
+during ramp-driven setup or the final timed dispatch) IS a result -- recorded, not a
+crash.
 
 `--tiny` runs the SAME code paths at a cheap synthetic shape (n=256, v=2048, d=256) for
 end-to-end verification, writing to `bench_<condition>_tiny.json` -- a DIFFERENT filename
@@ -75,11 +100,13 @@ from pathlib import Path
 import mlx.core as mx
 
 from mlx_train_perf.bench.artifacts import result_is_fresh, run_identity, write_result
+from mlx_train_perf.core.chunked import chunked_backward
 from mlx_train_perf.core.guards import install_guardrails
 from mlx_train_perf.core.kernel.dispatch import select_variant
 from mlx_train_perf.core.kernel.launch import (
     SAFETY_FACTOR,
     backward_dhidden,
+    backward_dhidden_mma,
     backward_dw,
     calibrated_rate,
     forward,
@@ -93,11 +120,23 @@ from mlx_train_perf.errors import LaunchBudgetError
 N, V, D = 8192, 151936, 4096
 TINY_N, TINY_V, TINY_D = 256, 2048, 256
 DTYPE = mx.bfloat16
-FORWARD_TILE = 8192          # fixed tile for the (unmeasured, setup-only) forward call
+FORWARD_TILE = 8192          # fixed tile for the (unmeasured, setup-only) forward call;
+                             # also reused as chunked_backward's chunk_size (pure MLX --
+                             # no launch-budget concept, matches loss.py's own default).
 REPS = 3
+
+# The two `impl` values `_staged_fn` can be built with -- named constants, not inline
+# string literals, specifically so the honesty-guard test in
+# tests/test_bench_backward_ladder.py imports and checks THESE (the actual wiring),
+# rather than asserting an independent literal that could drift from the real dispatch.
+CHUNKED_FALLBACK_IMPL = "chunked"
+STAGED_KERNEL_IMPL = "kernel"
+
 CONDITIONS = (
-    "staged_vjp_frozen", "staged_vjp_trainable",
-    "kernel_dhidden_v0", "kernel_dw_v0", "kernel_backward_v0_combined",
+    "chunked_fallback_frozen", "chunked_fallback_trainable",
+    "staged_kernel_frozen", "staged_kernel_trainable",
+    "kernel_dhidden_v0", "kernel_dhidden_mma", "kernel_dw_v0",
+    "kernel_backward_v0_combined", "chunked_dhidden_alone",
 )
 
 _SCRIPTS_DIR = Path(__file__).resolve().parent
@@ -124,26 +163,34 @@ def macs_for_condition(condition: str, *, n: int, v: int, d: int) -> int:
     rate (G MAC/s) is computed against. Never used for the launch-budget guard itself
     (each kernel call's own `check_budget` already accounts its own MAC cost internally).
 
-    staged_vjp_frozen: forward (1x n*v*d) + the chunked backward's d_hidden-only cost
-    (1x) -- the shared vjp's d_w branch exists but is never EVALUATED (argnums=(0,)
-    only; see the module docstring), so it costs nothing here.
-    staged_vjp_trainable: forward (1x) + chunked backward's d_hidden (1x) + d_w (1x).
-    kernel_dhidden_v0 / kernel_dw_v0: EACH kernel alone regenerates logits tile-wise
-    (1x) AND scatter-accumulates its own gradient (1x) -- 2x. No forward MACs counted
-    here: the forward that produces (lse, tgt) runs once, unmeasured, outside the timed
-    window (isolating the backward kernel's OWN cost is the point of these conditions).
-    kernel_backward_v0_combined: both kernels run back to back, NOT yet fused -- there is
-    no shared logit regeneration between them (each is its own separate Metal kernel with
-    its own internal recompute), so this is genuinely 4x (2x + 2x) base MACs, not the ~2x
-    a future FUSED kernel would achieve by sharing the recompute across both
-    accumulations.
+    chunked_fallback_frozen / staged_kernel_frozen: forward (1x n*v*d) + the chunked
+    backward's d_hidden-only cost (1x) -- the shared vjp's d_w branch exists but is
+    never EVALUATED (argnums=(0,) only; see the module docstring), so it costs nothing
+    here. The forward IMPLEMENTATION differs between the two (chunked-streamed vs the
+    fused kernel), but the MAC COUNT this model charges is the same either way -- both
+    still do one N*V*D-shaped forward pass.
+    chunked_fallback_trainable / staged_kernel_trainable: forward (1x) + chunked
+    backward's d_hidden (1x) + d_w (1x) = 3x.
+    kernel_dhidden_v0 / kernel_dhidden_mma / kernel_dw_v0 / chunked_dhidden_alone: EACH
+    backward alone regenerates logits tile-wise (1x) AND accumulates its own gradient
+    (1x) -- 2x. No forward MACs counted here: the forward that produces (lse, tgt) runs
+    once, unmeasured, outside the timed window (isolating the backward's OWN cost is the
+    point of these conditions) -- this applies uniformly whether the backward is a v0
+    kernel, the MMA kernel, or the pure-MLX chunked backward.
+    kernel_backward_v0_combined: both v0 kernels run back to back, NOT yet fused --
+    there is no shared logit regeneration between them (each is its own separate Metal
+    kernel with its own internal recompute), so this is genuinely 4x (2x + 2x) base
+    MACs, not the ~2x a future FUSED kernel would achieve by sharing the recompute
+    across both accumulations.
     """
     base = n * v * d
-    if condition == "staged_vjp_frozen":
+    if condition in ("chunked_fallback_frozen", "staged_kernel_frozen"):
         return 2 * base
-    if condition == "staged_vjp_trainable":
+    if condition in ("chunked_fallback_trainable", "staged_kernel_trainable"):
         return 3 * base
-    if condition in ("kernel_dhidden_v0", "kernel_dw_v0"):
+    if condition in (
+        "kernel_dhidden_v0", "kernel_dhidden_mma", "kernel_dw_v0", "chunked_dhidden_alone",
+    ):
         return 2 * base
     if condition == "kernel_backward_v0_combined":
         return 4 * base
@@ -159,7 +206,7 @@ def ramp_tile_and_rate(
     measurement) but with DIFFERENT MAC accounting, for a reason that must not be
     flattened into "mirrors calibrate() exactly" -- doing so once produced a real bug
     (fixed here; see below). Also returns the tile the ramp converged to (`calibrate()`
-    itself only returns the rate) since the backward kernels' v0 rate is UNKNOWN (never
+    itself only returns the rate) since the backward kernels' rate is UNKNOWN (never
     assume the forward's), so their production dispatch must run at the SAME tile this
     ramp actually measured, not a separately-guessed constant.
 
@@ -173,19 +220,19 @@ def ramp_tile_and_rate(
     THIS caller's `measure(tile)` closures (see `_dhidden_measure`/`_dw_measure`) reuse
     the FULL PRODUCTION `w`/`targets` (shape `(v, d)` -- deliberately, since these bench
     conditions measure the REAL backward kernel at REAL production scale, not a
-    tile-sized synthetic probe). Calling `backward_dhidden`/`backward_dw(..., tile=tile)`
-    against a full-size `w` makes their OWN internal `for v0 in range(0, v, tile)` loop
-    run `ceil(v / tile)` iterations -- `measure(tile)` times the WHOLE CHAIN across every
-    vocab column, not one dispatch. A prior version of this function kept `calibrate()`'s
-    `n*tile*d/per_dispatch_s` formula anyway, which under-reports the rate by
-    approximately `v/tile` (at tile=128 against V=151936, ~1,187x) -- the ramp collapsed
-    to a "0 G MAC/s" rate and `check_budget` refused every kernel condition with a
-    fictional multi-hundred-second projection (confirmed against the production run's
-    recorded refusal artifacts). Since every dispatch in the chain covers a DIFFERENT,
-    disjoint slice of `v` and the chain's total MAC count is therefore ALWAYS `n*v*d`
-    regardless of how many dispatches the chain took or how it was tiled, the correct
-    rate is `n*v*d/elapsed` (used for BOTH the ramp-stage rate below and the final
-    median-of-3 rate) -- this is genuinely per-dispatch-comparable throughput:
+    tile-sized synthetic probe). Calling `backward_dhidden`/`backward_dhidden_mma`/
+    `backward_dw(..., tile=tile)` against a full-size `w` makes their OWN internal
+    `for v0 in range(0, v, tile)` loop run `ceil(v / tile)` iterations -- `measure(tile)`
+    times the WHOLE CHAIN across every vocab column, not one dispatch. A prior version of
+    this function kept `calibrate()`'s `n*tile*d/per_dispatch_s` formula anyway, which
+    under-reports the rate by approximately `v/tile` (at tile=128 against V=151936,
+    ~1,187x) -- the ramp collapsed to a "0 G MAC/s" rate and `check_budget` refused every
+    kernel condition with a fictional multi-hundred-second projection (confirmed against
+    the production run's recorded refusal artifacts). Since every dispatch in the chain
+    covers a DIFFERENT, disjoint slice of `v` and the chain's total MAC count is therefore
+    ALWAYS `n*v*d` regardless of how many dispatches the chain took or how it was tiled,
+    the correct rate is `n*v*d/elapsed` (used for BOTH the ramp-stage rate below and the
+    final median-of-3 rate) -- this is genuinely per-dispatch-comparable throughput:
     `check_budget`'s own `n*tile*d/rate` projection then reduces to
     `elapsed * (tile/v)`, i.e. the chain's measured average time per one `tile`-sized
     dispatch, exactly the quantity a launch-budget guard needs.
@@ -235,20 +282,23 @@ def _timed(
     return statistics.median(walls), walls, active_before / 1024**3, marginal_peak_gb
 
 
-# --- staged_vjp_* : the shared chunked-vjp path, differing only in value_and_grad's argnums
+# --- chunked_fallback_* / staged_kernel_* : the SAME wiring, differing only in
+# `linear_cross_entropy`'s `impl` and in value_and_grad's argnums.
 
 
-def _chunked_loss(hidden: mx.array, w: mx.array, targets: mx.array, *, trainable: bool) -> mx.array:
+def _staged_loss(
+    hidden: mx.array, w: mx.array, targets: mx.array, *, impl: str, trainable: bool,
+) -> mx.array:
     head = DenseHead(weight=w, trainable=trainable)
-    return linear_cross_entropy(hidden, head, targets, impl="chunked", reduction="mean")
+    return linear_cross_entropy(hidden, head, targets, impl=impl, reduction="mean")
 
 
-def _staged_vjp_fn(
-    hidden: mx.array, w: mx.array, targets: mx.array, *, trainable: bool,
+def _staged_fn(
+    hidden: mx.array, w: mx.array, targets: mx.array, *, impl: str, trainable: bool,
 ) -> Callable[[], None]:
     if trainable:
         def loss(h: mx.array, ww: mx.array, t: mx.array) -> mx.array:
-            return _chunked_loss(h, ww, t, trainable=True)
+            return _staged_loss(h, ww, t, impl=impl, trainable=True)
         vag = mx.value_and_grad(loss, argnums=(0, 1))
 
         def fn() -> None:
@@ -257,7 +307,7 @@ def _staged_vjp_fn(
         return fn
 
     def loss_frozen(h: mx.array, ww: mx.array, t: mx.array) -> mx.array:
-        return _chunked_loss(h, ww, t, trainable=False)
+        return _staged_loss(h, ww, t, impl=impl, trainable=False)
     vag_frozen = mx.value_and_grad(loss_frozen, argnums=(0,))
 
     def fn_frozen() -> None:
@@ -269,15 +319,17 @@ def _staged_vjp_fn(
     return fn_frozen
 
 
-# --- kernel_* : the v0 backward kernels, ramp-calibrated (their rate is UNKNOWN)
+# --- kernel_* / chunked_dhidden_alone : isolated backward passes, ramp-calibrated where
+# a launch guard applies (their rate is UNKNOWN).
 
 
 def _shared_forward_residual(
     hidden: mx.array, w: mx.array, targets: mx.array, *, row_tiles: int, n: int, d: int, v: int,
 ) -> tuple[mx.array, mx.array]:
-    """UNMEASURED setup: the real (lse, tgt) residual the backward kernels need. Run
+    """UNMEASURED setup: the real (lse, tgt) residual the backward passes need. Run
     once, outside the timed/peak window, exactly like a real training step would produce
-    it once and reuse it for both d_hidden and d_w."""
+    it once and reuse it for both d_hidden and d_w (and, for `chunked_dhidden_alone`, the
+    chunked backward)."""
     fwd_rate = calibrated_rate(row_tiles=row_tiles, dtype=hidden.dtype, n=n, d=d, v=v)
     lse, tgt = forward(hidden, w, targets, row_tiles=row_tiles, tile=FORWARD_TILE,
                        rate_macs_per_s=fwd_rate)
@@ -286,20 +338,26 @@ def _shared_forward_residual(
 
 
 def _dhidden_measure(
+    backward_fn: Callable[..., mx.array],
     hidden: mx.array, w: mx.array, targets: mx.array, lse: mx.array, tgt: mx.array,
     ct: mx.array, *, row_tiles: int,
 ) -> Callable[[int], float]:
+    """`backward_fn` is `backward_dhidden` or `backward_dhidden_mma` -- both share the
+    IDENTICAL (hidden, w, targets, lse, tgt, cotangent, *, row_tiles, tile,
+    rate_macs_per_s) -> d_hidden contract (`backward_dhidden_mma` is a documented
+    drop-in replacement for `backward_dhidden`), so one measure-closure factory serves
+    both."""
     warmed: set[int] = set()
 
     def measure(tile: int) -> float:
         if tile not in warmed:
-            out = backward_dhidden(hidden, w, targets, lse, tgt, ct, row_tiles=row_tiles,
-                                   tile=tile, rate_macs_per_s=None)
+            out = backward_fn(hidden, w, targets, lse, tgt, ct, row_tiles=row_tiles,
+                              tile=tile, rate_macs_per_s=None)
             mx.eval(out)
             warmed.add(tile)
         t0 = time.perf_counter()
-        out = backward_dhidden(hidden, w, targets, lse, tgt, ct, row_tiles=row_tiles,
-                               tile=tile, rate_macs_per_s=None)
+        out = backward_fn(hidden, w, targets, lse, tgt, ct, row_tiles=row_tiles,
+                          tile=tile, rate_macs_per_s=None)
         mx.eval(out)
         return time.perf_counter() - t0
     return measure
@@ -325,21 +383,25 @@ def _dw_measure(
     return measure
 
 
-def _kernel_dhidden_fn(
+def _kernel_dhidden_generic_fn(
+    backward_fn: Callable[..., mx.array],
     hidden: mx.array, w: mx.array, targets: mx.array, *, row_tiles: int, n: int, d: int, v: int,
 ) -> tuple[Callable[[], None], dict[str, object]]:
+    """Shared builder for `kernel_dhidden_v0` (`backward_fn=backward_dhidden`) and
+    `kernel_dhidden_mma` (`backward_fn=backward_dhidden_mma`) -- identical setup/ramp/
+    dispatch shape, differing only in which backward kernel is timed."""
     lse, tgt = _shared_forward_residual(hidden, w, targets, row_tiles=row_tiles, n=n, d=d, v=v)
     ct = mx.full((n,), 1.0 / n, dtype=mx.float32)
     mx.eval(ct)
     start_tile = min(probe_tile_for(n=n, d=d), v)
     tile, rate = ramp_tile_and_rate(
-        _dhidden_measure(hidden, w, targets, lse, tgt, ct, row_tiles=row_tiles),
+        _dhidden_measure(backward_fn, hidden, w, targets, lse, tgt, ct, row_tiles=row_tiles),
         n=n, d=d, v=v, start_tile=start_tile,
     )
 
     def fn() -> None:
-        out = backward_dhidden(hidden, w, targets, lse, tgt, ct, row_tiles=row_tiles,
-                               tile=tile, rate_macs_per_s=rate)
+        out = backward_fn(hidden, w, targets, lse, tgt, ct, row_tiles=row_tiles,
+                          tile=tile, rate_macs_per_s=rate)
         mx.eval(out)
     return fn, {"tile": tile, "calibrated_rate_macs_per_s": round(rate, 1)}
 
@@ -367,13 +429,15 @@ def _kernel_combined_fn(
     hidden: mx.array, w: mx.array, targets: mx.array, *, row_tiles: int, n: int, d: int, v: int,
 ) -> tuple[Callable[[], None], dict[str, object]]:
     # ONE shared forward residual for both kernels -- the real trainable step computes
-    # (lse, tgt) once and reuses it for both accumulations.
+    # (lse, tgt) once and reuses it for both accumulations. Still the v0/v0 pairing
+    # (backward_dhidden + backward_dw) -- this condition's refusals are the v0 baseline
+    # row for the STOP table, unchanged by the MMA rung.
     lse, tgt = _shared_forward_residual(hidden, w, targets, row_tiles=row_tiles, n=n, d=d, v=v)
     ct = mx.full((n,), 1.0 / n, dtype=mx.float32)
     mx.eval(ct)
     start_tile = min(probe_tile_for(n=n, d=d), v)
     dh_tile, dh_rate = ramp_tile_and_rate(
-        _dhidden_measure(hidden, w, targets, lse, tgt, ct, row_tiles=row_tiles),
+        _dhidden_measure(backward_dhidden, hidden, w, targets, lse, tgt, ct, row_tiles=row_tiles),
         n=n, d=d, v=v, start_tile=start_tile,
     )
     dw_tile, dw_rate = ramp_tile_and_rate(
@@ -396,6 +460,39 @@ def _kernel_combined_fn(
     }
 
 
+def _chunked_dhidden_alone_fn(
+    hidden: mx.array, w: mx.array, targets: mx.array, *, row_tiles: int, n: int, d: int, v: int,
+) -> tuple[Callable[[], None], dict[str, object]]:
+    """The proven chunked backward (`core.chunked.chunked_backward`, `head_trainable=
+    False` -- the frozen/d_hidden-only path), timed ALONE on the SAME saved (lse, tgt)
+    residual a kernel forward produced. Direct wall+memory comparison partner for
+    `kernel_dhidden_mma`: both share one kernel forward (built OUTSIDE the timed window
+    here too), so the two conditions differ ONLY in which backward computes d_hidden.
+    No launch guard on this path -- `chunked_backward` is pure MLX, no `check_budget`
+    call anywhere in it (matches `_kernel_nll_dense`'s own frozen-path vjp in `loss.py`,
+    which calls this exact function with this exact `mm`/`w_chunk` closure shape --
+    Python-side `w[v0:v1]` slicing is the ESTABLISHED, already-shipped idiom for the
+    pure-MLX chunked path; the "full buffers, no Python-side slices" rule is specific to
+    the METAL KERNEL chained launches, not this pure-MLX one)."""
+    lse, _tgt = _shared_forward_residual(hidden, w, targets, row_tiles=row_tiles, n=n, d=d, v=v)
+    ct = mx.full((n,), 1.0 / n, dtype=mx.float32)
+    mx.eval(ct)
+
+    def mm(v0: int, v1: int) -> mx.array:
+        return (hidden @ w[v0:v1].T).astype(mx.float32)
+
+    def w_chunk(v0: int, v1: int) -> mx.array:
+        return w[v0:v1]
+
+    def fn() -> None:
+        d_hidden, _ = chunked_backward(
+            hidden=hidden, matmul_chunk=mm, w_chunk=w_chunk, targets=targets, lse=lse,
+            cotangent=ct, v=v, chunk_size=FORWARD_TILE, head_trainable=False,
+        )
+        mx.eval(d_hidden)
+    return fn, {}
+
+
 def run_condition(condition: str, *, tiny: bool) -> None:
     install_guardrails()
     n, v, d = (TINY_N, TINY_V, TINY_D) if tiny else (N, V, D)
@@ -416,16 +513,31 @@ def run_condition(condition: str, *, tiny: bool) -> None:
     mx.eval(hidden, w, targets)
 
     try:
-        if condition == "staged_vjp_frozen":
-            fn, extra = _staged_vjp_fn(hidden, w, targets, trainable=False), {}
-        elif condition == "staged_vjp_trainable":
-            fn, extra = _staged_vjp_fn(hidden, w, targets, trainable=True), {}
+        if condition == "chunked_fallback_frozen":
+            fn, extra = _staged_fn(hidden, w, targets, impl=CHUNKED_FALLBACK_IMPL,
+                                   trainable=False), {}
+        elif condition == "chunked_fallback_trainable":
+            fn, extra = _staged_fn(hidden, w, targets, impl=CHUNKED_FALLBACK_IMPL,
+                                   trainable=True), {}
+        elif condition == "staged_kernel_frozen":
+            fn, extra = _staged_fn(hidden, w, targets, impl=STAGED_KERNEL_IMPL,
+                                   trainable=False), {}
+        elif condition == "staged_kernel_trainable":
+            fn, extra = _staged_fn(hidden, w, targets, impl=STAGED_KERNEL_IMPL,
+                                   trainable=True), {}
         elif condition == "kernel_dhidden_v0":
-            fn, extra = _kernel_dhidden_fn(hidden, w, targets, row_tiles=row_tiles, n=n, d=d, v=v)
+            fn, extra = _kernel_dhidden_generic_fn(backward_dhidden, hidden, w, targets,
+                                                   row_tiles=row_tiles, n=n, d=d, v=v)
+        elif condition == "kernel_dhidden_mma":
+            fn, extra = _kernel_dhidden_generic_fn(backward_dhidden_mma, hidden, w, targets,
+                                                   row_tiles=row_tiles, n=n, d=d, v=v)
         elif condition == "kernel_dw_v0":
             fn, extra = _kernel_dw_fn(hidden, w, targets, row_tiles=row_tiles, n=n, d=d, v=v)
-        else:
+        elif condition == "kernel_backward_v0_combined":
             fn, extra = _kernel_combined_fn(hidden, w, targets, row_tiles=row_tiles, n=n, d=d, v=v)
+        else:  # chunked_dhidden_alone
+            fn, extra = _chunked_dhidden_alone_fn(hidden, w, targets, row_tiles=row_tiles,
+                                                  n=n, d=d, v=v)
     except LaunchBudgetError as exc:
         # A guard refusal during ramp-driven SETUP is still a valid, recorded result --
         # it means even the smallest safe tile the ramp could find still refuses.
