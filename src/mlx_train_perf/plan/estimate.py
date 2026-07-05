@@ -120,6 +120,19 @@ class FitReport:
     provenance: dict[str, str]
 
 
+@dataclass(frozen=True, slots=True, kw_only=True)
+class FitPoint:
+    """One real measurement feeding `fit_activation_and_optimizer_bytes`: the model
+    shape + training config that produced it, plus the MARGINAL peak this config's
+    `train_step` bench condition measured (`bench/worker.py::run_train_step`'s own
+    `marginal_peak_gb` field, converted to bytes -- the training LOOP's own
+    incremental memory above whatever was already resident before it started, NOT
+    `total_peak_gb`, which also counts the already-resident weights)."""
+    shape: ModelShape
+    cfg: TrainConfig
+    marginal_peak_bytes: float
+
+
 def _dtype_bytes(dtype: str) -> int:
     try:
         return _DTYPE_BYTES[dtype]
@@ -275,3 +288,72 @@ def plan_fit(
         is_estimate=True,
         provenance=calib.provenance,
     )
+
+
+def fit_activation_and_optimizer_bytes(
+    points: list[FitPoint], *, calib: Calibration,
+) -> tuple[float, float]:
+    """Ordinary least squares, THROUGH THE ORIGIN (zero tokens and zero trainable
+    params implies zero activation/optimizer bytes by construction -- there is no
+    intercept term to fit), solving for `(act_bytes_per_token_layer,
+    optimizer_bytes_per_param)` from `points`.
+
+    Each point's marginal peak is modeled as:
+
+        marginal_peak_bytes ~= act_bytes_per_token_layer * (batch * seq_len * layers)
+                              + optimizer_bytes_per_param * lora_param_count
+                              + loss_bytes(cfg, shape, calib)
+
+    `loss_bytes` is analytically known (this project's OWN `_loss_bytes` formula) and
+    subtracted from each point's measured peak BEFORE the fit -- only the
+    activation/optimizer residual is actually being fit here. Every point must use
+    `impl="kernel"` (what `bench/worker.py::run_train_step`'s `ours` path resolves to
+    on a verified mlx install): `impl="chunked"`/`"naive"` measure a materially
+    different (and, for `"naive"`, still only APPROXIMATELY calibrated) loss-layer
+    memory shape, so subtracting `_loss_bytes` for those would fold that approximation
+    error into the fitted activation/optimizer constants instead of keeping it
+    isolated to the one term it belongs to.
+
+    Raises `PlanInputError` for fewer than 2 points, a non-`"kernel"` `impl`, or a
+    singular 2x2 normal-equations matrix -- the two drivers (activation, optimizer)
+    are collinear across every given point (e.g. `lora_rank` scales in exact
+    proportion to `batch * seq_len` across the whole point set), so there is no way to
+    separate the two coefficients from this data alone; vary them independently.
+    """
+    if len(points) < 2:
+        raise PlanInputError(
+            "fit_activation_and_optimizer_bytes needs at least 2 FitPoints to solve "
+            f"for 2 coefficients, got {len(points)}"
+        )
+    x1s: list[float] = []
+    x2s: list[float] = []
+    ys: list[float] = []
+    for p in points:
+        if p.cfg.impl != "kernel":
+            raise PlanInputError(
+                f"fit_activation_and_optimizer_bytes only accepts impl='kernel' "
+                f"FitPoints (got impl={p.cfg.impl!r}) -- see this function's own "
+                "docstring for why 'chunked'/'naive' points would contaminate the fit"
+            )
+        loss_bytes = _loss_bytes(p.cfg, p.shape, calib)
+        x1s.append(float(p.cfg.batch * p.cfg.seq_len * p.shape.layers))
+        x2s.append(float(_lora_param_count(p.cfg, p.shape)))
+        ys.append(p.marginal_peak_bytes - loss_bytes)
+
+    s11 = sum(x1 * x1 for x1 in x1s)
+    s22 = sum(x2 * x2 for x2 in x2s)
+    s12 = sum(x1 * x2 for x1, x2 in zip(x1s, x2s, strict=True))
+    s1y = sum(x1 * y for x1, y in zip(x1s, ys, strict=True))
+    s2y = sum(x2 * y for x2, y in zip(x2s, ys, strict=True))
+
+    det = s11 * s22 - s12 * s12
+    if abs(det) < 1e-6:
+        raise PlanInputError(
+            "fit_activation_and_optimizer_bytes: the activation-bytes and "
+            "optimizer-bytes drivers are collinear across every given FitPoint -- "
+            "cannot separate the two coefficients from this data alone; vary "
+            "batch*seq_len*layers and lora_rank independently across the measurements"
+        )
+    act_bytes_per_token_layer = (s1y * s22 - s2y * s12) / det
+    optimizer_bytes_per_param = (s11 * s2y - s12 * s1y) / det
+    return act_bytes_per_token_layer, optimizer_bytes_per_param
