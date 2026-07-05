@@ -23,7 +23,7 @@ values (the full cross product x {ours, stock} is built), `--batch`/`--steps`/
 `--lora-rank`/`--lora-layers`/`--learning-rate`/`--seed` apply uniformly across the
 whole matrix -- the controller picks the production matrix (>= 2 fits-both configs +
 the flagship OOM-on-stock config) via these flags. `--smoke` overrides the matrix to
-one small REAL model (mlx-community/Qwen2.5-0.5B-Instruct-bf16) at a short sequence
+one small REAL model (mlx-community/Llama-3.2-1B-Instruct-4bit) at a short sequence
 length for 2 steps, writing to a SEPARATE directory -- for end-to-end verification
 only, never the production measurement, and (being a real model load) gated the same
 way `tests/test_adapter.py`'s own `@pytest.mark.smoke` test is: see
@@ -44,7 +44,10 @@ from pathlib import Path
 from mlx_train_perf.bench.artifacts import new_session_id
 from mlx_train_perf.bench.runner import Condition, run_conditions
 
-SMOKE_MODEL = "mlx-community/Qwen2.5-0.5B-Instruct-bf16"
+# A `llama`-architecture model: the adapter's `split_model` supports llama + qwen3 (the
+# 0.1.0 scope), not qwen2 — so the smoke must use a supported family. Llama-3.2-1B-4bit is
+# the smallest supported downloaded model, exercising the quantized-head path end to end.
+SMOKE_MODEL = "mlx-community/Llama-3.2-1B-Instruct-4bit"
 SMOKE_SEQ_LEN = 512
 SMOKE_STEPS = 2
 
@@ -85,6 +88,7 @@ def build_conditions(
     learning_rate: float,
     seed: int,
     revision: str | None,
+    impl: str = "auto",
 ) -> list[Condition]:
     sha = script_sha()
     conditions: list[Condition] = []
@@ -94,7 +98,7 @@ def build_conditions(
                 params: dict[str, object] = {
                     "model": model, "revision": revision, "seq_len": seq_len,
                     "batch": batch, "steps": steps, "lora_rank": lora_rank,
-                    "lora_layers": lora_layers, "impl": "auto", "stock": stock,
+                    "lora_layers": lora_layers, "impl": impl, "stock": stock,
                     "learning_rate": learning_rate, "seed": seed, "script_sha": sha,
                 }
                 conditions.append(Condition(
@@ -186,13 +190,15 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--lora-rank", type=int, default=8)
     ap.add_argument("--lora-layers", type=int, default=-1, help="-1 == all layers")
     ap.add_argument("--learning-rate", type=float, default=1e-5)
+    ap.add_argument("--impl", choices=["auto", "kernel", "chunked", "naive"], default="auto",
+                    help="the 'ours' loss impl; kernel needs bf16-compute hidden states")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--revision", default=None, help="applied to every --model")
     ap.add_argument("--out", default=None, help="output directory (default: this "
                     "script's own _artifacts subdirectory)")
     ap.add_argument("--condition", help="run only this one named condition")
     ap.add_argument("--smoke", action="store_true",
-                    help="tiny REAL-model default (Qwen2.5-0.5B, seq_len=512, 2 "
+                    help="tiny REAL-model default (Llama-3.2-1B-4bit, seq_len=512, 2 "
                         "steps) for end-to-end verification -- never the production "
                         "matrix; still loads a real model, so this is gated the same "
                         "way tests/test_adapter.py's own smoke test is")
@@ -201,16 +207,22 @@ def main(argv: list[str] | None = None) -> int:
     if args.smoke:
         models, seq_lens, steps = [SMOKE_MODEL], [SMOKE_SEQ_LEN], SMOKE_STEPS
         out_dir = Path(args.out) if args.out else RESULTS_SMOKE
+        # SMOKE_MODEL loads as fp16, which the kernel path does not accept — the smoke
+        # exercises `ours` end to end through the compiled trainer via the chunked path
+        # (the kernel path's compile-compatibility is locked by tests/test_loss_compile.py).
+        impl = "chunked"
     else:
         if not args.model or not args.seq_len:
             raise SystemExit("--model and --seq-len are required unless --smoke is set")
         models, seq_lens, steps = args.model, args.seq_len, args.steps
         out_dir = Path(args.out) if args.out else RESULTS
+        impl = args.impl
 
     conditions = build_conditions(
         models=models, seq_lens=seq_lens, batch=args.batch, steps=steps,
         lora_rank=args.lora_rank, lora_layers=args.lora_layers,
         learning_rate=args.learning_rate, seed=args.seed, revision=args.revision,
+        impl=impl,
     )
     if args.condition:
         matches = [c for c in conditions if c.name == args.condition]
