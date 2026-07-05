@@ -22,6 +22,7 @@ import mlx.core as mx
 from mlx_train_perf.core.chunked import QuantSpec
 from mlx_train_perf.core.kernel.source import (
     QUANT_HELPERS,
+    build_backward_dhidden_mma_source,
     build_backward_dhidden_source,
     build_backward_dw_source,
     build_dense_source,
@@ -149,6 +150,73 @@ def backward_dhidden(
     rows = 8 * row_tiles
     row_blocks = (n + rows - 1) // rows
     kernel = _backward_dhidden_kernel(row_tiles)
+    d_hidden = mx.zeros((n, d), dtype=mx.float32)
+    ct32 = cotangent.astype(mx.float32)
+    tg_y = min(8, row_blocks)
+    for v0 in range(0, v, tile):
+        v1 = min(v0 + tile, v)
+        offs = mx.array([v0, v1], dtype=mx.uint32)
+        (d_hidden,) = kernel(
+            inputs=[hidden, w, targets, offs, lse, ct32, d_hidden],
+            template=[("T", hidden.dtype)],
+            grid=(32, row_blocks, 1),
+            threadgroup=(32, tg_y, 1),
+            output_shapes=[(n, d)],
+            output_dtypes=[mx.float32],
+        )
+    return d_hidden.astype(hidden.dtype)
+
+
+@functools.cache
+def _backward_dhidden_mma_kernel(row_tiles: int) -> _MetalKernel:
+    kernel = mx.fast.metal_kernel(
+        name=f"mtp_bwd_dhidden_mma_rt{row_tiles}",
+        input_names=["hidden", "w", "targets", "offs", "lse", "cotangent", "d_hidden_in"],
+        output_names=["d_hidden_out"],
+        source=build_backward_dhidden_mma_source(row_tiles),
+    )
+    return cast(_MetalKernel, kernel)
+
+
+def backward_dhidden_mma(
+    hidden: mx.array,
+    w: mx.array,
+    targets: mx.array,
+    lse: mx.array,
+    tgt: mx.array,  # noqa: ARG001 — d_hidden's math needs only lse (see source.py's
+    # derivation comment); accepted for interface parity with the (lse, tgt) residual pair
+    # `forward` saves — same convention as `backward_dhidden`'s unused `tgt`.
+    cotangent: mx.array,
+    *,
+    row_tiles: int,
+    tile: int,
+    rate_macs_per_s: float | None,
+) -> mx.array:
+    """d_hidden-only backward via the fused two-GEMM MMA kernel (Task 16b step 4 — the
+    frozen/QLoRA-head PERF rung).
+
+    Drop-in replacement for `backward_dhidden`: same math, same
+    (hidden, w, targets, lse, cotangent) -> d_hidden contract, same chained vocab-tile
+    accumulation (full buffers + in-kernel offsets, fp32 accumulator cast to `hidden.dtype`
+    once at the end). The difference is entirely inside the kernel body — logit
+    regeneration runs as the forward's 4x4 simdgroup-matrix GEMM (reused verbatim) and the
+    gradient contracts against the same weight tile as a second MMA, instead of v0's
+    zero-reuse scalar dot products. See `core/kernel/source.py`'s
+    `build_backward_dhidden_mma_source` block comment for the full derivation and the
+    GEMM-B output-structure choice, cross-checked against `core.chunked.chunked_backward`
+    (the proven oracle) and the v0 `backward_dhidden` kernel (two kernels, one truth).
+
+    Backward recomputes logits tile-wise AND accumulates into d_hidden — roughly 2x the
+    forward's per-tile MAC count — so `check_budget` is called at half the supplied rate,
+    the same accounting `backward_dhidden` uses.
+    """
+    n, d = hidden.shape
+    v = w.shape[0]
+    if rate_macs_per_s is not None:
+        check_budget(n=n, d=d, v=v, tile=tile, rate_macs_per_s=rate_macs_per_s / 2.0)
+    rows = 8 * row_tiles
+    row_blocks = (n + rows - 1) // rows
+    kernel = _backward_dhidden_mma_kernel(row_tiles)
     d_hidden = mx.zeros((n, d), dtype=mx.float32)
     ct32 = cotangent.astype(mx.float32)
     tg_y = min(8, row_blocks)

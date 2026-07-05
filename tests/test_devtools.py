@@ -5,6 +5,7 @@ import pytest
 
 from mlx_train_perf.core.kernel.source import (
     QUANT_HELPERS,
+    build_backward_dhidden_mma_source,
     build_backward_dhidden_source,
     build_backward_dw_source,
     build_dense_source,
@@ -179,4 +180,34 @@ def test_backward_dw_kernel_ceiling_is_plausible() -> None:
         atomic_outputs=True,
     )
     print(f"backward d_w RT=4 compiled ceiling (observed): {ceiling}")
+    assert 0 < ceiling <= 1024
+
+
+@pytest.mark.metal
+def test_backward_dhidden_mma_kernel_ceiling_is_plausible() -> None:
+    # The d_hidden MMA kernel (Task 16b step 4) shares the v0 backward's exact contract --
+    # inputs (hidden, w, targets, offs, lse, cotangent, d_hidden_in) and a single (rows, d)
+    # fp32 d_hidden_out -- so it probes through the same parameterized path. Measured 448 at
+    # RT=4 -- the forward's own ceiling, NO drop (reusing the C tiles in place for the
+    # gradient coefficients keeps per-lane register state flat). The number is a register-
+    # pressure telltale only, never a rate verdict (see the module docstring) -- logged here.
+    n, d, v = 8, 32, 16
+    mx.random.seed(2)
+    hidden = mx.random.normal((n, d)).astype(mx.bfloat16)
+    w = (mx.random.normal((v, d)) * 0.05).astype(mx.bfloat16)
+    targets = mx.random.randint(0, v, (n,))
+    offs = mx.array([0, v], dtype=mx.uint32)
+    lse = mx.full((n,), float("-inf"), dtype=mx.float32)
+    cotangent = mx.full((n,), 1.0 / n, dtype=mx.float32)
+    d_hidden_in = mx.zeros((n, d), dtype=mx.float32)
+    mx.eval(hidden, w, targets, offs, lse, cotangent, d_hidden_in)
+    ceiling = compiled_ceiling(
+        build_backward_dhidden_mma_source(4),
+        input_names=["hidden", "w", "targets", "offs", "lse", "cotangent", "d_hidden_in"],
+        inputs=[hidden, w, targets, offs, lse, cotangent, d_hidden_in],
+        output_names=["d_hidden_out"],
+        output_shapes=[(n, d)],
+        output_dtypes=[mx.float32],
+    )
+    print(f"backward d_hidden MMA RT=4 compiled ceiling (observed): {ceiling}")
     assert 0 < ceiling <= 1024
