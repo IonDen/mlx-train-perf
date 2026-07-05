@@ -21,19 +21,23 @@ false-refusal this distinction fixes.
 import sys
 from pathlib import Path
 
+import mlx.core as mx
 import pytest
 
 _SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts"
 sys.path.insert(0, str(_SCRIPTS_DIR))
 
 from bench_backward_ladder import (  # noqa: E402 -- import must follow the sys.path insert
+    CHUNKED_FALLBACK_IMPL,
     CONDITIONS,
+    STAGED_KERNEL_IMPL,
     macs_for_condition,
     ramp_tile_and_rate,
     script_sha,
 )
 
 from mlx_train_perf.core.kernel.launch import SAFETY_FACTOR  # noqa: E402
+from mlx_train_perf.core.loss import DenseHead, resolve_impl  # noqa: E402
 
 # Same regression shape `test_kernel_launch_calibration.py` uses for `launch.calibrate`.
 N, D, V = 8192, 4096, 151936
@@ -50,18 +54,29 @@ def test_macs_for_condition_covers_every_declared_condition() -> None:
         assert macs_for_condition(condition, n=8, v=16, d=4) > 0
 
 
-def test_macs_for_condition_staged_frozen_is_2x_base() -> None:
-    assert macs_for_condition("staged_vjp_frozen", n=8, v=16, d=4) == 2 * 8 * 16 * 4
+def test_macs_for_condition_chunked_fallback_frozen_is_2x_base() -> None:
+    assert macs_for_condition("chunked_fallback_frozen", n=8, v=16, d=4) == 2 * 8 * 16 * 4
 
 
-def test_macs_for_condition_staged_trainable_is_3x_base() -> None:
-    assert macs_for_condition("staged_vjp_trainable", n=8, v=16, d=4) == 3 * 8 * 16 * 4
+def test_macs_for_condition_chunked_fallback_trainable_is_3x_base() -> None:
+    assert macs_for_condition("chunked_fallback_trainable", n=8, v=16, d=4) == 3 * 8 * 16 * 4
 
 
-def test_macs_for_condition_kernel_dhidden_and_dw_are_2x_base() -> None:
+def test_macs_for_condition_staged_kernel_matches_chunked_fallback_buckets() -> None:
+    # Same MAC-count MODEL as chunked_fallback -- the two conditions differ only in
+    # which FORWARD implementation runs (kernel vs chunked-streamed), not in the total
+    # MAC count this reporting model charges.
+    base = 8 * 16 * 4
+    assert macs_for_condition("staged_kernel_frozen", n=8, v=16, d=4) == 2 * base
+    assert macs_for_condition("staged_kernel_trainable", n=8, v=16, d=4) == 3 * base
+
+
+def test_macs_for_condition_isolated_backward_conditions_are_2x_base() -> None:
     base = 8 * 16 * 4
     assert macs_for_condition("kernel_dhidden_v0", n=8, v=16, d=4) == 2 * base
+    assert macs_for_condition("kernel_dhidden_mma", n=8, v=16, d=4) == 2 * base
     assert macs_for_condition("kernel_dw_v0", n=8, v=16, d=4) == 2 * base
+    assert macs_for_condition("chunked_dhidden_alone", n=8, v=16, d=4) == 2 * base
 
 
 def test_macs_for_condition_combined_is_4x_base_not_2x() -> None:
@@ -181,3 +196,62 @@ def test_script_sha_is_a_stable_short_hex_digest() -> None:
     assert a == b
     assert len(a) == 16
     assert all(c in "0123456789abcdef" for c in a)
+
+
+# ---------------------------------------------------------------------------
+# Honesty guard (Part A): staged_kernel_* must resolve to the KERNEL forward, not
+# silently fall back to chunked -- the exact mislabel the production run found
+# (the condition previously named staged_vjp_* was wired to impl="chunked", the
+# fully-chunked fallback, not the shipping staged mechanism -- its memory read
+# 8.5/7.9 GB vs the gate's 2.47 GB precisely because of the different forward path).
+#
+# These tests import `CHUNKED_FALLBACK_IMPL`/`STAGED_KERNEL_IMPL` directly from the
+# bench script -- the ACTUAL constants its condition-builders are wired with -- rather
+# than asserting an independent string literal, so a future edit that silently set
+# `STAGED_KERNEL_IMPL` back to "chunked" would make these tests fail for the right
+# reason (confirmed by TDD: temporarily setting STAGED_KERNEL_IMPL = "chunked" in the
+# script and re-running failed both `test_staged_kernel_impl_resolves_to_the_kernel_
+# forward_not_chunked` and `test_staged_kernel_and_chunked_fallback_resolve_to_
+# different_impls`, then passed again once reverted -- see the report).
+# ---------------------------------------------------------------------------
+
+
+def _tiny_dense_head() -> DenseHead:
+    return DenseHead(weight=mx.zeros((32, 16), dtype=mx.bfloat16))
+
+
+def test_staged_kernel_impl_resolves_to_the_kernel_forward_not_chunked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("mlx_train_perf._compat._installed_mlx_version", lambda: "0.31.2")
+    r = resolve_impl(head=_tiny_dense_head(), dtype=mx.bfloat16, n=8, impl=STAGED_KERNEL_IMPL)
+    assert r.impl == "kernel"
+
+
+def test_chunked_fallback_impl_resolves_to_chunked(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("mlx_train_perf._compat._installed_mlx_version", lambda: "0.31.2")
+    r = resolve_impl(head=_tiny_dense_head(), dtype=mx.bfloat16, n=8, impl=CHUNKED_FALLBACK_IMPL)
+    assert r.impl == "chunked"
+
+
+def test_staged_kernel_and_chunked_fallback_resolve_to_different_impls() -> None:
+    # The point of Part A: these two constants must name DIFFERENT mechanisms -- if a
+    # future edit ever set them equal (or both to "chunked"), staged_kernel_* would
+    # silently measure the SAME thing as chunked_fallback_*, exactly the original bug.
+    assert STAGED_KERNEL_IMPL != CHUNKED_FALLBACK_IMPL
+    assert STAGED_KERNEL_IMPL == "kernel"
+
+
+def test_auto_and_explicit_kernel_never_silently_downgrade_to_chunked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # T11 contract, re-affirmed at this bench script's own tiny scale: neither "auto"
+    # nor an explicit "kernel" request ever falls back to "chunked" silently -- both
+    # resolve to the kernel forward (or raise a typed error naming "chunked" as the
+    # explicit alternative -- see tests/test_loss_api.py for that error-path coverage).
+    # Neither ever just quietly returns Resolution.impl == "chunked".
+    monkeypatch.setattr("mlx_train_perf._compat._installed_mlx_version", lambda: "0.31.2")
+    head = _tiny_dense_head()
+    for impl in ("auto", STAGED_KERNEL_IMPL):
+        r = resolve_impl(head=head, dtype=mx.bfloat16, n=8, impl=impl)
+        assert r.impl == "kernel"
