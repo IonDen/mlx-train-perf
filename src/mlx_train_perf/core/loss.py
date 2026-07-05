@@ -123,7 +123,9 @@ def resolve_impl(*, head: HeadRef, dtype: mx.Dtype, n: int,
                       provisional=variant.provisional, reason=reason)
 
 
-def _validate_inputs(*, hidden: mx.array, head: HeadRef, targets: mx.array) -> None:
+def _validate_inputs(
+    *, hidden: mx.array, head: HeadRef, targets: mx.array, validate_targets: bool = True
+) -> None:
     if hidden.ndim not in (2, 3):
         raise LossInputError(
             f"hidden must be 2D (N,D) or 3D (B,S,D), got shape {hidden.shape}"
@@ -169,14 +171,19 @@ def _validate_inputs(*, hidden: mx.array, head: HeadRef, targets: mx.array) -> N
                 f"not match hidden's D={d}"
             )
         v = head.w_q.shape[0]
-    # Deliberate PER-STEP host sync, not a one-time construction cost: an out-of-range
-    # target on the kernel path silently produces a WRONG loss (the id never matches any
-    # column, so `tgt` stays 0) instead of raising — no-silent-wrong-results outranks a
-    # microsecond-scale sync next to a multi-second train step.
-    tmin = int(mx.min(targets).item())
-    tmax = int(mx.max(targets).item())
-    if tmin < 0 or tmax >= v:
-        raise LossInputError(f"targets must satisfy 0 <= t < V={v}; got range [{tmin}, {tmax}]")
+    if validate_targets:
+        # A host sync — SKIPPED on the trusted training path (validate_targets=False):
+        # mlx_lm's trainer wraps the step in mx.compile, which forbids evaluating a traced
+        # array, and it feeds tokenizer ids that are in-range by construction. On the direct
+        # API it stays on by default, because an out-of-range target on the kernel path
+        # silently produces a WRONG loss (the id never matches any column, so `tgt` stays 0)
+        # instead of raising — no-silent-wrong-results outranks a microsecond-scale sync.
+        tmin = int(mx.min(targets).item())
+        tmax = int(mx.max(targets).item())
+        if tmin < 0 or tmax >= v:
+            raise LossInputError(
+                f"targets must satisfy 0 <= t < V={v}; got range [{tmin}, {tmax}]"
+            )
 
 
 def _flatten(hidden: mx.array, targets: mx.array) -> tuple[mx.array, mx.array, tuple[int, ...]]:
@@ -357,12 +364,14 @@ def linear_cross_entropy(
     chunk_size: int | None = None,
     reduction: Literal["none", "mean", "sum"] = "mean",
     allow_unverified_mlx: bool = False,
+    validate_targets: bool = True,
 ) -> mx.array:
     if reduction not in ("none", "mean", "sum"):
         raise LossInputError(
             f"unknown reduction {reduction!r}; expected 'none', 'mean', or 'sum'"
         )
-    _validate_inputs(hidden=hidden, head=head, targets=targets)
+    _validate_inputs(hidden=hidden, head=head, targets=targets,
+                     validate_targets=validate_targets)
     hidden2, targets2, leading = _flatten(hidden, targets)
     n = hidden2.shape[0]
     res = resolve_impl(head=head, dtype=hidden2.dtype, n=n, impl=impl,

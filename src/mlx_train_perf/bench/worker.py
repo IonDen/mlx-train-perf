@@ -15,15 +15,13 @@ the cap actually held throughout -- `wired_cap_holds`
 mismatch raises `WiredCapRegressionError` rather than silently reporting numbers
 measured under an uncapped run.
 
-A second, independent hazard for the SAME condition kind: `train()` always wraps its
-per-step function in `mx.compile`, and `mx.compile` unconditionally forbids evaluating
-an array during tracing. `linear_cross_entropy`'s own `_validate_inputs`
-(core/loss.py) performs exactly that -- a per-call `mx.min(targets).item()` host sync
-(the out-of-range-target safety check) -- so `make_loss_fn`'s output cannot be driven
-through `train()`'s compiled step, for any `impl`. `run_train_step` therefore drives
-`ours` through an uncompiled manual loop (`_run_manual_steps`) instead of `train()`;
-`stock`'s own `default_loss` has no such host sync and runs through the real,
-compiled `train()` unmodified.
+`train()` always wraps its per-step function in `mx.compile`, which forbids evaluating
+an array during tracing. `make_loss_fn` (the `ours` loss) passes `validate_targets=False`
+to `linear_cross_entropy`, skipping the one per-call host sync (`_validate_inputs`'s
+out-of-range-target check) that would otherwise break the trace -- safe because the
+trainer feeds in-range tokenizer ids. So BOTH arms (`ours` and stock's `default_loss`)
+run through the real compiled `train()` step, and the tok/s comparison is compiled vs
+compiled, apples to apples.
 """
 import argparse
 import json
@@ -36,7 +34,6 @@ from pathlib import Path
 from typing import Any, Literal, cast
 
 import mlx.core as mx
-from mlx import nn
 
 from mlx_train_perf.adapters.mlx_lm import make_loss_fn
 from mlx_train_perf.bench.artifacts import condition_identity, write_result
@@ -244,54 +241,7 @@ def _make_reasserting_loss(
     return wrapped
 
 
-def _run_manual_steps(
-    model: Any,
-    optimizer: Any,
-    loss_fn: Callable[[Any, mx.array, mx.array], tuple[mx.array, mx.array]],
-    batch: mx.array,
-    lengths: mx.array,
-    *,
-    steps: int,
-) -> list[dict[str, object]]:
-    """Drives `steps` training iterations WITHOUT `mx.compile` -- the manual-loop
-    escape hatch this module's docstring anticipates, REQUIRED for the `ours` path:
-    `linear_cross_entropy`'s `_validate_inputs` (core/loss.py) performs a per-call
-    host sync (`mx.min(targets).item()`, the out-of-range-target safety check) that
-    MLX unconditionally forbids inside a traced/compiled function ("Attempting to
-    eval an array during function transformations like compile or vmap is not
-    allowed") -- confirmed empirically: driving `make_loss_fn`'s output through
-    `mlx_lm.tuner.trainer.train()` (which always wraps its step in `mx.compile`)
-    raises exactly this error, for every `impl`. Stock's own `default_loss` has no
-    such host sync and IS driven through the real, compiled `train()` (see
-    `run_train_step`) -- this asymmetry (ours: uncompiled Python-dispatch overhead
-    per step; stock: compiled) is a KNOWN LIMITATION of this measurement, not a claim
-    that the two conditions are compared at the Python-dispatch level apples to
-    apples. At production model scale the actual GEMM/attention compute should dwarf
-    per-step Python dispatch, but that has not been measured here (build-time
-    verification only, tiny shapes) -- do not trust a close tok/s margin between the
-    two conditions without checking this asymmetry first.
-
-    Otherwise mirrors `mlx_lm.tuner.trainer.train`'s own per-step shape:
-    `nn.value_and_grad`, `optimizer.update`, evaluating `model.state` +
-    `optimizer.state` together with the reported values (never just the loss) so no
-    lazy graph survives across iterations."""
-    model.train()
-    vag = nn.value_and_grad(model, loss_fn)
-    reports: list[dict[str, object]] = []
-    for _ in range(steps):
-        t0 = time.perf_counter()
-        (loss_val, ntoks), grad = vag(model, batch, lengths)
-        optimizer.update(model, grad)
-        mx.eval(model.state, optimizer.state, loss_val, ntoks)
-        elapsed = time.perf_counter() - t0
-        reports.append({
-            "train_loss": float(loss_val.item()),
-            "tokens_per_second": float(ntoks.item()) / elapsed,
-        })
-    return reports
-
-
-def _run_stock_steps(
+def _run_train_steps(
     model: Any,
     optimizer: Any,
     loss_fn: Callable[[Any, mx.array, mx.array], tuple[mx.array, mx.array]],
@@ -302,9 +252,11 @@ def _run_stock_steps(
     steps: int,
     grad_checkpoint: bool,
 ) -> list[dict[str, object]]:
-    """The real, compiled `mlx_lm.tuner.trainer.train()` -- `default_loss` has no
-    per-call host sync, so it runs through `train()`'s `mx.compile`d step unmodified
-    (see `_run_manual_steps`'s docstring for why the `ours` path cannot)."""
+    """Drives `steps` real fine-tune iterations through the compiled
+    `mlx_lm.tuner.trainer.train()` -- used for BOTH arms. Stock's `default_loss` and
+    ours (via `make_loss_fn`, which passes `validate_targets=False`) are both free of the
+    per-call host sync `mx.compile` forbids, so both run through the real compiled step
+    and the tok/s comparison is apples to apples."""
     from mlx_lm.tuner.trainer import TrainingArgs, train  # noqa: PLC0415
 
     callback = _RecordingCallback()
@@ -335,10 +287,10 @@ def run_train_step(params: dict[str, object]) -> dict[str, object]:
     `WiredCapRegressionError` if the observed limit, read back after training, does
     not match this project's house cap.
 
-    `stock` runs the real, compiled `mlx_lm.tuner.trainer.train()`. `ours` runs a
-    manual (uncompiled) step loop instead -- see `_run_manual_steps`'s docstring for
-    why: `train()`'s `mx.compile`d step is incompatible with `linear_cross_entropy`'s
-    own per-call host-sync validation, for every `impl`. Only LoRA fine-tuning is
+    Both `ours` (via `make_loss_fn`) and `stock` (`default_loss`) run through the real,
+    compiled `mlx_lm.tuner.trainer.train()` -- `make_loss_fn` passes
+    `validate_targets=False` so ours is free of the host sync `mx.compile` forbids, so the
+    two arms are compared compiled-vs-compiled. Only LoRA fine-tuning is
     modeled (mlx-lm's own `linear_to_lora_layers`, zero-config default target set,
     applied identically to both `ours` and `stock`) -- full fine-tuning
     (`lora_rank=0`) is out of scope for this condition kind.
@@ -352,7 +304,6 @@ def run_train_step(params: dict[str, object]) -> dict[str, object]:
     _require_mlx_lm()
     import mlx.optimizers as optim  # noqa: PLC0415
     from mlx_lm.tuner.trainer import default_loss  # noqa: PLC0415
-    from mlx_lm.tuner.trainer import grad_checkpoint as apply_grad_checkpoint  # noqa: PLC0415
     from mlx_lm.tuner.utils import linear_to_lora_layers  # noqa: PLC0415
 
     model_id = str(params["model"])
@@ -391,24 +342,13 @@ def run_train_step(params: dict[str, object]) -> dict[str, object]:
 
     active_before = mx.get_active_memory()
     mx.reset_peak_memory()
-    if stock:
-        step_reports = _run_stock_steps(
-            model, opt, loss_fn, examples, batch=batch, seq_len=seq_len, steps=steps,
-            grad_checkpoint=grad_checkpoint,
-        )
-    else:
-        # Manual (uncompiled) loop -- every synthetic example is the SAME fixed
-        # length, so the whole (batch, lengths) pair is built once and reused
-        # unchanged every step (see `_synthetic_train_examples`'s docstring).
-        if grad_checkpoint:
-            # mlx_lm.tuner.trainer.grad_checkpoint's own source has no annotations.
-            apply_grad_checkpoint(model.layers[0])  # type: ignore[no-untyped-call]
-        batch_arr = mx.array(examples)
-        lengths_arr = mx.array([[0, seq_len + 1] for _ in range(batch)])
-        mx.eval(batch_arr, lengths_arr)
-        step_reports = _run_manual_steps(
-            model, opt, loss_fn, batch_arr, lengths_arr, steps=steps,
-        )
+    # Both arms run through the real compiled `train()`: stock's `default_loss` and ours
+    # (via `make_loss_fn`, `validate_targets=False`) are both free of the host sync
+    # `mx.compile` forbids, so the tok/s comparison is compiled-vs-compiled, apples to apples.
+    step_reports = _run_train_steps(
+        model, opt, loss_fn, examples, batch=batch, seq_len=seq_len, steps=steps,
+        grad_checkpoint=grad_checkpoint,
+    )
     marginal_peak_gb = (mx.get_peak_memory() - active_before) / 1024**3
 
     observed_after = install_guardrails()

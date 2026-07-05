@@ -199,8 +199,12 @@ def make_loss_fn(
                 head=head, dtype=hidden.dtype, n=n, impl=impl,
                 allow_unverified_mlx=allow_unverified_mlx,
             ).impl
+        # validate_targets=False: mlx_lm's trainer wraps this step in mx.compile, which
+        # forbids the range check's host sync; the trainer feeds in-range tokenizer ids, so
+        # the check is both unusable here and unnecessary. This is what lets `ours` run
+        # through the real compiled train() step, on equal footing with stock.
         nll = linear_cross_entropy(hidden, head, targets, impl=resolved_impl,
-                                   reduction="none")
+                                   reduction="none", validate_targets=False)
         steps = mx.arange(1, targets.shape[1] + 1)
         mask = (steps >= lengths[:, 0:1]) & (steps <= lengths[:, 1:])
         ntoks = mask.sum()

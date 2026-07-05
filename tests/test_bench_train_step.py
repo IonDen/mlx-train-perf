@@ -235,7 +235,7 @@ def test_main_requires_model_and_seq_len_unless_smoke() -> None:
 @pytest.mark.smoke
 def test_bench_train_step_smoke_end_to_end(tmp_path: Path) -> None:
     """`--run-smoke`: invokes `bench_train_step.py --smoke` as a real subprocess
-    against the pre-downloaded `mlx-community/Qwen2.5-0.5B-Instruct-bf16` (2 steps,
+    against the pre-downloaded `mlx-community/Llama-3.2-1B-Instruct-4bit` (2 steps,
     ours vs stock) and asserts both arms report `status == "ok"` with a finite
     tokens/sec median."""
     out_dir = tmp_path / "bench_train_step_smoke"
