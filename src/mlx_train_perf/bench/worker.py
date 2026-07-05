@@ -1,32 +1,53 @@
 """Bench worker: the subprocess entry point for exactly one `Condition`, invoked by
 `runner.run_conditions` as `python -m mlx_train_perf.bench.worker --config <path>`.
 
-Guardrail-reassert note for the training-step condition kind, which lands with the
-end-to-end benches: `mlx_lm.tuner.trainer.train()` raises the wired limit to the device
-max AT ENTRY (site-packages/mlx_lm/tuner/trainer.py:229) and then blocks until the
-training loop finishes. A worker that calls `install_guardrails()` once before `train()`
-and again after it returns protects nothing in between -- the stricter cap is silently
-overridden for the entire run. The re-assert has to live INSIDE the loop: the loss
-callable handed to `train(...)` calls `install_guardrails()` on its own first invocation
-(a one-shot flag), and the worker records the OBSERVED wired limit mid-run in its
-artifact so a cap regression is visible rather than assumed away (drive the step loop
-manually instead of calling `train()` if that callback point proves awkward). 0.1.0 only
-implements the `loss_layer` kind below, which never calls `train()`, so this hazard does
-not apply yet.
+Guardrail-reassert note for the `train_step` condition kind: `mlx_lm.tuner.trainer.
+train()` raises the wired limit to the device max AT ENTRY (site-packages/mlx_lm/
+tuner/trainer.py:229) and then blocks until the training loop finishes. A worker that
+calls `install_guardrails()` once before `train()` and again after it returns protects
+nothing in between -- the stricter cap is silently overridden for the entire run. The
+re-assert has to live INSIDE the loop: the loss callable handed to `train(...)` calls
+`install_guardrails()` on its own first invocation (a one-shot flag --
+`_make_reasserting_loss` below), and `run_train_step` reads the wired limit back
+(`install_guardrails`'s own return value) once more after `train()` returns to CONFIRM
+the cap actually held throughout -- `wired_cap_holds`
+(`mlx_train_perf.core.guards`) is the pure decision that comparison reduces to, and a
+mismatch raises `WiredCapRegressionError` rather than silently reporting numbers
+measured under an uncapped run.
+
+A second, independent hazard for the SAME condition kind: `train()` always wraps its
+per-step function in `mx.compile`, and `mx.compile` unconditionally forbids evaluating
+an array during tracing. `linear_cross_entropy`'s own `_validate_inputs`
+(core/loss.py) performs exactly that -- a per-call `mx.min(targets).item()` host sync
+(the out-of-range-target safety check) -- so `make_loss_fn`'s output cannot be driven
+through `train()`'s compiled step, for any `impl`. `run_train_step` therefore drives
+`ours` through an uncompiled manual loop (`_run_manual_steps`) instead of `train()`;
+`stock`'s own `default_loss` has no such host sync and runs through the real,
+compiled `train()` unmodified.
 """
 import argparse
 import json
+import random
 import statistics
+import tempfile
 import time
+from collections.abc import Callable
 from pathlib import Path
-from typing import Literal, cast
+from typing import Any, Literal, cast
 
 import mlx.core as mx
+from mlx import nn
 
+from mlx_train_perf.adapters.mlx_lm import make_loss_fn
 from mlx_train_perf.bench.artifacts import condition_identity, write_result
-from mlx_train_perf.core.guards import install_guardrails
+from mlx_train_perf.core.guards import clamped_caps, install_guardrails, wired_cap_holds
 from mlx_train_perf.core.loss import DenseHead, HeadRef, QuantizedHead, linear_cross_entropy
-from mlx_train_perf.errors import LaunchBudgetError, MlxTrainPerfError
+from mlx_train_perf.errors import (
+    LaunchBudgetError,
+    MissingDependencyError,
+    MlxTrainPerfError,
+    WiredCapRegressionError,
+)
 
 _DTYPES: dict[str, mx.Dtype] = {
     "float32": mx.float32, "bfloat16": mx.bfloat16, "float16": mx.float16,
@@ -103,6 +124,323 @@ def run_loss_layer(params: dict[str, object]) -> dict[str, object]:
     }
 
 
+# ---------------------------------------------------------------------------------
+# train_step: N real mlx-lm LoRA fine-tune steps end to end -- ours (via the T12
+# adapter, `make_loss_fn`) or stock (`mlx_lm.tuner.trainer.default_loss`), selected by
+# `params["stock"]`.
+# ---------------------------------------------------------------------------------
+
+
+def _require_mlx_lm() -> None:
+    """Mirrors `adapters.mlx_lm._require_mlx_lm`'s check -- duplicated rather than
+    imported across modules since it is a tiny, independent fail-fast guard, not
+    shared logic. `_load_model` below is the ONLY thing in this function's OWN control
+    flow that would otherwise raise a raw `ImportError`; everything else that needs
+    `mlx_lm` (the adapter, `mlx_lm.tuner.*`) reaches its own lazy import naturally."""
+    try:
+        import mlx_lm  # noqa: F401, PLC0415
+    except ImportError as exc:
+        raise MissingDependencyError(
+            "mlx-lm is required for the train_step bench condition; install the "
+            "optional 'mlx-lm' extra (pip install 'mlx-train-perf[mlx-lm]')"
+        ) from exc
+
+
+def _load_model(model_id: str, revision: str | None) -> tuple[Any, Any]:
+    """The sole call site that touches `mlx_lm.load` (a real repo/checkpoint read) --
+    isolated so tests can monkeypatch this one function and hand back a tiny,
+    freshly-constructed synthetic model instead of a real downloaded checkpoint. Cast
+    to `tuple[Any, Any]` deliberately -- `mlx_lm`'s own real (model, tokenizer) types
+    are not imported anywhere in this project (see `adapters/mlx_lm.py`'s identical
+    `model: Any` convention); this project verifies model support structurally, not
+    by type."""
+    import mlx_lm  # noqa: PLC0415
+    return cast("tuple[Any, Any]", mlx_lm.load(model_id, revision=revision))
+
+
+def _synthetic_train_examples(
+    *, vocab_size: int, seq_len: int, num_examples: int, seed: int,
+) -> list[list[int]]:
+    """`num_examples` fixed-length (`seq_len + 1`, matching `train()`'s own
+    `inputs=batch[:, :-1]` / `targets=batch[:, 1:]` shift) random-token rows. Plain
+    `random.Random`, never `mx.random` -- dataset construction stays independent of
+    MLX's global RNG state, which `run_train_step` reseeds separately (`mx.random.
+    seed`) right before the LoRA layers' own random-init draw. With `num_examples ==
+    batch` (this function's only caller), `iterate_batches` (mlx_lm/tuner/trainer.py)
+    ends up with exactly ONE batch group, and `np.random.permutation` of a single-
+    element array is deterministic regardless of numpy's global RNG state -- so every
+    training step reuses the identical batch, and two conditions built from the same
+    `seed` see byte-identical training data at every step. That is what makes the
+    per-step loss dump a real parity check against stock's own masking/`ntoks`
+    denominator, not an approximate one."""
+    rng = random.Random(seed)
+    return [
+        [rng.randrange(vocab_size) for _ in range(seq_len + 1)] for _ in range(num_examples)
+    ]
+
+
+class _SyntheticDataset:
+    """`train()` (unlike `mlx_lm.lora.train_model`, which wraps its dataset argument
+    in `CacheDataset`) hands its `train_dataset` STRAIGHT to `iterate_batches`
+    unwrapped -- so `isinstance(dataset, CacheDataset)` is false, and
+    `iterate_batches`'s own `len_fn = lambda idx: len(dataset[idx][0])` reads
+    `dataset[idx]` as the FINAL `(tokens, offset)` pair directly (mlx_lm/tuner/
+    trainer.py:113-114). `__getitem__` therefore returns that pair immediately --
+    `offset=0` always, every synthetic row fully unmasked -- with no separate
+    `process()`/caching indirection (`CacheDataset`'s own job, which does not apply
+    here)."""
+
+    def __init__(self, examples: list[list[int]]) -> None:
+        self._examples = examples
+
+    def __getitem__(self, idx: int) -> tuple[list[int], int]:
+        return self._examples[idx], 0
+
+    def __len__(self) -> int:
+        return len(self._examples)
+
+
+class _RecordingCallback:
+    """Duck-typed `mlx_lm.tuner.callbacks.TrainingCallback` -- `train()` only ever
+    calls these two methods by name, never `isinstance`-checks, so no inheritance (and
+    no module-level `mlx_lm` import) is needed. Collects every per-step report
+    (`steps_per_report=1` means exactly one call per training iteration).
+    `on_val_loss_report` is never invoked: `run_train_step` always passes an empty
+    `val_dataset`, which `train()`'s own `if val_dataset and (...)` guard treats as "no
+    validation configured"."""
+
+    def __init__(self) -> None:
+        self.train_info: list[dict[str, object]] = []
+
+    def on_train_loss_report(self, train_info: dict[str, object]) -> None:
+        self.train_info.append(dict(train_info))
+
+    def on_val_loss_report(self, val_info: dict[str, object]) -> None:  # noqa: ARG002
+        # `val_info` unused: required for interface parity with `TrainingCallback` --
+        # `train()` calls this positionally; never actually invoked (val_dataset=[]).
+        return None  # pragma: no cover
+
+
+def _make_reasserting_loss(
+    loss_fn: Callable[[Any, mx.array, mx.array], tuple[mx.array, mx.array]],
+    observed_before: list[int],
+) -> Callable[[Any, mx.array, mx.array], tuple[mx.array, mx.array]]:
+    """Wraps a trainer loss callable (ours, via `make_loss_fn`, or stock's own
+    `default_loss`) so its FIRST invocation re-asserts this project's house wired cap
+    before doing anything else -- see the module docstring for why this must live
+    INSIDE the loop rather than around the `train()` call. `mx.compile` only re-runs a
+    traced Python body on a recompile, so firing once is sufficient: the reassert
+    holds for the rest of the run once it has fired. `observed_before` is a
+    caller-owned single-element-once-fired list, doubling as both the one-shot flag
+    (empty == not fired yet) and the captured diagnostic value (the wired limit that
+    was active immediately before the reassert -- expected to be the device max
+    `train()` just set at its own entry)."""
+
+    def wrapped(model: Any, batch: mx.array, lengths: mx.array) -> tuple[mx.array, mx.array]:
+        if not observed_before:
+            observed_before.append(install_guardrails())
+        return loss_fn(model, batch, lengths)
+
+    return wrapped
+
+
+def _run_manual_steps(
+    model: Any,
+    optimizer: Any,
+    loss_fn: Callable[[Any, mx.array, mx.array], tuple[mx.array, mx.array]],
+    batch: mx.array,
+    lengths: mx.array,
+    *,
+    steps: int,
+) -> list[dict[str, object]]:
+    """Drives `steps` training iterations WITHOUT `mx.compile` -- the manual-loop
+    escape hatch this module's docstring anticipates, REQUIRED for the `ours` path:
+    `linear_cross_entropy`'s `_validate_inputs` (core/loss.py) performs a per-call
+    host sync (`mx.min(targets).item()`, the out-of-range-target safety check) that
+    MLX unconditionally forbids inside a traced/compiled function ("Attempting to
+    eval an array during function transformations like compile or vmap is not
+    allowed") -- confirmed empirically: driving `make_loss_fn`'s output through
+    `mlx_lm.tuner.trainer.train()` (which always wraps its step in `mx.compile`)
+    raises exactly this error, for every `impl`. Stock's own `default_loss` has no
+    such host sync and IS driven through the real, compiled `train()` (see
+    `run_train_step`) -- this asymmetry (ours: uncompiled Python-dispatch overhead
+    per step; stock: compiled) is a KNOWN LIMITATION of this measurement, not a claim
+    that the two conditions are compared at the Python-dispatch level apples to
+    apples. At production model scale the actual GEMM/attention compute should dwarf
+    per-step Python dispatch, but that has not been measured here (build-time
+    verification only, tiny shapes) -- do not trust a close tok/s margin between the
+    two conditions without checking this asymmetry first.
+
+    Otherwise mirrors `mlx_lm.tuner.trainer.train`'s own per-step shape:
+    `nn.value_and_grad`, `optimizer.update`, evaluating `model.state` +
+    `optimizer.state` together with the reported values (never just the loss) so no
+    lazy graph survives across iterations."""
+    model.train()
+    vag = nn.value_and_grad(model, loss_fn)
+    reports: list[dict[str, object]] = []
+    for _ in range(steps):
+        t0 = time.perf_counter()
+        (loss_val, ntoks), grad = vag(model, batch, lengths)
+        optimizer.update(model, grad)
+        mx.eval(model.state, optimizer.state, loss_val, ntoks)
+        elapsed = time.perf_counter() - t0
+        reports.append({
+            "train_loss": float(loss_val.item()),
+            "tokens_per_second": float(ntoks.item()) / elapsed,
+        })
+    return reports
+
+
+def _run_stock_steps(
+    model: Any,
+    optimizer: Any,
+    loss_fn: Callable[[Any, mx.array, mx.array], tuple[mx.array, mx.array]],
+    examples: list[list[int]],
+    *,
+    batch: int,
+    seq_len: int,
+    steps: int,
+    grad_checkpoint: bool,
+) -> list[dict[str, object]]:
+    """The real, compiled `mlx_lm.tuner.trainer.train()` -- `default_loss` has no
+    per-call host sync, so it runs through `train()`'s `mx.compile`d step unmodified
+    (see `_run_manual_steps`'s docstring for why the `ours` path cannot)."""
+    from mlx_lm.tuner.trainer import TrainingArgs, train  # noqa: PLC0415
+
+    callback = _RecordingCallback()
+    train_set = _SyntheticDataset(examples)
+    with tempfile.TemporaryDirectory(prefix="mlx-train-perf-bench-") as tmp_dir:
+        args = TrainingArgs(
+            batch_size=batch, iters=steps, val_batches=0, steps_per_report=1,
+            steps_per_eval=steps + 1, steps_per_save=steps + 1,
+            max_seq_length=seq_len + 1, grad_checkpoint=grad_checkpoint,
+            adapter_file=str(Path(tmp_dir) / "adapters.safetensors"),
+        )
+        # `_RecordingCallback` is duck-typed against `mlx_lm.tuner.callbacks.
+        # TrainingCallback` deliberately (see its own docstring) rather than
+        # inheriting from it -- avoids a module-level `mlx_lm` import for a class
+        # this project only ever hands to `train()`, which never `isinstance`-checks.
+        train(model=model, optimizer=optimizer, train_dataset=train_set, val_dataset=[],
+              args=args, loss=loss_fn, training_callback=cast(Any, callback))
+    return callback.train_info
+
+
+def run_train_step(params: dict[str, object]) -> dict[str, object]:
+    """Times `steps` real mlx-lm LoRA fine-tune steps end to end against a real
+    (`mlx_lm.load`-resolved) model: ours, via the T12 adapter (`make_loss_fn`), or
+    stock's own `mlx_lm.tuner.trainer.default_loss` when `params["stock"]` is true.
+    Records tokens/sec (median + per-step), per-step loss, and the memory story
+    (active-before / marginal-peak / total-peak, matching `run_loss_layer`'s own
+    convention) plus the wired-limit contract this module's docstring describes --
+    `WiredCapRegressionError` if the observed limit, read back after training, does
+    not match this project's house cap.
+
+    `stock` runs the real, compiled `mlx_lm.tuner.trainer.train()`. `ours` runs a
+    manual (uncompiled) step loop instead -- see `_run_manual_steps`'s docstring for
+    why: `train()`'s `mx.compile`d step is incompatible with `linear_cross_entropy`'s
+    own per-call host-sync validation, for every `impl`. Only LoRA fine-tuning is
+    modeled (mlx-lm's own `linear_to_lora_layers`, zero-config default target set,
+    applied identically to both `ours` and `stock`) -- full fine-tuning
+    (`lora_rank=0`) is out of scope for this condition kind.
+
+    `params`: `model` (str, repo id or local path, required), `revision` (str | None,
+    default None), `seq_len`/`batch`/`steps` (int, required), `lora_rank` (int, default
+    8), `lora_layers` (int, default -1 == all layers), `impl` (default "auto",
+    ignored when `stock`), `stock` (bool, default False), `learning_rate` (float,
+    default 1e-5), `seed` (int, default 0), `grad_checkpoint` (bool, default False).
+    """
+    _require_mlx_lm()
+    import mlx.optimizers as optim  # noqa: PLC0415
+    from mlx_lm.tuner.trainer import default_loss  # noqa: PLC0415
+    from mlx_lm.tuner.trainer import grad_checkpoint as apply_grad_checkpoint  # noqa: PLC0415
+    from mlx_lm.tuner.utils import linear_to_lora_layers  # noqa: PLC0415
+
+    model_id = str(params["model"])
+    revision = cast("str | None", params.get("revision"))
+    seq_len = int(cast(int, params["seq_len"]))
+    batch = int(cast(int, params["batch"]))
+    steps = int(cast(int, params["steps"]))
+    lora_rank = int(cast(int, params.get("lora_rank", 8)))
+    lora_layers = int(cast(int, params.get("lora_layers", -1)))
+    impl = cast(Literal["auto", "kernel", "chunked", "naive"], params.get("impl", "auto"))
+    stock = bool(params.get("stock", False))
+    learning_rate = float(cast(float, params.get("learning_rate", 1e-5)))
+    seed = int(cast(int, params.get("seed", 0)))
+    grad_checkpoint = bool(params.get("grad_checkpoint", False))
+
+    model, _tokenizer = _load_model(model_id, revision)
+    mx.random.seed(seed)  # BEFORE freeze/LoRA-injection: their random init draws next
+    model.freeze()
+    linear_to_lora_layers(
+        model, lora_layers, {"rank": lora_rank, "dropout": 0.0, "scale": 20.0}
+    )
+
+    base_loss = default_loss if stock else make_loss_fn(model, impl=impl)
+    observed_before: list[int] = []
+    loss_fn = _make_reasserting_loss(base_loss, observed_before)
+
+    vocab_size = int(model.args.vocab_size)
+    examples = _synthetic_train_examples(
+        vocab_size=vocab_size, seq_len=seq_len, num_examples=batch, seed=seed,
+    )
+
+    dev_max = int(mx.device_info()["max_recommended_working_set_size"])
+    expected_wired, _soft = clamped_caps(dev_max)
+
+    opt = optim.Adam(learning_rate=learning_rate)
+
+    active_before = mx.get_active_memory()
+    mx.reset_peak_memory()
+    if stock:
+        step_reports = _run_stock_steps(
+            model, opt, loss_fn, examples, batch=batch, seq_len=seq_len, steps=steps,
+            grad_checkpoint=grad_checkpoint,
+        )
+    else:
+        # Manual (uncompiled) loop -- every synthetic example is the SAME fixed
+        # length, so the whole (batch, lengths) pair is built once and reused
+        # unchanged every step (see `_synthetic_train_examples`'s docstring).
+        if grad_checkpoint:
+            # mlx_lm.tuner.trainer.grad_checkpoint's own source has no annotations.
+            apply_grad_checkpoint(model.layers[0])  # type: ignore[no-untyped-call]
+        batch_arr = mx.array(examples)
+        lengths_arr = mx.array([[0, seq_len + 1] for _ in range(batch)])
+        mx.eval(batch_arr, lengths_arr)
+        step_reports = _run_manual_steps(
+            model, opt, loss_fn, batch_arr, lengths_arr, steps=steps,
+        )
+    marginal_peak_gb = (mx.get_peak_memory() - active_before) / 1024**3
+
+    observed_after = install_guardrails()
+    if not wired_cap_holds(observed_bytes=observed_after, expected_bytes=expected_wired):
+        raise WiredCapRegressionError(
+            f"train_step condition's wired limit was {observed_after / 1024**3:.2f} GB "
+            f"after training, expected the house cap {expected_wired / 1024**3:.2f} GB "
+            "-- mlx_lm.tuner.trainer.train()'s entry-time override was not correctly "
+            "re-asserted (see this module's docstring)"
+        )
+
+    tokens_per_sec_all = [
+        float(cast(float, info["tokens_per_second"])) for info in step_reports
+    ]
+    loss_all = [float(cast(float, info["train_loss"])) for info in step_reports]
+    return {
+        "tokens_per_sec_median": (
+            round(statistics.median(tokens_per_sec_all), 3) if tokens_per_sec_all else 0.0
+        ),
+        "tokens_per_sec_all": [round(x, 3) for x in tokens_per_sec_all],
+        "loss_all": [round(x, 6) for x in loss_all],
+        "active_before_gb": round(active_before / 1024**3, 4),
+        "marginal_peak_gb": round(marginal_peak_gb, 4),
+        "total_peak_gb": round(active_before / 1024**3 + marginal_peak_gb, 4),
+        "observed_wired_limit_gb": round(observed_after / 1024**3, 4),
+        "house_wired_limit_gb": round(expected_wired / 1024**3, 4),
+        "wired_limit_before_reassert_gb": (
+            round(observed_before[0] / 1024**3, 4) if observed_before else None
+        ),
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="python -m mlx_train_perf.bench.worker")
     ap.add_argument("--config", required=True, help="path to a JSON condition config")
@@ -116,22 +454,29 @@ def main(argv: list[str] | None = None) -> int:
     install_guardrails()  # FIRST -- before any allocation this condition makes
 
     ident = condition_identity(kind=kind, session_id=session_id, params=params)
-    if kind != "loss_layer":
-        # Deliberately uncaught: an unsupported kind is a program error (a bad Condition
-        # was constructed), not a recorded run outcome -- it crashes this worker process
-        # with a nonzero exit, and `runner.run_conditions` records the failure envelope
-        # on the CALLER's side instead of this worker writing anything. Referencing the
-        # bare `run_loss_layer` name below (not a dict bound at import time) also keeps
-        # this dispatch monkeypatch-friendly for tests.
-        raise MlxTrainPerfError(
-            f"unsupported bench condition kind {kind!r}; only 'loss_layer' is implemented "
-            "in 0.1.0 ('train_step' lands in a later task)"
-        )
     try:
-        fields = run_loss_layer(params)
+        if kind == "loss_layer":
+            fields = run_loss_layer(params)
+        elif kind == "train_step":
+            fields = run_train_step(params)
+        else:
+            # Deliberately uncaught: an unsupported kind is a program error (a bad
+            # Condition was constructed), not a recorded run outcome -- it crashes this
+            # worker process with a nonzero exit, and `runner.run_conditions` records
+            # the failure envelope on the CALLER's side instead of this worker writing
+            # anything. Referencing the bare `run_loss_layer`/`run_train_step` names
+            # above (not a dict bound at import time) also keeps this dispatch
+            # monkeypatch-friendly for tests.
+            raise MlxTrainPerfError(
+                f"unsupported bench condition kind {kind!r}; expected 'loss_layer' or "
+                "'train_step'"
+            )
     except LaunchBudgetError as exc:
-        # A guard refusal IS a result: the calibrated rate cannot serve this shape within
-        # the watchdog budget -- record it, don't crash the sweep.
+        # A guard refusal IS a result: the calibrated rate cannot serve this shape
+        # within the watchdog budget -- record it, don't crash the sweep. A
+        # WiredCapRegressionError is a DIFFERENT, more serious failure (a condition
+        # that measured under an uncapped run) and is deliberately NOT caught here --
+        # it propagates the same way an unsupported kind does.
         write_result(out, ident, "refused", error=str(exc))
         return 0
     write_result(out, ident, "ok", **fields)

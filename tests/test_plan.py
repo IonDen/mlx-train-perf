@@ -4,7 +4,16 @@ import pytest
 from mlx_train_perf.core.guards import clamped_caps
 from mlx_train_perf.errors import PlanInputError
 from mlx_train_perf.plan.calibration import load_calibration
-from mlx_train_perf.plan.estimate import ModelShape, TrainConfig, estimate_peak, plan_fit
+from mlx_train_perf.plan.estimate import (
+    FitPoint,
+    ModelShape,
+    TrainConfig,
+    _lora_param_count,
+    _loss_bytes,
+    estimate_peak,
+    fit_activation_and_optimizer_bytes,
+    plan_fit,
+)
 
 
 def _shape() -> ModelShape:  # micro "llama": V=1000, D=64, L=2, I=128, 4h/2kv, untied
@@ -229,3 +238,114 @@ def test_naive_estimate_is_conservative_at_smaller_n() -> None:
     _, comp = estimate_peak(shape, cfg, calib)
     measured_bytes = 4.057 * 1024**3
     assert comp["loss"] >= measured_bytes
+
+
+# ---------------------------------------------------------------------------
+# fit_activation_and_optimizer_bytes: pure ordinary-least-squares fit of
+# act_bytes_per_token_layer / optimizer_bytes_per_param from `run_train_step` peak
+# measurements. Every point here is SYNTHETIC (generated forward from known true
+# coefficients via the same `_loss_bytes`/`_lora_param_count` the fit itself inverts)
+# -- no real artifact, no model, no MLX device. The controller runs this against
+# real `run_train_step` artifacts after the production runs; calibration_data.json's
+# own constants are left untouched by this task.
+# ---------------------------------------------------------------------------
+
+
+def _synthesize_fit_point(
+    *, shape: ModelShape, calib, batch: int, seq_len: int, lora_rank: int,
+    lora_layers: int, true_act: float, true_opt: float,
+) -> FitPoint:
+    cfg = TrainConfig(batch=batch, seq_len=seq_len, dtype="bfloat16", lora_rank=lora_rank,
+                      lora_layers=lora_layers, grad_checkpoint=True, impl="kernel")
+    loss_bytes = _loss_bytes(cfg, shape, calib)
+    n_token_layers = batch * seq_len * shape.layers
+    n_params = _lora_param_count(cfg, shape)
+    marginal = true_act * n_token_layers + true_opt * n_params + loss_bytes
+    return FitPoint(shape=shape, cfg=cfg, marginal_peak_bytes=marginal)
+
+
+def test_fit_activation_and_optimizer_bytes_recovers_known_coefficients() -> None:
+    """Classic fit-recovery test: synthesize FitPoints FORWARD from KNOWN true
+    coefficients, then fit BACKWARD and assert exact recovery (up to floating-point
+    tolerance) -- proves the 2-variable least-squares solve itself is correct,
+    independent of what calibration_data.json's own (still-placeholder) constants
+    happen to be."""
+    shape = _shape()
+    calib = load_calibration()
+    true_act, true_opt = 512.0, 8.0
+    points = [
+        _synthesize_fit_point(shape=shape, calib=calib, batch=1, seq_len=512,
+                              lora_rank=8, lora_layers=2, true_act=true_act,
+                              true_opt=true_opt),
+        _synthesize_fit_point(shape=shape, calib=calib, batch=2, seq_len=512,
+                              lora_rank=16, lora_layers=2, true_act=true_act,
+                              true_opt=true_opt),
+        _synthesize_fit_point(shape=shape, calib=calib, batch=1, seq_len=1024,
+                              lora_rank=8, lora_layers=2, true_act=true_act,
+                              true_opt=true_opt),
+    ]
+    fitted_act, fitted_opt = fit_activation_and_optimizer_bytes(points, calib=calib)
+    assert fitted_act == pytest.approx(true_act, rel=1e-9)
+    assert fitted_opt == pytest.approx(true_opt, rel=1e-9)
+
+
+def test_fit_activation_and_optimizer_bytes_recovers_with_exactly_two_points() -> None:
+    shape = _shape()
+    calib = load_calibration()
+    true_act, true_opt = 300.0, 6.0
+    points = [
+        _synthesize_fit_point(shape=shape, calib=calib, batch=1, seq_len=256,
+                              lora_rank=4, lora_layers=2, true_act=true_act,
+                              true_opt=true_opt),
+        _synthesize_fit_point(shape=shape, calib=calib, batch=1, seq_len=1024,
+                              lora_rank=32, lora_layers=2, true_act=true_act,
+                              true_opt=true_opt),
+    ]
+    fitted_act, fitted_opt = fit_activation_and_optimizer_bytes(points, calib=calib)
+    assert fitted_act == pytest.approx(true_act, rel=1e-9)
+    assert fitted_opt == pytest.approx(true_opt, rel=1e-9)
+
+
+def test_fit_activation_and_optimizer_bytes_rejects_fewer_than_two_points() -> None:
+    shape = _shape()
+    calib = load_calibration()
+    points = [
+        _synthesize_fit_point(shape=shape, calib=calib, batch=1, seq_len=512,
+                              lora_rank=8, lora_layers=2, true_act=1.0, true_opt=1.0),
+    ]
+    with pytest.raises(PlanInputError, match="at least 2"):
+        fit_activation_and_optimizer_bytes(points, calib=calib)
+
+
+def test_fit_activation_and_optimizer_bytes_rejects_non_kernel_impl() -> None:
+    shape = _shape()
+    calib = load_calibration()
+    cfg = TrainConfig(batch=1, seq_len=512, dtype="bfloat16", lora_rank=8, lora_layers=2,
+                      grad_checkpoint=True, impl="naive")
+    points = [
+        FitPoint(shape=shape, cfg=cfg, marginal_peak_bytes=1.0),
+        FitPoint(shape=shape, cfg=cfg, marginal_peak_bytes=2.0),
+    ]
+    with pytest.raises(PlanInputError, match="kernel"):
+        fit_activation_and_optimizer_bytes(points, calib=calib)
+
+
+def test_fit_activation_and_optimizer_bytes_rejects_collinear_points() -> None:
+    """True collinearity in this THROUGH-THE-ORIGIN model needs the two drivers
+    PROPORTIONAL across every point, not merely equal -- `lora_rank` doubling exactly
+    when `seq_len` doubles makes the optimizer-bytes driver (linear in `lora_rank`,
+    `_lora_param_count`) a constant multiple of the activation-bytes driver (linear in
+    `batch*seq_len*layers`) at every point, so the 2x2 normal-equations matrix is
+    singular (verified by hand: det=0 exactly for this construction, whereas merely
+    repeating the SAME `lora_rank` across differing `seq_len` values is NOT collinear
+    here -- confirmed separately before writing this test)."""
+    shape = _shape()
+    calib = load_calibration()
+    points = [
+        _synthesize_fit_point(shape=shape, calib=calib, batch=1, seq_len=512,
+                              lora_rank=8, lora_layers=2, true_act=1.0, true_opt=1.0),
+        _synthesize_fit_point(shape=shape, calib=calib, batch=1, seq_len=1024,
+                              lora_rank=16, lora_layers=2, true_act=1.0, true_opt=1.0),
+    ]
+    with pytest.raises(PlanInputError, match="collinear"):
+        fit_activation_and_optimizer_bytes(points, calib=calib)

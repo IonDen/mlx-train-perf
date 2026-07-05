@@ -41,3 +41,9 @@ class BenchInputError(MlxTrainPerfError):
 class RegisterProbeError(MlxTrainPerfError):
     """Standalone MSL recompile for the register-pressure probe failed: a bad capture,
     a Metal compiler error, or an unexpected number of compiled kernel functions."""
+
+
+class WiredCapRegressionError(MlxTrainPerfError):
+    """A `train_step` condition's wired limit was not at this project's house cap
+    after training completed -- the in-loop re-assert did not hold; the condition is a
+    failed result, not a silent pass."""

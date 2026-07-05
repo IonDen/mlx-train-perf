@@ -44,6 +44,7 @@ CODE_SHA_DEPS: tuple[Path, ...] = tuple(
         "core/kernel/dispatch.py",
         "core/kernel/source.py",
         "core/guards.py",
+        "adapters/mlx_lm.py",
     )
 )
 

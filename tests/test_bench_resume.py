@@ -387,7 +387,7 @@ def test_worker_main_crashes_on_unsupported_kind(tmp_path: Path) -> None:
     out = tmp_path / "r.json"
     cfg = tmp_path / "config.json"
     cfg.write_text(json.dumps({
-        "kind": "train_step", "params": {}, "session_id": "s1", "out": str(out),
+        "kind": "not_a_real_kind", "params": {}, "session_id": "s1", "out": str(out),
     }))
     with pytest.raises(MlxTrainPerfError):
         worker.main(["--config", str(cfg)])
