@@ -189,6 +189,38 @@ def test_build_probe_pins_the_dataset_recipe_and_script_sha() -> None:
     assert cond.params["revision"] == "main"
 
 
+def test_build_probe_threads_compute_dtype_into_both_arms() -> None:
+    """The `ours` probe runs the kernel, which needs bf16-compute hidden -- the 4-bit
+    flagship loads fp16, so every probe casts the model to `compute_dtype` (else `auto`
+    refuses the kernel on fp16, the worker crashes, and the probe reads as "does not
+    fit" -> ours' max context would collapse to 0). Applied to BOTH arms, like the
+    train-step bench, so the max-context comparison holds the trunk dtype constant.
+    Defaults to bfloat16 -- the only sensible value for the 4-bit flagship sweep."""
+    for arm in ("ours", "stock"):
+        cond = build_probe(model=_RECIPE["model"], revision=None, batch=1, lora_rank=8,
+                           lora_layers=-1, seed=0, arm=arm, seq_len=2048)
+        assert cond.params["compute_dtype"] == "bfloat16"
+
+
+def test_build_probe_honors_an_explicit_compute_dtype() -> None:
+    cond = build_probe(model=_RECIPE["model"], revision=None, batch=1, lora_rank=8,
+                       lora_layers=-1, seed=0, arm="ours", seq_len=2048,
+                       compute_dtype="float32")
+    assert cond.params["compute_dtype"] == "float32"
+
+
+def test_recipe_session_id_differs_for_a_different_compute_dtype() -> None:
+    """A different compute_dtype is a different recipe -- it must not silently resume a
+    sweep measured at another dtype."""
+    a = _recipe_session_id(**_RECIPE)  # default bfloat16
+    b = _recipe_session_id(**_RECIPE, compute_dtype="float16")
+    assert a != b
+
+
+def test_default_compute_dtype_is_bfloat16() -> None:
+    assert build_parser().parse_args([]).compute_dtype == "bfloat16"
+
+
 def test_build_probe_rejects_an_unknown_arm() -> None:
     with pytest.raises(ValueError, match="unknown arm"):
         build_probe(model=_RECIPE["model"], revision=None, batch=1, lora_rank=8,
