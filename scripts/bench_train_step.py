@@ -89,6 +89,7 @@ def build_conditions(
     seed: int,
     revision: str | None,
     impl: str = "auto",
+    compute_dtype: str | None = None,
 ) -> list[Condition]:
     sha = script_sha()
     conditions: list[Condition] = []
@@ -99,7 +100,8 @@ def build_conditions(
                     "model": model, "revision": revision, "seq_len": seq_len,
                     "batch": batch, "steps": steps, "lora_rank": lora_rank,
                     "lora_layers": lora_layers, "impl": impl, "stock": stock,
-                    "learning_rate": learning_rate, "seed": seed, "script_sha": sha,
+                    "learning_rate": learning_rate, "seed": seed,
+                    "compute_dtype": compute_dtype, "script_sha": sha,
                 }
                 conditions.append(Condition(
                     name=condition_name(model=model, seq_len=seq_len, arm=arm),
@@ -192,6 +194,13 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--learning-rate", type=float, default=1e-5)
     ap.add_argument("--impl", choices=["auto", "kernel", "chunked", "naive"], default="auto",
                     help="the 'ours' loss impl; kernel needs bf16-compute hidden states")
+    ap.add_argument("--compute-dtype", choices=["bfloat16", "float32", "float16"],
+                    default=None,
+                    help="cast the loaded model's floating params to this dtype before "
+                        "training (int4 weights of a 4-bit checkpoint stay int4). The "
+                        "kernel impl needs bfloat16 on the 4-bit models that otherwise "
+                        "compute in fp16; applied to BOTH arms, holding the trunk dtype "
+                        "constant so the ours-vs-stock comparison isolates the loss layer")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--revision", default=None, help="applied to every --model")
     ap.add_argument("--out", default=None, help="output directory (default: this "
@@ -210,19 +219,20 @@ def main(argv: list[str] | None = None) -> int:
         # SMOKE_MODEL loads as fp16, which the kernel path does not accept — the smoke
         # exercises `ours` end to end through the compiled trainer via the chunked path
         # (the kernel path's compile-compatibility is locked by tests/test_loss_compile.py).
-        impl = "chunked"
+        # No cast: chunked accepts fp16, so the smoke stays on the fp16 checkpoint as-is.
+        impl, compute_dtype = "chunked", None
     else:
         if not args.model or not args.seq_len:
             raise SystemExit("--model and --seq-len are required unless --smoke is set")
         models, seq_lens, steps = args.model, args.seq_len, args.steps
         out_dir = Path(args.out) if args.out else RESULTS
-        impl = args.impl
+        impl, compute_dtype = args.impl, args.compute_dtype
 
     conditions = build_conditions(
         models=models, seq_lens=seq_lens, batch=args.batch, steps=steps,
         lora_rank=args.lora_rank, lora_layers=args.lora_layers,
         learning_rate=args.learning_rate, seed=args.seed, revision=args.revision,
-        impl=impl,
+        impl=impl, compute_dtype=compute_dtype,
     )
     if args.condition:
         matches = [c for c in conditions if c.name == args.condition]

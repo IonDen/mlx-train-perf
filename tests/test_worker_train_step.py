@@ -86,6 +86,41 @@ def test_run_train_step_stock_reports_expected_fields(monkeypatch: pytest.Monkey
     assert len(fields["tokens_per_sec_all"]) == 2  # type: ignore[arg-type]
 
 
+def test_run_train_step_casts_model_to_compute_dtype(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`compute_dtype` casts the loaded model's floating params right after load, before
+    freeze/LoRA injection, so the kernel loss path (which accepts only fp32/bf16 hidden)
+    can run on a model that otherwise computes in fp16 -- the real reason this exists:
+    4-bit MLX checkpoints store fp16 scales and compute in fp16 regardless of their
+    config `torch_dtype`. The final RMSNorm weight is the stable observable: a trunk
+    param `linear_to_lora_layers` never wraps and `model.freeze()` keeps frozen, so it
+    holds the cast dtype unchanged through training."""
+    model = _tiny_llama()
+    assert model.model.norm.weight.dtype == mx.float32  # constructed fp32
+    monkeypatch.setattr(worker, "_load_model", lambda _m, _r: (model, object()))
+    install_guardrails()
+
+    worker.run_train_step({**_BASE_PARAMS, "compute_dtype": "bfloat16"})
+
+    assert model.model.norm.weight.dtype == mx.bfloat16
+
+
+def test_run_train_step_without_compute_dtype_leaves_model_dtype_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Default (no `compute_dtype`): the model runs at its loaded dtype, uncast -- the
+    smoke/chunked path relies on this (fp16 models stay fp16 for chunked/naive, which
+    accept them; only the kernel arm needs the bf16 cast)."""
+    model = _tiny_llama()
+    monkeypatch.setattr(worker, "_load_model", lambda _m, _r: (model, object()))
+    install_guardrails()
+
+    worker.run_train_step(dict(_BASE_PARAMS))  # no compute_dtype key
+
+    assert model.model.norm.weight.dtype == mx.float32
+
+
 def test_run_train_step_ours_with_grad_checkpoint_still_reports_fields(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
