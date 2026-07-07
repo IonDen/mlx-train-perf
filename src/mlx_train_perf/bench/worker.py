@@ -299,7 +299,10 @@ def run_train_step(params: dict[str, object]) -> dict[str, object]:
     default None), `seq_len`/`batch`/`steps` (int, required), `lora_rank` (int, default
     8), `lora_layers` (int, default -1 == all layers), `impl` (default "auto",
     ignored when `stock`), `stock` (bool, default False), `learning_rate` (float,
-    default 1e-5), `seed` (int, default 0), `grad_checkpoint` (bool, default False).
+    default 1e-5), `seed` (int, default 0), `grad_checkpoint` (bool, default False),
+    `compute_dtype` (str | None, default None -- when set, e.g. "bfloat16", the loaded
+    model's floating params are cast to it before training; the kernel `impl` needs
+    this on 4-bit models that otherwise compute in fp16).
     """
     _require_mlx_lm()
     import mlx.optimizers as optim  # noqa: PLC0415
@@ -318,8 +321,22 @@ def run_train_step(params: dict[str, object]) -> dict[str, object]:
     learning_rate = float(cast(float, params.get("learning_rate", 1e-5)))
     seed = int(cast(int, params.get("seed", 0)))
     grad_checkpoint = bool(params.get("grad_checkpoint", False))
+    compute_dtype = cast("str | None", params.get("compute_dtype"))
 
     model, _tokenizer = _load_model(model_id, revision)
+    if compute_dtype is not None:
+        # Cast the loaded model's FLOATING params (a 4-bit checkpoint's int4 weights
+        # stay int4 -- `set_dtype`'s default predicate skips non-floating params -- while
+        # scales/biases/norms move to `compute_dtype`, so the trunk produces
+        # `compute_dtype` hidden states). Needed for the kernel `impl`, which accepts
+        # only fp32/bf16 hidden, on the 4-bit models that otherwise compute in fp16
+        # (they store fp16 scales, overriding a config `torch_dtype=bf16`). Applied
+        # BEFORE freeze/LoRA so it does not touch the fp32 LoRA adapters injected next,
+        # and identically to both arms when the caller sets it -- holding the trunk
+        # dtype constant so the ours-vs-stock tok/s + loss-curve comparison isolates the
+        # loss layer. `set_dtype` is a pure `astype` (draws no RNG), so the seed->LoRA-
+        # init determinism below is undisturbed.
+        model.set_dtype(_resolve_dtype(compute_dtype))
     mx.random.seed(seed)  # BEFORE freeze/LoRA-injection: their random init draws next
     model.freeze()
     linear_to_lora_layers(

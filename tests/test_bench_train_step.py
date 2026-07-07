@@ -97,6 +97,28 @@ def test_build_conditions_ours_and_stock_share_every_param_except_stock_and_impl
         assert ours.params[key] == stock.params[key]
 
 
+def test_build_conditions_threads_compute_dtype_into_both_arms() -> None:
+    """`--compute-dtype` reaches EVERY condition's params uniformly (both `ours` and
+    `stock`), so the kernel arm gets a bf16-cast model AND the comparison holds the
+    trunk dtype constant across the two arms -- isolating the loss layer."""
+    conditions = build_conditions(
+        models=["m/a"], seq_lens=[1024], batch=1, steps=20, lora_rank=8, lora_layers=-1,
+        learning_rate=1e-5, seed=0, revision=None, compute_dtype="bfloat16",
+    )
+    assert conditions
+    assert all(c.params["compute_dtype"] == "bfloat16" for c in conditions)
+
+
+def test_build_conditions_compute_dtype_defaults_to_none() -> None:
+    """Absent `--compute-dtype`, the key is present and None -- no cast (the
+    smoke/chunked path, and any explicit-chunked/naive run, keeps the loaded dtype)."""
+    conditions = build_conditions(
+        models=["m/a"], seq_lens=[1024], batch=1, steps=20, lora_rank=8, lora_layers=-1,
+        learning_rate=1e-5, seed=0, revision=None,
+    )
+    assert all(c.params["compute_dtype"] is None for c in conditions)
+
+
 def test_build_conditions_all_share_the_same_script_sha() -> None:
     conditions = build_conditions(
         models=["m/a"], seq_lens=[1024], batch=1, steps=20, lora_rank=8, lora_layers=-1,
