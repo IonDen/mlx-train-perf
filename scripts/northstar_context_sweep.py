@@ -67,7 +67,7 @@ def model_slug(model: str) -> str:
 
 def _recipe_session_id(
     *, model: str, revision: str | None, batch: int, lora_rank: int, lora_layers: int,
-    seed: int, compute_dtype: str = "bfloat16",
+    seed: int, compute_dtype: str = "bfloat16", grad_checkpoint: bool = True,
 ) -> str:
     """Deterministic (NOT random) session id -- see the module docstring for why this
     sweep needs stable-across-restarts resume rather than
@@ -79,7 +79,7 @@ def _recipe_session_id(
     h = hashlib.sha256()
     for part in (
         model, str(revision), str(batch), str(lora_rank), str(lora_layers), str(seed),
-        compute_dtype, script_sha(),
+        compute_dtype, str(grad_checkpoint), script_sha(),
     ):
         h.update(part.encode())
         h.update(b"\x00")
@@ -93,6 +93,7 @@ def probe_condition_name(*, model: str, seq_len: int, arm: str) -> str:
 def build_probe(
     *, model: str, revision: str | None, batch: int, lora_rank: int, lora_layers: int,
     seed: int, arm: str, seq_len: int, compute_dtype: str = "bfloat16",
+    grad_checkpoint: bool = True,
 ) -> Condition:
     if arm not in ARMS:
         raise ValueError(f"unknown arm {arm!r}; expected one of {ARMS}")
@@ -101,11 +102,15 @@ def build_probe(
     # fp32/bf16 hidden -- the 4-bit flagship computes in fp16 uncast, so `auto` would
     # refuse the kernel and the probe would (falsely) read as "does not fit". Applied to
     # BOTH arms so the max-context comparison holds the trunk dtype constant.
+    # `grad_checkpoint` defaults True: this sweep measures the realistic long-context
+    # QLoRA setup (activations recomputed), the ONLY regime where ours' flat loss-layer
+    # memory is the binding constraint and its max-context advantage over stock appears
+    # -- without it, the stored trunk activations dominate and both arms OOM together.
     params: dict[str, object] = {
         "model": model, "revision": revision, "seq_len": seq_len, "batch": batch,
         "steps": PROBE_STEPS, "lora_rank": lora_rank, "lora_layers": lora_layers,
         "impl": "auto", "stock": arm == "stock", "seed": seed,
-        "compute_dtype": compute_dtype,
+        "compute_dtype": compute_dtype, "grad_checkpoint": grad_checkpoint,
         "script_sha": script_sha(), "dataset_recipe": DATASET_RECIPE,
     }
     return Condition(
@@ -125,6 +130,7 @@ def _read_status(path: Path) -> str:
 def make_probe(
     *, model: str, revision: str | None, batch: int, lora_rank: int, lora_layers: int,
     seed: int, arm: str, out_dir: Path, session_id: str, compute_dtype: str = "bfloat16",
+    grad_checkpoint: bool = True,
 ) -> Callable[[int], bool]:
     """Builds the `probe(seq_len) -> bool` callable `find_max_context` drives: ONE
     `train_step` condition per call, dispatched through `run_conditions`
@@ -137,7 +143,7 @@ def make_probe(
         condition = build_probe(
             model=model, revision=revision, batch=batch, lora_rank=lora_rank,
             lora_layers=lora_layers, seed=seed, arm=arm, seq_len=seq_len,
-            compute_dtype=compute_dtype,
+            compute_dtype=compute_dtype, grad_checkpoint=grad_checkpoint,
         )
         paths = run_conditions([condition], out_dir, session_id=session_id)
         return _read_status(paths[0]) == "ok"
@@ -185,12 +191,12 @@ def find_max_context(
 def sweep_arm(
     *, model: str, revision: str | None, batch: int, lora_rank: int, lora_layers: int,
     seed: int, arm: str, start: int, granularity: int, out_dir: Path, session_id: str,
-    compute_dtype: str = "bfloat16",
+    compute_dtype: str = "bfloat16", grad_checkpoint: bool = True,
 ) -> dict[str, object]:
     probe = make_probe(
         model=model, revision=revision, batch=batch, lora_rank=lora_rank,
         lora_layers=lora_layers, seed=seed, arm=arm, out_dir=out_dir,
-        session_id=session_id, compute_dtype=compute_dtype,
+        session_id=session_id, compute_dtype=compute_dtype, grad_checkpoint=grad_checkpoint,
     )
     max_fitting, min_failing = find_max_context(probe, start=start, granularity=granularity)
     return {
@@ -217,6 +223,12 @@ def build_parser() -> argparse.ArgumentParser:
                     help="cast the loaded model's floating params to this dtype before "
                         "each probe (the 4-bit flagship computes in fp16 otherwise, and "
                         "the ours-arm kernel needs bf16). Applied to both arms")
+    ap.add_argument("--grad-checkpoint", action=argparse.BooleanOptionalAction,
+                    default=True,
+                    help="recompute activations instead of storing them (default: on) -- "
+                        "the realistic long-context QLoRA setup and the only regime where "
+                        "ours' max-context advantage over stock appears; --no-grad-checkpoint "
+                        "reverts to the activations-resident config both arms OOM at 8192")
     return ap
 
 
@@ -227,7 +239,7 @@ def main(argv: list[str] | None = None) -> int:
     session_id = _recipe_session_id(
         model=args.model, revision=args.revision, batch=args.batch,
         lora_rank=args.lora_rank, lora_layers=args.lora_layers, seed=args.seed,
-        compute_dtype=args.compute_dtype,
+        compute_dtype=args.compute_dtype, grad_checkpoint=args.grad_checkpoint,
     )
     arms = ARMS if args.arm == "both" else (args.arm,)
     results = [
@@ -236,12 +248,14 @@ def main(argv: list[str] | None = None) -> int:
             lora_rank=args.lora_rank, lora_layers=args.lora_layers, seed=args.seed,
             arm=arm, start=args.start_seq_len, granularity=args.granularity,
             out_dir=out_dir, session_id=session_id, compute_dtype=args.compute_dtype,
+            grad_checkpoint=args.grad_checkpoint,
         )
         for arm in arms
     ]
     print(json.dumps({
         "model": args.model, "revision": args.revision, "dataset_recipe": DATASET_RECIPE,
-        "compute_dtype": args.compute_dtype, "session_id": session_id, "results": results,
+        "compute_dtype": args.compute_dtype, "grad_checkpoint": args.grad_checkpoint,
+        "session_id": session_id, "results": results,
     }, indent=2))
     return 0
 

@@ -119,6 +119,26 @@ def test_build_conditions_compute_dtype_defaults_to_none() -> None:
     assert all(c.params["compute_dtype"] is None for c in conditions)
 
 
+def test_build_conditions_threads_grad_checkpoint_into_both_arms() -> None:
+    """`--grad-checkpoint` reaches every condition's params uniformly -- the realistic
+    long-context QLoRA setup (activations recomputed), where ours' flat loss-layer
+    memory becomes visible against a small trunk footprint."""
+    conditions = build_conditions(
+        models=["m/a"], seq_lens=[1024], batch=1, steps=20, lora_rank=8, lora_layers=-1,
+        learning_rate=1e-5, seed=0, revision=None, grad_checkpoint=True,
+    )
+    assert conditions
+    assert all(c.params["grad_checkpoint"] is True for c in conditions)
+
+
+def test_build_conditions_grad_checkpoint_defaults_to_false() -> None:
+    conditions = build_conditions(
+        models=["m/a"], seq_lens=[1024], batch=1, steps=20, lora_rank=8, lora_layers=-1,
+        learning_rate=1e-5, seed=0, revision=None,
+    )
+    assert all(c.params["grad_checkpoint"] is False for c in conditions)
+
+
 def test_build_conditions_all_share_the_same_script_sha() -> None:
     conditions = build_conditions(
         models=["m/a"], seq_lens=[1024], batch=1, steps=20, lora_rank=8, lora_layers=-1,
