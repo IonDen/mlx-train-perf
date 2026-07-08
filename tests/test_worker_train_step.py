@@ -106,6 +106,41 @@ def test_run_train_step_casts_model_to_compute_dtype(
     assert model.model.norm.weight.dtype == mx.bfloat16
 
 
+def test_run_train_step_evaluates_setup_before_the_memory_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """review-mlx finding: `set_dtype` and `linear_to_lora_layers` build LAZY graphs
+    (`Module.apply` astype; LoRA's random-init), and `mlx_lm.load(lazy=False)` only
+    materializes the ORIGINAL weights -- so without a forced eval, the one-time cast +
+    adapter init execute inside the `reset_peak_memory()`->`get_peak_memory()` window
+    and land in `marginal_peak_gb` (and in step 1's wall time). The contract: at least
+    one `mx.eval` runs BEFORE the first `reset_peak_memory` call. The spies call
+    through, so the step still trains for real."""
+    model = _tiny_llama()
+    monkeypatch.setattr(worker, "_load_model", lambda _m, _r: (model, object()))
+    install_guardrails()
+
+    calls: list[str] = []
+    real_eval = worker.mx.eval
+    real_reset = worker.mx.reset_peak_memory
+
+    def spy_eval(*args: Any) -> None:
+        calls.append("eval")
+        real_eval(*args)
+
+    def spy_reset() -> None:
+        calls.append("reset")
+        real_reset()
+
+    monkeypatch.setattr(worker.mx, "eval", spy_eval)
+    monkeypatch.setattr(worker.mx, "reset_peak_memory", spy_reset)
+
+    worker.run_train_step({**_BASE_PARAMS, "compute_dtype": "bfloat16"})
+
+    assert "reset" in calls
+    assert "eval" in calls[: calls.index("reset")]
+
+
 def test_run_train_step_without_compute_dtype_leaves_model_dtype_unchanged(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

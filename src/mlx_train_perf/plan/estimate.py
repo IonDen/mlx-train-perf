@@ -20,8 +20,11 @@ kernel loss term is negligible next to naive's, and the naive loss term's own
 coefficient is fit to a persisted gate artifact at that shape (see
 `Calibration.naive_loss_bytes_per_nv`'s docstring for the derivation and its known
 limits -- it is an empirical fit to one anchor, not a validated buffer decomposition,
-and does not extrapolate linearly to smaller n). The remaining calibration constants
-are honest analytic placeholders a later, real-measurement task is expected to replace.
+and does not extrapolate linearly to smaller n). The base transient and the two
+activation coefficients plus the attention coefficient are MEASURED (OLS-fit from real
+train-step peaks -- see `fit_memory_coeffs` and the calibration file's provenance);
+only `optimizer_bytes_per_param` (analytic AdamW) and `overhead_frac` (a fixed safety
+margin) are non-measured constants.
 
 Known limits (not modeled in 0.1.0): full fine-tuning (`lora_rank == 0`) only adds the
 loss layer's own `d_w` term to the loss component -- the BASE MODEL's own weight
@@ -332,8 +335,11 @@ def fit_memory_coeffs(points: list[FitPoint], *, calib: Calibration) -> dict[str
     `grad_checkpoint` selects the linear coefficient (`_ckpt` vs `_full`).
 
     grad_checkpoint=True points fit (base, a_lin_ckpt, a_quad) by ordinary least squares
-    -- needs >= 3 points spanning >= 2 distinct seq_len (to separate the constant, linear
-    and quadratic terms). grad_checkpoint=False points then fit a_lin_full alone (base and
+    -- needs a FULL-RANK (1, x_lin, x_quad) design to separate the constant, linear and
+    quadratic terms: with batch held fixed (the standard calibration regime) that means
+    >= 3 distinct seq_len; batch variation can restore rank at 2 distinct seq_len. A
+    rank-deficient design raises PlanInputError (lstsq would otherwise silently return
+    minimum-norm garbage). grad_checkpoint=False points then fit a_lin_full alone (base and
     a_quad held from the gc=True fit); with no gc=False points the existing `calib` value
     is kept. Every point must be `impl="kernel"` -- `"chunked"`/`"naive"` measure a
     materially different loss-layer memory shape that would contaminate the fit.
@@ -361,13 +367,22 @@ def fit_memory_coeffs(points: list[FitPoint], *, calib: Calibration) -> dict[str
 
     ckpt = [p for p in points if p.cfg.grad_checkpoint]
     full = [p for p in points if not p.cfg.grad_checkpoint]
-    if len(ckpt) < 3 or len({p.cfg.seq_len for p in ckpt}) < 2:
+    a_mat = np.array([[1.0, x_lin(p), x_quad(p)] for p in ckpt], dtype=float).reshape(-1, 3)
+    # Rank check, not a point/seq_len head-count: `np.linalg.lstsq` never raises on a
+    # rank-deficient design -- it returns the minimum-norm solution, i.e. silently-wrong
+    # coefficients (review reproduced a NEGATIVE a_quad from 3 points at 2 distinct
+    # seq_len, batch fixed). Full rank of the actual (1, x_lin, x_quad) matrix is the
+    # exact identifiability condition: batch-fixed runs need >= 3 distinct seq_len,
+    # while batch variation can restore rank at 2 (both cases tested).
+    if np.linalg.matrix_rank(a_mat) < 3:
         raise PlanInputError(
-            "fit_memory_coeffs needs at least 3 grad_checkpoint=True FitPoints spanning "
-            "at least 2 distinct seq_len values to fit (base, linear, quadratic) -- vary "
-            f"seq_len across the calibration runs (got {len(ckpt)} gc=True point(s))"
+            "fit_memory_coeffs cannot separate (base, linear, quadratic): the gc=True "
+            "design matrix is rank-deficient. Supply at least 3 grad_checkpoint=True "
+            "FitPoints whose (1, x_lin, x_quad) rows are independent -- with batch held "
+            "fixed that means at least 3 distinct seq_len values (got "
+            f"{len(ckpt)} gc=True point(s), "
+            f"{len({p.cfg.seq_len for p in ckpt})} distinct seq_len)"
         )
-    a_mat = np.array([[1.0, x_lin(p), x_quad(p)] for p in ckpt], dtype=float)
     b_vec = np.array([residual(p) for p in ckpt], dtype=float)
     solution = np.linalg.lstsq(a_mat, b_vec, rcond=None)[0]
     base = float(solution[0])

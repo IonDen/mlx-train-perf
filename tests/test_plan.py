@@ -308,6 +308,37 @@ def test_grad_checkpoint_changes_only_the_linear_activation_term() -> None:
         / calib.act_bytes_per_token_hidden_layer_ckpt, rel=1e-5)
 
 
+def test_base_component_is_the_calibration_base_transient() -> None:
+    """review item: `components["base"]` is new in the O(N^2) rework and nothing else
+    pins it -- the measured-anchor test stays green with base dropped entirely (mutation-
+    verified during review: anchor error moves 8.6% -> 2.2%, still passing), so a
+    refactor that forgets to add it to the components dict would ship silently."""
+    s = _shape()
+    calib = load_calibration()
+    cfg = TrainConfig(batch=1, seq_len=512, dtype="bfloat16", lora_rank=8, lora_layers=2,
+                      grad_checkpoint=True, impl="kernel")
+    _, comp = estimate_peak(s, cfg, calib)
+    assert comp["base"] == int(calib.base_transient_bytes)
+
+
+def test_activation_and_attention_components_hand_computed() -> None:
+    """Exact-value pins for the two components the rework added. The ratio tests above
+    are invariant to a dropped constant factor (losing `shape.hidden` from the linear
+    term still doubles with seq and keeps the ckpt/full ratio -- mutation-verified during
+    review), so each term gets one hand-computed absolute value: drivers as literals from
+    `_shape()` (batch=1, seq=512, hidden=64, layers=2, heads=4 -- all powers of two, so
+    the product is float-exact), coefficient from the committed calibration."""
+    s = _shape()
+    calib = load_calibration()
+    cfg = TrainConfig(batch=1, seq_len=512, dtype="bfloat16", lora_rank=8, lora_layers=2,
+                      grad_checkpoint=True, impl="kernel")
+    _, comp = estimate_peak(s, cfg, calib)
+    assert comp["activations"] == int(
+        calib.act_bytes_per_token_hidden_layer_ckpt * (1 * 512 * 64 * 2))
+    assert comp["attention"] == int(
+        calib.attn_bytes_per_head_token2 * (1 * 4 * 512 * 512))
+
+
 # ---------------------------------------------------------------------------
 # fit_memory_coeffs: OLS fit of (base, a_lin_ckpt, a_quad) from grad_checkpoint=True
 # kernel-impl `run_train_step` peaks + a_lin_full from grad_checkpoint=False peaks.
@@ -399,6 +430,45 @@ def test_fit_memory_coeffs_rejects_single_seq_len_gc_true() -> None:
 
     with pytest.raises(PlanInputError, match="distinct seq_len"):
         fit_memory_coeffs([synth(1), synth(2), synth(4)], calib=calib)
+
+
+def test_fit_memory_coeffs_rejects_two_distinct_seq_len_gc_true() -> None:
+    """Three gc=True points at only TWO distinct seq_len (batch fixed -- the actual
+    calibration regime) give a rank-2 design for the 3 unknowns (base, linear, quad).
+    `np.linalg.lstsq` does NOT raise on rank deficiency -- it returns the minimum-norm
+    solution, which here is garbage (verified during review: wildly wrong values
+    including a negative a_quad). The fit must refuse loudly instead."""
+    shape = _shape()
+    calib = load_calibration()
+
+    def synth(seq_len: int) -> FitPoint:
+        return _synthesize_fit_point(
+            shape=shape, calib=calib, batch=1, seq_len=seq_len, lora_rank=8, lora_layers=2,
+            grad_checkpoint=True, base=1.5e9, a_lin_ckpt=4.0, a_lin_full=180.0, a_quad=9.0)
+
+    with pytest.raises(PlanInputError, match="distinct seq_len"):
+        fit_memory_coeffs([synth(1024), synth(1024), synth(2048)], calib=calib)
+
+
+def test_fit_memory_coeffs_accepts_two_seq_len_when_batch_variation_restores_rank() -> None:
+    """The guard is about design-matrix RANK, not a seq_len head-count: with batch
+    varying, two distinct seq_len CAN span (constant, linear, quadratic) -- x_lin and
+    x_quad scale together in batch but differently in seq_len, so e.g. (b=1,s=512),
+    (b=2,s=512), (b=1,s=1024) is full-rank and must fit exactly."""
+    shape = _shape()
+    calib = load_calibration()
+    base, a_lin_ckpt, a_quad = 1.5e9, 4.0, 9.0
+
+    def synth(batch: int, seq_len: int) -> FitPoint:
+        return _synthesize_fit_point(
+            shape=shape, calib=calib, batch=batch, seq_len=seq_len, lora_rank=8,
+            lora_layers=2, grad_checkpoint=True, base=base, a_lin_ckpt=a_lin_ckpt,
+            a_lin_full=180.0, a_quad=a_quad)
+
+    c = fit_memory_coeffs([synth(1, 512), synth(2, 512), synth(1, 1024)], calib=calib)
+    assert c["base_transient_bytes"] == pytest.approx(base, rel=1e-6)
+    assert c["act_bytes_per_token_hidden_layer_ckpt"] == pytest.approx(a_lin_ckpt, rel=1e-6)
+    assert c["attn_bytes_per_head_token2"] == pytest.approx(a_quad, rel=1e-6)
 
 
 def test_fit_memory_coeffs_rejects_non_kernel_impl() -> None:

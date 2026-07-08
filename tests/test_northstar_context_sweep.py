@@ -223,9 +223,10 @@ def test_default_compute_dtype_is_bfloat16() -> None:
 
 def test_build_probe_threads_grad_checkpoint_defaulting_true() -> None:
     """North-Star measures the realistic long-context QLoRA setup, where activations are
-    recomputed (grad_checkpoint=True) -- the regime where ours' flat loss-layer memory
-    is the binding constraint and the max-context advantage over stock appears. Default
-    True; applied to both arms."""
+    recomputed (grad_checkpoint=True) -- without it the stored trunk activations dominate
+    and both arms OOM together long before the loss layer matters. The sweep measures
+    both arms' ceilings; it does not presume ours is higher. Default True; applied to
+    both arms."""
     for arm in ("ours", "stock"):
         cond = build_probe(model=_RECIPE["model"], revision=None, batch=1, lora_rank=8,
                            lora_layers=-1, seed=0, arm=arm, seq_len=2048)

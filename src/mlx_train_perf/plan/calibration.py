@@ -2,10 +2,13 @@
 
 Loaded from `calibration_data.json`, a versioned data file that carries its own
 measurement provenance (machine, macOS, mlx version, measured date) so a `FitReport`
-can always show where its non-analytic constants came from. Most of 0.1.0's constants
-are HONEST placeholders -- the file's own `provenance.measured_date` says so explicitly
--- but `naive_loss_bytes_per_nv` is a real measured value: see its field docstring below
-for the derivation against a persisted benchmark artifact.
+can always show where its non-analytic constants came from. The memory coefficients
+(`base_transient_bytes` and the activation/attention terms) are MEASURED -- fit by
+ordinary least squares from real train-step marginal peaks (Qwen3-8B-4bit context
+sweep; cross-model validated on Llama-3.2-3B) -- and `naive_loss_bytes_per_nv` is an
+empirical fit to a persisted benchmark artifact (see its field docstring).
+`optimizer_bytes_per_param` is analytic (AdamW: two fp32 moments) and `overhead_frac`
+is a fixed safety margin -- those two are the only non-measured constants.
 """
 import json
 from dataclasses import dataclass

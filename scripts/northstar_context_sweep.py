@@ -103,9 +103,10 @@ def build_probe(
     # refuse the kernel and the probe would (falsely) read as "does not fit". Applied to
     # BOTH arms so the max-context comparison holds the trunk dtype constant.
     # `grad_checkpoint` defaults True: this sweep measures the realistic long-context
-    # QLoRA setup (activations recomputed), the ONLY regime where ours' flat loss-layer
-    # memory is the binding constraint and its max-context advantage over stock appears
-    # -- without it, the stored trunk activations dominate and both arms OOM together.
+    # QLoRA setup (activations recomputed) -- without it, the stored trunk activations
+    # dominate and both arms OOM together long before the loss layer matters. The sweep
+    # MEASURES both arms' ceilings; it does not presume ours is higher (measured
+    # 2026-07-08: the O(N^2) attention backward binds both arms, ceilings tied ~8.5k).
     params: dict[str, object] = {
         "model": model, "revision": revision, "seq_len": seq_len, "batch": batch,
         "steps": PROBE_STEPS, "lora_rank": lora_rank, "lora_layers": lora_layers,
@@ -226,8 +227,7 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--grad-checkpoint", action=argparse.BooleanOptionalAction,
                     default=True,
                     help="recompute activations instead of storing them (default: on) -- "
-                        "the realistic long-context QLoRA setup and the only regime where "
-                        "ours' max-context advantage over stock appears; --no-grad-checkpoint "
+                        "the realistic long-context QLoRA setup; --no-grad-checkpoint "
                         "reverts to the activations-resident config both arms OOM at 8192")
     return ap
 
