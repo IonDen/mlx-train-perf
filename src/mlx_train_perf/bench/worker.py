@@ -342,6 +342,12 @@ def run_train_step(params: dict[str, object]) -> dict[str, object]:
     linear_to_lora_layers(
         model, lora_layers, {"rank": lora_rank, "dropout": 0.0, "scale": 20.0}
     )
+    # Force the lazy setup graphs NOW, before the measurement window below: `set_dtype`
+    # is a lazy `apply`/astype and LoRA's random-init is equally lazy, so without this
+    # eval the one-time cast + adapter init would execute inside the
+    # `reset_peak_memory()` window and leak setup cost into `marginal_peak_gb` (and
+    # into step 1's wall time).
+    mx.eval(model.parameters())
 
     base_loss = default_loss if stock else make_loss_fn(model, impl=impl)
     observed_before: list[int] = []

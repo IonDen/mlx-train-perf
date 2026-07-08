@@ -68,9 +68,9 @@ def _write_manifest(
 
 def _write_gc_true_manifest(tmp_path: Path, config_path: Path) -> Path:
     """3 grad_checkpoint=True kernel points spanning 3 distinct seq_len (512/1024/2048) --
-    the minimum `fit_memory_coeffs` needs (>= 3 gc=True points, >= 2 distinct seq_len, to
-    separate base/linear/quadratic). Arbitrary distinct marginals; the fit just needs a
-    non-singular design."""
+    the minimum full-rank design `fit_memory_coeffs` accepts in the batch-fixed regime
+    (>= 3 distinct seq_len to separate base/linear/quadratic). Arbitrary distinct
+    marginals; the fit just needs a non-singular design."""
     manifest: list[dict[str, object]] = []
     for name, seq, marg in [("a", 512, 2.0), ("b", 1024, 3.5), ("c", 2048, 8.0)]:
         artifact = tmp_path / f"{name}.json"
@@ -110,6 +110,24 @@ def test_load_fit_points_builds_one_fitpoint_per_manifest_entry(tmp_path: Path) 
     assert points[1].cfg.lora_rank == 16
     assert points[0].shape.vocab == 1000
     assert points[0].cfg.impl == "kernel"
+
+
+def test_load_fit_points_defaults_omitted_grad_checkpoint_to_true(tmp_path: Path) -> None:
+    """review item: a manifest entry that OMITS `grad_checkpoint` defaults to True (the
+    realistic calibration regime) -- a deliberate flip from the pre-rework False default.
+    Untested, a revert would silently misroute future calibration points into the wrong
+    ckpt/full fit bucket."""
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(_CONFIG))
+    artifact_path = tmp_path / "a.json"
+    _write_artifact(artifact_path, marginal_peak_gb=2.0)
+    manifest_path = tmp_path / "manifest.json"
+    _write_manifest(manifest_path, [
+        {"config": str(config_path), "artifact": str(artifact_path), "batch": 1,
+         "seq_len": 512, "lora_rank": 8, "lora_layers": 2},  # no grad_checkpoint key
+    ])
+    points = load_fit_points(manifest_path)
+    assert points[0].cfg.grad_checkpoint is True
 
 
 def test_load_fit_points_reads_impl_from_the_artifact_identity(tmp_path: Path) -> None:
@@ -223,6 +241,10 @@ def test_main_writes_the_updated_calibration_file_without_dry_run(tmp_path: Path
     assert updated["base_transient_bytes"] != _EXISTING_CALIBRATION["base_transient_bytes"]
     assert "attn_bytes_per_head_token2" in updated
     assert updated["overhead_frac"] == _EXISTING_CALIBRATION["overhead_frac"]
+    # review item: main() wires optimizer_bytes_per_param from the EXISTING file (it is
+    # analytic, not fitted -- a behavior change in the rework, previously fit-returned):
+    assert (updated["optimizer_bytes_per_param"]
+            == _EXISTING_CALIBRATION["optimizer_bytes_per_param"])
     assert updated["provenance"]["measured_date"]
 
 
