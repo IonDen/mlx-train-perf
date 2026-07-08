@@ -221,6 +221,34 @@ def test_default_compute_dtype_is_bfloat16() -> None:
     assert build_parser().parse_args([]).compute_dtype == "bfloat16"
 
 
+def test_build_probe_threads_grad_checkpoint_defaulting_true() -> None:
+    """North-Star measures the realistic long-context QLoRA setup, where activations are
+    recomputed (grad_checkpoint=True) -- the regime where ours' flat loss-layer memory
+    is the binding constraint and the max-context advantage over stock appears. Default
+    True; applied to both arms."""
+    for arm in ("ours", "stock"):
+        cond = build_probe(model=_RECIPE["model"], revision=None, batch=1, lora_rank=8,
+                           lora_layers=-1, seed=0, arm=arm, seq_len=2048)
+        assert cond.params["grad_checkpoint"] is True
+
+
+def test_build_probe_honors_explicit_grad_checkpoint_false() -> None:
+    cond = build_probe(model=_RECIPE["model"], revision=None, batch=1, lora_rank=8,
+                       lora_layers=-1, seed=0, arm="ours", seq_len=2048,
+                       grad_checkpoint=False)
+    assert cond.params["grad_checkpoint"] is False
+
+
+def test_recipe_session_id_differs_for_a_different_grad_checkpoint() -> None:
+    a = _recipe_session_id(**_RECIPE)  # default grad_checkpoint True
+    b = _recipe_session_id(**_RECIPE, grad_checkpoint=False)
+    assert a != b
+
+
+def test_default_grad_checkpoint_is_true() -> None:
+    assert build_parser().parse_args([]).grad_checkpoint is True
+
+
 def test_build_probe_rejects_an_unknown_arm() -> None:
     with pytest.raises(ValueError, match="unknown arm"):
         build_probe(model=_RECIPE["model"], revision=None, batch=1, lora_rank=8,
