@@ -56,7 +56,7 @@ def test_plan_refuses_exit_one_with_suggestion(
     tmp_path: Path, capsys: pytest.CaptureFixture[str],
 ) -> None:
     rc = main(["plan", "--config", str(_config(tmp_path)), "--batch", "4096",
-               "--seq-len", "8192", "--lora-rank", "8", "--budget-gb", "1", "--json"])
+               "--seq-len", "8192", "--lora-rank", "8", "--budget-gb", "3", "--json"])
     out = json.loads(capsys.readouterr().out)
     assert rc == 1
     assert out["fits"] is False

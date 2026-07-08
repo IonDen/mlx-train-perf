@@ -4,11 +4,15 @@ Formulas encode the standard Llama/Qwen3 parameter arithmetic plus this project'
 per-impl loss-layer memory shape (naive materializes the full `(N,V)` logits+softmax
 pair; chunked is bounded by its fixed vocab tile, not `V`; the kernel never materializes
 `(N,V)` at all -- its `custom_function` returns exactly three N-length fp32 arrays,
-`nll_rows, lse, tgt`, see `core/loss.py`). Every constant that is NOT derivable from the
-model's own shape (activation footprint per token/layer under grad-checkpointing, AdamW
-optimizer bytes/param, a fixed overhead margin for unmodeled fragmentation) comes from
-`Calibration`, loaded from a versioned, provenance-carrying data file -- never hardcoded
-here.
+`nll_rows, lse, tgt`, see `core/loss.py`). Activation memory has two measured terms: a
+LINEAR one (checkpoint-boundary residuals, per token*hidden*layer, gc-aware) and a
+QUADRATIC one (the O(N^2) attention backward -- mlx's SDPA backward materializes one
+`(N,N)` score matrix at a time -- per head*seq^2, one layer). The quadratic term dominates
+peak training memory at long context and is what caps trainable context on MLX regardless
+of the loss layer. Every constant that is NOT derivable from the model's own shape (the two
+activation coefficients + a fixed base transient, AdamW optimizer bytes/param, a fragmentation
+margin) comes from `Calibration`, loaded from a versioned, provenance-carrying data file --
+never hardcoded here.
 
 Sanity-anchored (not tolerance-pinned) against the mlx-train-perf-spike gate
 measurements at production shape (n=8192, V=151936, D=4096, bf16, M1 Max 32 GB): the
@@ -122,7 +126,7 @@ class FitReport:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class FitPoint:
-    """One real measurement feeding `fit_activation_and_optimizer_bytes`: the model
+    """One real measurement feeding `fit_memory_coeffs`: the model
     shape + training config that produced it, plus the MARGINAL peak this config's
     `train_step` bench condition measured (`bench/worker.py::run_train_step`'s own
     `marginal_peak_gb` field, converted to bytes -- the training LOOP's own
@@ -184,7 +188,22 @@ def _optimizer_bytes(cfg: TrainConfig, shape: ModelShape, calib: Calibration) ->
 
 
 def _activation_bytes(cfg: TrainConfig, shape: ModelShape, calib: Calibration) -> int:
-    return int(calib.act_bytes_per_token_layer * cfg.batch * cfg.seq_len * shape.layers)
+    """Linear (checkpoint) activation memory: bytes per (token * hidden * layer), gc-aware.
+    grad_checkpoint=True stores only layer-boundary residuals; =False stores every layer's
+    forward activations (~45x more). The O(N^2) attention-backward term is SEPARATE -- see
+    `_attention_bytes`."""
+    a_lin = (calib.act_bytes_per_token_hidden_layer_ckpt if cfg.grad_checkpoint
+             else calib.act_bytes_per_token_hidden_layer_full)
+    return int(a_lin * cfg.batch * cfg.seq_len * shape.hidden * shape.layers)
+
+
+def _attention_bytes(cfg: TrainConfig, shape: ModelShape, calib: Calibration) -> int:
+    """Quadratic attention-backward memory: bytes per (head * seq^2), ONE layer for BOTH gc
+    settings -- mlx's O(N^2) SDPA backward materializes one (N,N) score matrix at a time as
+    the backward walks the layer stack. This term dominates peak training memory at long
+    context and caps the trainable context length regardless of the loss layer.
+    bf16-calibrated (dtype folded into the coefficient)."""
+    return int(calib.attn_bytes_per_head_token2 * cfg.batch * shape.heads * cfg.seq_len**2)
 
 
 def _head_trainable(cfg: TrainConfig) -> bool:
@@ -224,9 +243,11 @@ def estimate_peak(
     dtype_size = _dtype_bytes(cfg.dtype)
     components = {
         "weights": _weights_bytes(shape, dtype_size),
+        "base": int(calib.base_transient_bytes),
         "lora": _lora_bytes(cfg, shape),
         "optimizer": _optimizer_bytes(cfg, shape, calib),
         "activations": _activation_bytes(cfg, shape, calib),
+        "attention": _attention_bytes(cfg, shape, calib),
         "loss": _loss_bytes(cfg, shape, calib),
     }
     subtotal = sum(components.values())
@@ -290,70 +311,80 @@ def plan_fit(
     )
 
 
-def fit_activation_and_optimizer_bytes(
-    points: list[FitPoint], *, calib: Calibration,
-) -> tuple[float, float]:
-    """Ordinary least squares, THROUGH THE ORIGIN (zero tokens and zero trainable
-    params implies zero activation/optimizer bytes by construction -- there is no
-    intercept term to fit), solving for `(act_bytes_per_token_layer,
-    optimizer_bytes_per_param)` from `points`.
+def fit_memory_coeffs(points: list[FitPoint], *, calib: Calibration) -> dict[str, float]:
+    """Fit the calibration memory coefficients from kernel-impl `train_step` FitPoints.
 
-    Each point's marginal peak is modeled as:
+    Returns a dict with keys `base_transient_bytes`,
+    `act_bytes_per_token_hidden_layer_ckpt`, `act_bytes_per_token_hidden_layer_full`,
+    `attn_bytes_per_head_token2`.
 
-        marginal_peak_bytes ~= act_bytes_per_token_layer * (batch * seq_len * layers)
-                              + optimizer_bytes_per_param * lora_param_count
-                              + loss_bytes(cfg, shape, calib)
+    Each point's MARGINAL peak (kernel impl) is modeled as:
 
-    `loss_bytes` is analytically known (this project's OWN `_loss_bytes` formula) and
-    subtracted from each point's measured peak BEFORE the fit -- only the
-    activation/optimizer residual is actually being fit here. Every point must use
-    `impl="kernel"` (what `bench/worker.py::run_train_step`'s `ours` path resolves to
-    on a verified mlx install): `impl="chunked"`/`"naive"` measure a materially
-    different (and, for `"naive"`, still only APPROXIMATELY calibrated) loss-layer
-    memory shape, so subtracting `_loss_bytes` for those would fold that approximation
-    error into the fitted activation/optimizer constants instead of keeping it
-    isolated to the one term it belongs to.
+        marginal ~= base
+                  + a_lin[gc] * (batch * seq_len * hidden * layers)     # linear activations
+                  + a_quad    * (batch * heads * seq_len^2)             # one-layer attention bwd
+                  + analytic(lora + optimizer + loss)
 
-    Raises `PlanInputError` for fewer than 2 points, a non-`"kernel"` `impl`, or a
-    singular 2x2 normal-equations matrix -- the two drivers (activation, optimizer)
-    are collinear across every given point (e.g. `lora_rank` scales in exact
-    proportion to `batch * seq_len` across the whole point set), so there is no way to
-    separate the two coefficients from this data alone; vary them independently.
+    The analytic small terms (`_lora_bytes` + `_optimizer_bytes` + `_loss_bytes`) are
+    KNOWN and subtracted from each measured marginal BEFORE the fit, so only
+    base + the activation/attention coefficients are solved for. `a_quad` is one-layer
+    and gc-INDEPENDENT (mlx's O(N^2) SDPA backward materializes one (N,N) at a time);
+    `grad_checkpoint` selects the linear coefficient (`_ckpt` vs `_full`).
+
+    grad_checkpoint=True points fit (base, a_lin_ckpt, a_quad) by ordinary least squares
+    -- needs >= 3 points spanning >= 2 distinct seq_len (to separate the constant, linear
+    and quadratic terms). grad_checkpoint=False points then fit a_lin_full alone (base and
+    a_quad held from the gc=True fit); with no gc=False points the existing `calib` value
+    is kept. Every point must be `impl="kernel"` -- `"chunked"`/`"naive"` measure a
+    materially different loss-layer memory shape that would contaminate the fit.
     """
-    if len(points) < 2:
-        raise PlanInputError(
-            "fit_activation_and_optimizer_bytes needs at least 2 FitPoints to solve "
-            f"for 2 coefficients, got {len(points)}"
-        )
-    x1s: list[float] = []
-    x2s: list[float] = []
-    ys: list[float] = []
+    import numpy as np  # noqa: PLC0415 -- transitive dep, calibration-time only
+
     for p in points:
         if p.cfg.impl != "kernel":
             raise PlanInputError(
-                f"fit_activation_and_optimizer_bytes only accepts impl='kernel' "
-                f"FitPoints (got impl={p.cfg.impl!r}) -- see this function's own "
-                "docstring for why 'chunked'/'naive' points would contaminate the fit"
+                f"fit_memory_coeffs only accepts impl='kernel' FitPoints (got "
+                f"impl={p.cfg.impl!r}) -- 'chunked'/'naive' measure a different loss-layer "
+                "memory shape that would contaminate the fit"
             )
-        loss_bytes = _loss_bytes(p.cfg, p.shape, calib)
-        x1s.append(float(p.cfg.batch * p.cfg.seq_len * p.shape.layers))
-        x2s.append(float(_lora_param_count(p.cfg, p.shape)))
-        ys.append(p.marginal_peak_bytes - loss_bytes)
 
-    s11 = sum(x1 * x1 for x1 in x1s)
-    s22 = sum(x2 * x2 for x2 in x2s)
-    s12 = sum(x1 * x2 for x1, x2 in zip(x1s, x2s, strict=True))
-    s1y = sum(x1 * y for x1, y in zip(x1s, ys, strict=True))
-    s2y = sum(x2 * y for x2, y in zip(x2s, ys, strict=True))
+    def residual(p: FitPoint) -> float:
+        analytic = (_lora_bytes(p.cfg, p.shape) + _optimizer_bytes(p.cfg, p.shape, calib)
+                    + _loss_bytes(p.cfg, p.shape, calib))
+        return p.marginal_peak_bytes - analytic
 
-    det = s11 * s22 - s12 * s12
-    if abs(det) < 1e-6:
+    def x_lin(p: FitPoint) -> float:
+        return float(p.cfg.batch * p.cfg.seq_len * p.shape.hidden * p.shape.layers)
+
+    def x_quad(p: FitPoint) -> float:
+        return float(p.cfg.batch * p.shape.heads * p.cfg.seq_len ** 2)
+
+    ckpt = [p for p in points if p.cfg.grad_checkpoint]
+    full = [p for p in points if not p.cfg.grad_checkpoint]
+    if len(ckpt) < 3 or len({p.cfg.seq_len for p in ckpt}) < 2:
         raise PlanInputError(
-            "fit_activation_and_optimizer_bytes: the activation-bytes and "
-            "optimizer-bytes drivers are collinear across every given FitPoint -- "
-            "cannot separate the two coefficients from this data alone; vary "
-            "batch*seq_len*layers and lora_rank independently across the measurements"
+            "fit_memory_coeffs needs at least 3 grad_checkpoint=True FitPoints spanning "
+            "at least 2 distinct seq_len values to fit (base, linear, quadratic) -- vary "
+            f"seq_len across the calibration runs (got {len(ckpt)} gc=True point(s))"
         )
-    act_bytes_per_token_layer = (s1y * s22 - s2y * s12) / det
-    optimizer_bytes_per_param = (s11 * s2y - s12 * s1y) / det
-    return act_bytes_per_token_layer, optimizer_bytes_per_param
+    a_mat = np.array([[1.0, x_lin(p), x_quad(p)] for p in ckpt], dtype=float)
+    b_vec = np.array([residual(p) for p in ckpt], dtype=float)
+    solution = np.linalg.lstsq(a_mat, b_vec, rcond=None)[0]
+    base = float(solution[0])
+    a_lin_ckpt = float(solution[1])
+    a_quad = float(solution[2])
+
+    if full:
+        # a_lin_full from: residual - base - a_quad*x_quad = a_lin_full * x_lin (1-var OLS)
+        num = sum((residual(p) - base - a_quad * x_quad(p)) * x_lin(p) for p in full)
+        den = sum(x_lin(p) ** 2 for p in full)
+        a_lin_full = num / den if den else calib.act_bytes_per_token_hidden_layer_full
+    else:
+        a_lin_full = calib.act_bytes_per_token_hidden_layer_full
+
+    return {
+        "base_transient_bytes": base,
+        "act_bytes_per_token_hidden_layer_ckpt": a_lin_ckpt,
+        "act_bytes_per_token_hidden_layer_full": float(a_lin_full),
+        "attn_bytes_per_head_token2": a_quad,
+    }
