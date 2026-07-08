@@ -1,16 +1,20 @@
-"""Controller-run mechanism: fits `act_bytes_per_token_layer` and
-`optimizer_bytes_per_param` from real `train_step` bench artifacts (`bench/worker.py`
-`run_train_step`'s own JSON output) + their models' `config.json` files, and updates
-`calibration_data.json` with provenance -- the src-side math this wraps is
-`mlx_train_perf.plan.estimate.fit_activation_and_optimizer_bytes` (pure, unit-tested
-against synthetic FitPoints; see `tests/test_plan.py`).
+"""Controller-run mechanism: fits the memory-model coefficients (base transient +
+gc-aware linear activation + O(N^2) attention backward) from real `train_step` bench
+artifacts (`bench/worker.py` `run_train_step`'s own JSON output) + their models'
+`config.json` files, and updates `calibration_data.json` with provenance -- the src-side
+math this wraps is `mlx_train_perf.plan.estimate.fit_memory_coeffs` (pure, unit-tested
+against synthetic FitPoints; see `tests/test_plan.py`). `optimizer_bytes_per_param` is
+analytic (AdamW, 8 B/param), preserved unchanged rather than fitted.
 
 Reads a MANIFEST: a JSON list of `{"config": "<path to HF config.json>", "artifact":
 "<path to a run_train_step artifact, impl='kernel', status='ok'>", "batch": int,
-"seq_len": int, "lora_rank": int, "lora_layers": int}` objects. `batch`/`seq_len`/
-`lora_rank`/`lora_layers` are given explicitly in the manifest rather than
-reverse-engineered from the artifact's own (opaque, nested) `identity` dict -- makes
-this script's inputs auditable at a glance.
+"seq_len": int, "lora_rank": int, "lora_layers": int, "grad_checkpoint": bool}` objects.
+`batch`/`seq_len`/`lora_rank`/`lora_layers`/`grad_checkpoint` are given explicitly in the
+manifest rather than reverse-engineered from the artifact's own (opaque, nested)
+`identity` dict -- makes this script's inputs auditable at a glance. `grad_checkpoint`
+defaults True; the fit needs >= 3 grad_checkpoint=True points spanning >= 2 seq_len values
+(to separate base/linear/quadratic) plus optional grad_checkpoint=False points (for the
+`_full` linear coefficient).
 
 This is BUILD-verified only: `tests/test_fit_calibration.py` exercises this script
 end-to-end against SYNTHETIC (fabricated) manifest/config/artifact files written to a
@@ -33,7 +37,7 @@ from mlx_train_perf.plan.estimate import (
     FitPoint,
     ModelShape,
     TrainConfig,
-    fit_activation_and_optimizer_bytes,
+    fit_memory_coeffs,
 )
 
 _SCRIPTS_DIR = Path(__file__).resolve().parent
@@ -64,7 +68,7 @@ def load_fit_points(manifest_path: Path) -> list[FitPoint]:
         cfg = TrainConfig(
             batch=int(entry["batch"]), seq_len=int(entry["seq_len"]), dtype="bfloat16",
             lora_rank=int(entry["lora_rank"]), lora_layers=int(entry["lora_layers"]),
-            grad_checkpoint=bool(entry.get("grad_checkpoint", False)), impl=impl,
+            grad_checkpoint=bool(entry.get("grad_checkpoint", True)), impl=impl,
         )
         marginal_peak_bytes = float(artifact["marginal_peak_gb"]) * 1024**3
         points.append(FitPoint(shape=shape, cfg=cfg, marginal_peak_bytes=marginal_peak_bytes))
@@ -72,17 +76,20 @@ def load_fit_points(manifest_path: Path) -> list[FitPoint]:
 
 
 def build_updated_calibration_data(
-    *, existing: dict[str, object], act_bytes_per_token_layer: float,
+    *, existing: dict[str, object], coeffs: dict[str, float],
     optimizer_bytes_per_param: float, manifest_path: Path, num_points: int,
 ) -> dict[str, object]:
     """Preserves `overhead_frac`/`naive_loss_bytes_per_nv` from `existing` UNCHANGED
-    (this fit never touches them) and replaces `act_bytes_per_token_layer`/
-    `optimizer_bytes_per_param` + `provenance` -- `provenance` keeps the four keys
-    `load_calibration`'s own tests require truthy (`machine`, `macos`, `mlx_version`,
-    `measured_date`) and adds a `fit_source` note naming the manifest + point count
-    for auditability."""
+    (this fit never touches them) and replaces the four fitted memory coefficients (base +
+    gc-aware linear + O(N^2) attention) + `optimizer_bytes_per_param` (analytic) +
+    `provenance` -- `provenance` keeps the four keys `load_calibration`'s own tests require
+    truthy (`machine`, `macos`, `mlx_version`, `measured_date`) and adds a `fit_source` note
+    naming the manifest + point count for auditability."""
     return {
-        "act_bytes_per_token_layer": act_bytes_per_token_layer,
+        "base_transient_bytes": coeffs["base_transient_bytes"],
+        "act_bytes_per_token_hidden_layer_ckpt": coeffs["act_bytes_per_token_hidden_layer_ckpt"],
+        "act_bytes_per_token_hidden_layer_full": coeffs["act_bytes_per_token_hidden_layer_full"],
+        "attn_bytes_per_head_token2": coeffs["attn_bytes_per_head_token2"],
         "optimizer_bytes_per_param": optimizer_bytes_per_param,
         "overhead_frac": existing["overhead_frac"],
         "naive_loss_bytes_per_nv": existing["naive_loss_bytes_per_nv"],
@@ -92,9 +99,10 @@ def build_updated_calibration_data(
             "mlx_version": _installed_mlx_version(),
             "measured_date": date.today().isoformat(),
             "fit_source": (
-                f"act_bytes_per_token_layer and optimizer_bytes_per_param fitted "
-                f"from {num_points} train_step (impl='kernel') artifacts via "
-                f"fit_activation_and_optimizer_bytes; manifest={manifest_path.name}"
+                f"base + gc-aware linear + O(N^2) attention coefficients fitted from "
+                f"{num_points} train_step (impl='kernel') artifacts via fit_memory_coeffs; "
+                f"optimizer_bytes_per_param analytic (AdamW, 8 B/param); "
+                f"manifest={manifest_path.name}"
             ),
         },
     }
@@ -116,14 +124,17 @@ def main(argv: list[str] | None = None) -> int:
     calib = load_calibration() if calibration_path == DEFAULT_CALIBRATION_DATA else None
     if calib is None:
         # A non-default --calibration-data path (e.g. a test's temp file) can't go
-        # through load_calibration (which always reads the INSTALLED package data
-        # file) -- read `overhead_frac`/`naive_loss_bytes_per_nv` from `existing`
-        # directly instead; fit_activation_and_optimizer_bytes only reads
-        # naive_loss_bytes_per_nv when a FitPoint's impl=="naive", which this script
-        # never builds (see load_fit_points), so an approximate stand-in Calibration
-        # here is inert either way.
+        # through load_calibration (which always reads the INSTALLED package data file) --
+        # build a stand-in Calibration from `existing` instead. `fit_memory_coeffs` reads
+        # calib only for the analytic small terms it subtracts (optimizer + naive loss,
+        # the latter only for impl="naive" points, which this script never builds).
         calib = Calibration(
-            act_bytes_per_token_layer=float(existing["act_bytes_per_token_layer"]),
+            base_transient_bytes=float(existing["base_transient_bytes"]),
+            act_bytes_per_token_hidden_layer_ckpt=float(
+                existing["act_bytes_per_token_hidden_layer_ckpt"]),
+            act_bytes_per_token_hidden_layer_full=float(
+                existing["act_bytes_per_token_hidden_layer_full"]),
+            attn_bytes_per_head_token2=float(existing["attn_bytes_per_head_token2"]),
             optimizer_bytes_per_param=float(existing["optimizer_bytes_per_param"]),
             overhead_frac=float(existing["overhead_frac"]),
             naive_loss_bytes_per_nv=float(existing["naive_loss_bytes_per_nv"]),
@@ -131,13 +142,11 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     points = load_fit_points(manifest_path)
-    act_bytes_per_token_layer, optimizer_bytes_per_param = fit_activation_and_optimizer_bytes(
-        points, calib=calib,
-    )
+    coeffs = fit_memory_coeffs(points, calib=calib)
     updated = build_updated_calibration_data(
-        existing=existing, act_bytes_per_token_layer=act_bytes_per_token_layer,
-        optimizer_bytes_per_param=optimizer_bytes_per_param, manifest_path=manifest_path,
-        num_points=len(points),
+        existing=existing, coeffs=coeffs,
+        optimizer_bytes_per_param=float(existing["optimizer_bytes_per_param"]),
+        manifest_path=manifest_path, num_points=len(points),
     )
     print(json.dumps(updated, indent=2))
     if args.dry_run:

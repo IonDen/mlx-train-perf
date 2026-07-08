@@ -3,12 +3,12 @@ the existing convention), so the module is loaded by path.
 
 Every test here is fully synthetic: fabricated `config.json`/`run_train_step`-shaped
 artifact files written to `tmp_path`, and a `--calibration-data` pointed at a temp
-copy -- this task NEVER touches the real, committed
-`src/mlx_train_perf/plan/calibration_data.json` (its constants stay UNMEASURED, per
-this task's own scope; the controller runs this script for real, on real artifacts,
-after the production runs). The underlying fitting MATH
-(`fit_activation_and_optimizer_bytes`) has its own dedicated, RED-first-TDD'd tests in
-`tests/test_plan.py`; this file covers only the I/O/manifest-reading glue around it.
+copy -- this test module NEVER touches the real, committed
+`src/mlx_train_perf/plan/calibration_data.json` (which now carries measured constants;
+the controller ran this script for real, on the production artifacts). The underlying
+fitting MATH (`fit_memory_coeffs`) has its own
+dedicated, RED-first-TDD'd tests in `tests/test_plan.py`; this file covers only the
+I/O/manifest-reading glue around it.
 """
 import json
 import subprocess
@@ -37,8 +37,11 @@ _CONFIG = {
 }
 
 _EXISTING_CALIBRATION = {
-    "act_bytes_per_token_layer": 1.0,
-    "optimizer_bytes_per_param": 1.0,
+    "base_transient_bytes": 1.0,
+    "act_bytes_per_token_hidden_layer_ckpt": 1.0,
+    "act_bytes_per_token_hidden_layer_full": 50.0,
+    "attn_bytes_per_head_token2": 1.0,
+    "optimizer_bytes_per_param": 8.0,
     "overhead_frac": 0.10,
     "naive_loss_bytes_per_nv": 12.0,
     "provenance": {
@@ -61,6 +64,24 @@ def _write_manifest(
     path: Path, entries: list[dict[str, object]],
 ) -> None:
     path.write_text(json.dumps(entries))
+
+
+def _write_gc_true_manifest(tmp_path: Path, config_path: Path) -> Path:
+    """3 grad_checkpoint=True kernel points spanning 3 distinct seq_len (512/1024/2048) --
+    the minimum `fit_memory_coeffs` needs (>= 3 gc=True points, >= 2 distinct seq_len, to
+    separate base/linear/quadratic). Arbitrary distinct marginals; the fit just needs a
+    non-singular design."""
+    manifest: list[dict[str, object]] = []
+    for name, seq, marg in [("a", 512, 2.0), ("b", 1024, 3.5), ("c", 2048, 8.0)]:
+        artifact = tmp_path / f"{name}.json"
+        _write_artifact(artifact, marginal_peak_gb=marg)
+        manifest.append({
+            "config": str(config_path), "artifact": str(artifact), "batch": 1,
+            "seq_len": seq, "lora_rank": 8, "lora_layers": 2, "grad_checkpoint": True,
+        })
+    manifest_path = tmp_path / "manifest.json"
+    _write_manifest(manifest_path, manifest)
+    return manifest_path
 
 
 # ---------------------------------------------------------------------------
@@ -125,14 +146,23 @@ def test_load_fit_points_rejects_a_non_ok_artifact(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+_COEFFS = {
+    "base_transient_bytes": 5.0, "act_bytes_per_token_hidden_layer_ckpt": 2.0,
+    "act_bytes_per_token_hidden_layer_full": 60.0, "attn_bytes_per_head_token2": 3.0,
+}
+
+
 def test_build_updated_calibration_data_preserves_untouched_constants(tmp_path: Path) -> None:
     manifest_path = tmp_path / "manifest.json"
     manifest_path.write_text("[]")
     updated = build_updated_calibration_data(
-        existing=_EXISTING_CALIBRATION, act_bytes_per_token_layer=512.0,
+        existing=_EXISTING_CALIBRATION, coeffs=_COEFFS,
         optimizer_bytes_per_param=8.0, manifest_path=manifest_path, num_points=3,
     )
-    assert updated["act_bytes_per_token_layer"] == 512.0
+    assert updated["base_transient_bytes"] == 5.0
+    assert updated["act_bytes_per_token_hidden_layer_ckpt"] == 2.0
+    assert updated["act_bytes_per_token_hidden_layer_full"] == 60.0
+    assert updated["attn_bytes_per_head_token2"] == 3.0
     assert updated["optimizer_bytes_per_param"] == 8.0
     # untouched by this fit:
     assert updated["overhead_frac"] == _EXISTING_CALIBRATION["overhead_frac"]
@@ -145,8 +175,8 @@ def test_build_updated_calibration_data_provenance_has_the_required_keys(
     manifest_path = tmp_path / "manifest.json"
     manifest_path.write_text("[]")
     updated = build_updated_calibration_data(
-        existing=_EXISTING_CALIBRATION, act_bytes_per_token_layer=1.0,
-        optimizer_bytes_per_param=1.0, manifest_path=manifest_path, num_points=2,
+        existing=_EXISTING_CALIBRATION, coeffs=_COEFFS,
+        optimizer_bytes_per_param=8.0, manifest_path=manifest_path, num_points=2,
     )
     provenance = updated["provenance"]
     for key in ("machine", "macos", "mlx_version", "measured_date"):
@@ -164,23 +194,9 @@ def test_build_updated_calibration_data_provenance_has_the_required_keys(
 def test_main_dry_run_does_not_write_the_calibration_file(tmp_path: Path) -> None:
     config_path = tmp_path / "config.json"
     config_path.write_text(json.dumps(_CONFIG))
-    artifact_a = tmp_path / "a.json"
-    artifact_b = tmp_path / "b.json"
-    _write_artifact(artifact_a, marginal_peak_gb=2.0)
-    _write_artifact(artifact_b, marginal_peak_gb=4.0)
-    manifest_path = tmp_path / "manifest.json"
-    # Same lora_rank, different seq_len: NOT collinear with the activation driver
-    # (batch*seq_len*layers) -- verified numerically before writing this test (a
-    # naive "double both batch and lora_rank" pairing IS collinear here and was
-    # caught the same way while writing tests/test_plan.py's own fit tests).
-    _write_manifest(manifest_path, [
-        {"config": str(config_path), "artifact": str(artifact_a), "batch": 1,
-         "seq_len": 512, "lora_rank": 8, "lora_layers": 2},
-        {"config": str(config_path), "artifact": str(artifact_b), "batch": 1,
-         "seq_len": 1024, "lora_rank": 8, "lora_layers": 2},
-    ])
     calibration_path = tmp_path / "calibration_data.json"
     calibration_path.write_text(json.dumps(_EXISTING_CALIBRATION))
+    manifest_path = _write_gc_true_manifest(tmp_path, config_path)
     original_text = calibration_path.read_text()
 
     rc = fit_calibration.main([
@@ -194,31 +210,18 @@ def test_main_dry_run_does_not_write_the_calibration_file(tmp_path: Path) -> Non
 def test_main_writes_the_updated_calibration_file_without_dry_run(tmp_path: Path) -> None:
     config_path = tmp_path / "config.json"
     config_path.write_text(json.dumps(_CONFIG))
-    artifact_a = tmp_path / "a.json"
-    artifact_b = tmp_path / "b.json"
-    _write_artifact(artifact_a, marginal_peak_gb=2.0)
-    _write_artifact(artifact_b, marginal_peak_gb=4.0)
-    manifest_path = tmp_path / "manifest.json"
-    # Same lora_rank, different seq_len: NOT collinear with the activation driver
-    # (batch*seq_len*layers) -- verified numerically before writing this test (a
-    # naive "double both batch and lora_rank" pairing IS collinear here and was
-    # caught the same way while writing tests/test_plan.py's own fit tests).
-    _write_manifest(manifest_path, [
-        {"config": str(config_path), "artifact": str(artifact_a), "batch": 1,
-         "seq_len": 512, "lora_rank": 8, "lora_layers": 2},
-        {"config": str(config_path), "artifact": str(artifact_b), "batch": 1,
-         "seq_len": 1024, "lora_rank": 8, "lora_layers": 2},
-    ])
     calibration_path = tmp_path / "calibration_data.json"
     calibration_path.write_text(json.dumps(_EXISTING_CALIBRATION))
+    manifest_path = _write_gc_true_manifest(tmp_path, config_path)
 
     rc = fit_calibration.main([
         "--manifest", str(manifest_path), "--calibration-data", str(calibration_path),
     ])
     assert rc == 0
     updated = json.loads(calibration_path.read_text())
-    original_act = _EXISTING_CALIBRATION["act_bytes_per_token_layer"]
-    assert updated["act_bytes_per_token_layer"] != original_act
+    # the fit replaced the memory coefficients (base moved off its placeholder 1.0):
+    assert updated["base_transient_bytes"] != _EXISTING_CALIBRATION["base_transient_bytes"]
+    assert "attn_bytes_per_head_token2" in updated
     assert updated["overhead_frac"] == _EXISTING_CALIBRATION["overhead_frac"]
     assert updated["provenance"]["measured_date"]
 
@@ -234,8 +237,10 @@ def test_help_runs_without_touching_a_model() -> None:
 
 
 def test_real_calibration_data_json_is_never_touched_by_this_test_module() -> None:
-    """Sanity guard: the REAL, committed calibration_data.json must still read as
-    UNMEASURED placeholders after this whole test module runs -- if any test above
-    ever accidentally pointed at the real file, this would catch it."""
+    """Sanity guard: the REAL, committed calibration_data.json must still carry its
+    MEASURED provenance after this whole test module runs -- every test above points
+    `--calibration-data` at a temp copy, so a stray write to the real default would be
+    caught here (a synthetic overwrite's provenance would not mention the real Qwen3-8B
+    calibration)."""
     calib = load_calibration()
-    assert "placeholder" in calib.provenance["measured_date"].lower()
+    assert "Qwen3-8B" in calib.provenance["fit_source"]

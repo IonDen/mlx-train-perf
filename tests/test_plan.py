@@ -8,10 +8,11 @@ from mlx_train_perf.plan.estimate import (
     FitPoint,
     ModelShape,
     TrainConfig,
-    _lora_param_count,
+    _lora_bytes,
     _loss_bytes,
+    _optimizer_bytes,
     estimate_peak,
-    fit_activation_and_optimizer_bytes,
+    fit_memory_coeffs,
     plan_fit,
 )
 
@@ -49,7 +50,8 @@ def test_refuses_and_suggests() -> None:
     s = _shape()
     cfg = TrainConfig(batch=4096, seq_len=8192, dtype="bfloat16", lora_rank=8,
                       lora_layers=2, grad_checkpoint=True, impl="kernel")
-    report = plan_fit(s, cfg, budget_bytes=1 * 1024**3)
+    # Budget above the ~1.6 GB base transient but far below this huge batch/seq config.
+    report = plan_fit(s, cfg, budget_bytes=3 * 1024**3)
     assert not report.fits
     assert report.is_estimate
     assert report.suggestion is not None
@@ -167,7 +169,9 @@ def test_suggestion_falls_through_to_seq_len_when_batch_already_floored() -> Non
     s = _shape()
     cfg = TrainConfig(batch=1, seq_len=8192, dtype="bfloat16", lora_rank=8, lora_layers=2,
                       grad_checkpoint=True, impl="kernel")
-    report = plan_fit(s, cfg, budget_bytes=6_000_000)
+    # Budget above base + the seq-1024 floor config, below the seq-8192 config (whose
+    # O(N^2) attention term dominates) -- so the fix must step seq_len down, not batch.
+    report = plan_fit(s, cfg, budget_bytes=3 * 1024**3)
     assert not report.fits
     assert report.suggestion is not None
     assert report.suggestion.batch == 1
@@ -241,111 +245,167 @@ def test_naive_estimate_is_conservative_at_smaller_n() -> None:
 
 
 # ---------------------------------------------------------------------------
-# fit_activation_and_optimizer_bytes: pure ordinary-least-squares fit of
-# act_bytes_per_token_layer / optimizer_bytes_per_param from `run_train_step` peak
-# measurements. Every point here is SYNTHETIC (generated forward from known true
-# coefficients via the same `_loss_bytes`/`_lora_param_count` the fit itself inverts)
-# -- no real artifact, no model, no MLX device. The controller runs this against
-# real `run_train_step` artifacts after the production runs; calibration_data.json's
-# own constants are left untouched by this task.
+# The corrected memory model: a LINEAR activation term (gc-aware) + a QUADRATIC
+# attention-backward term (one layer, gc-independent -- mlx's O(N^2) SDPA backward
+# materializes one (N,N) at a time). These tests pin the SHAPE + measured accuracy.
+# ---------------------------------------------------------------------------
+
+
+def test_predicted_peak_matches_measured_qwen3_8b_within_tolerance() -> None:
+    """Measured-vs-predicted acceptance: anchor the corrected model to the North-Star
+    measurement it was fit against -- Qwen3-8B-4bit, seq 8192, grad_checkpoint=True,
+    kernel, MEASURED total peak 25.68 GB (`_artifacts/northstar_context_sweep/`, session
+    435c2ef). The model (with the committed calibration) predicts within 15%, and
+    OVER-predicts (the safe direction for a fit planner). The whole point of the O(N^2)
+    correction is here: a purely-linear activation model grossly UNDER-predicts at this
+    context, which is exactly the (unsafe) failure this task fixed."""
+    qwen = ModelShape(vocab=151936, hidden=4096, layers=36, intermediate=12288, heads=32,
+                      kv_heads=8, tied=False, quant_bits=4, quant_group=64)
+    calib = load_calibration()
+    cfg = TrainConfig(batch=1, seq_len=8192, dtype="bfloat16", lora_rank=8, lora_layers=36,
+                      grad_checkpoint=True, impl="kernel")
+    peak, _ = estimate_peak(qwen, cfg, calib)
+    measured_bytes = 25.68 * 1024**3
+    assert abs(peak - measured_bytes) / measured_bytes < 0.15
+    assert peak >= measured_bytes  # over-predicts -- the safe direction for a fit planner
+
+
+def test_attention_component_scales_quadratically_with_seq() -> None:
+    """The `"attention"` component is `a_quad * batch*heads*seq^2` -- doubling seq_len
+    must ~4x it (O(N^2)), which is the whole point of the correction. Approx (not exact)
+    because `estimate_peak` int-floors each component."""
+    s = _shape()
+    calib = load_calibration()
+    cfg_n = TrainConfig(batch=1, seq_len=512, dtype="bfloat16", lora_rank=8, lora_layers=2,
+                        grad_checkpoint=True, impl="kernel")
+    cfg_2n = TrainConfig(batch=1, seq_len=1024, dtype="bfloat16", lora_rank=8, lora_layers=2,
+                         grad_checkpoint=True, impl="kernel")
+    _, comp_n = estimate_peak(s, cfg_n, calib)
+    _, comp_2n = estimate_peak(s, cfg_2n, calib)
+    # rel tolerance absorbs `estimate_peak`'s per-component int-floor (a few bytes on
+    # values of millions) -- the SHAPE (4x vs 2x) is what this pins.
+    assert comp_2n["attention"] == pytest.approx(4 * comp_n["attention"], rel=1e-5)
+    # And it is the term that grows fastest with context: attention grows 4x while the
+    # linear activations term only doubles.
+    assert comp_2n["activations"] == pytest.approx(2 * comp_n["activations"], rel=1e-5)
+
+
+def test_grad_checkpoint_changes_only_the_linear_activation_term() -> None:
+    """grad_checkpoint selects the linear coefficient (`_ckpt` vs `_full`, ~45x apart)
+    but does NOT change the attention term (the O(N^2) backward is one-layer either way)."""
+    s = _shape()
+    calib = load_calibration()
+    cfg_ck = TrainConfig(batch=1, seq_len=1024, dtype="bfloat16", lora_rank=8, lora_layers=2,
+                         grad_checkpoint=True, impl="kernel")
+    cfg_no = TrainConfig(batch=1, seq_len=1024, dtype="bfloat16", lora_rank=8, lora_layers=2,
+                         grad_checkpoint=False, impl="kernel")
+    _, comp_ck = estimate_peak(s, cfg_ck, calib)
+    _, comp_no = estimate_peak(s, cfg_no, calib)
+    assert comp_no["attention"] == comp_ck["attention"]  # gc-independent
+    assert comp_no["activations"] > comp_ck["activations"]  # full stores more than ckpt
+    assert comp_no["activations"] / comp_ck["activations"] == pytest.approx(
+        calib.act_bytes_per_token_hidden_layer_full
+        / calib.act_bytes_per_token_hidden_layer_ckpt, rel=1e-5)
+
+
+# ---------------------------------------------------------------------------
+# fit_memory_coeffs: OLS fit of (base, a_lin_ckpt, a_quad) from grad_checkpoint=True
+# kernel-impl `run_train_step` peaks + a_lin_full from grad_checkpoint=False peaks.
+# Every point here is SYNTHETIC (generated forward from known true coefficients via the
+# exact same model + `_lora_bytes`/`_optimizer_bytes`/`_loss_bytes` the fit itself
+# subtracts) -- no real artifact, no model, no MLX device. optimizer_bytes_per_param is
+# analytic (not fitted). The controller runs this against real artifacts after the
+# production runs.
 # ---------------------------------------------------------------------------
 
 
 def _synthesize_fit_point(
     *, shape: ModelShape, calib, batch: int, seq_len: int, lora_rank: int,
-    lora_layers: int, true_act: float, true_opt: float,
+    lora_layers: int, grad_checkpoint: bool, base: float, a_lin_ckpt: float,
+    a_lin_full: float, a_quad: float,
 ) -> FitPoint:
     cfg = TrainConfig(batch=batch, seq_len=seq_len, dtype="bfloat16", lora_rank=lora_rank,
-                      lora_layers=lora_layers, grad_checkpoint=True, impl="kernel")
-    loss_bytes = _loss_bytes(cfg, shape, calib)
-    n_token_layers = batch * seq_len * shape.layers
-    n_params = _lora_param_count(cfg, shape)
-    marginal = true_act * n_token_layers + true_opt * n_params + loss_bytes
+                      lora_layers=lora_layers, grad_checkpoint=grad_checkpoint, impl="kernel")
+    analytic = (_lora_bytes(cfg, shape) + _optimizer_bytes(cfg, shape, calib)
+                + _loss_bytes(cfg, shape, calib))
+    a_lin = a_lin_ckpt if grad_checkpoint else a_lin_full
+    x_lin = batch * seq_len * shape.hidden * shape.layers
+    x_quad = batch * shape.heads * seq_len ** 2
+    marginal = base + a_lin * x_lin + a_quad * x_quad + analytic
     return FitPoint(shape=shape, cfg=cfg, marginal_peak_bytes=marginal)
 
 
-def test_fit_activation_and_optimizer_bytes_recovers_known_coefficients() -> None:
-    """Classic fit-recovery test: synthesize FitPoints FORWARD from KNOWN true
-    coefficients, then fit BACKWARD and assert exact recovery (up to floating-point
-    tolerance) -- proves the 2-variable least-squares solve itself is correct,
-    independent of what calibration_data.json's own (still-placeholder) constants
-    happen to be."""
+def test_fit_memory_coeffs_recovers_known_coefficients() -> None:
+    """Classic fit-recovery: synthesize FitPoints FORWARD from KNOWN coefficients, fit
+    BACKWARD, assert recovery. gc=True points recover (base, a_lin_ckpt, a_quad); the
+    gc=False point recovers a_lin_full."""
     shape = _shape()
     calib = load_calibration()
-    true_act, true_opt = 512.0, 8.0
-    points = [
-        _synthesize_fit_point(shape=shape, calib=calib, batch=1, seq_len=512,
-                              lora_rank=8, lora_layers=2, true_act=true_act,
-                              true_opt=true_opt),
-        _synthesize_fit_point(shape=shape, calib=calib, batch=2, seq_len=512,
-                              lora_rank=16, lora_layers=2, true_act=true_act,
-                              true_opt=true_opt),
-        _synthesize_fit_point(shape=shape, calib=calib, batch=1, seq_len=1024,
-                              lora_rank=8, lora_layers=2, true_act=true_act,
-                              true_opt=true_opt),
-    ]
-    fitted_act, fitted_opt = fit_activation_and_optimizer_bytes(points, calib=calib)
-    assert fitted_act == pytest.approx(true_act, rel=1e-9)
-    assert fitted_opt == pytest.approx(true_opt, rel=1e-9)
+    base, a_lin_ckpt, a_lin_full, a_quad = 1.5e9, 4.0, 180.0, 9.0
+
+    def synth(seq_len: int, gc: bool) -> FitPoint:
+        return _synthesize_fit_point(
+            shape=shape, calib=calib, batch=1, seq_len=seq_len, lora_rank=8, lora_layers=2,
+            grad_checkpoint=gc, base=base, a_lin_ckpt=a_lin_ckpt, a_lin_full=a_lin_full,
+            a_quad=a_quad)
+
+    points = [synth(512, True), synth(1024, True), synth(2048, True), synth(1024, False)]
+    c = fit_memory_coeffs(points, calib=calib)
+    assert c["base_transient_bytes"] == pytest.approx(base, rel=1e-6)
+    assert c["act_bytes_per_token_hidden_layer_ckpt"] == pytest.approx(a_lin_ckpt, rel=1e-6)
+    assert c["act_bytes_per_token_hidden_layer_full"] == pytest.approx(a_lin_full, rel=1e-6)
+    assert c["attn_bytes_per_head_token2"] == pytest.approx(a_quad, rel=1e-6)
 
 
-def test_fit_activation_and_optimizer_bytes_recovers_with_exactly_two_points() -> None:
+def test_fit_memory_coeffs_without_gc_false_points_keeps_calib_full() -> None:
+    """With no grad_checkpoint=False points, `a_lin_full` is not identifiable -- the fit
+    falls back to the existing calib value rather than inventing one."""
     shape = _shape()
     calib = load_calibration()
-    true_act, true_opt = 300.0, 6.0
-    points = [
-        _synthesize_fit_point(shape=shape, calib=calib, batch=1, seq_len=256,
-                              lora_rank=4, lora_layers=2, true_act=true_act,
-                              true_opt=true_opt),
-        _synthesize_fit_point(shape=shape, calib=calib, batch=1, seq_len=1024,
-                              lora_rank=32, lora_layers=2, true_act=true_act,
-                              true_opt=true_opt),
-    ]
-    fitted_act, fitted_opt = fit_activation_and_optimizer_bytes(points, calib=calib)
-    assert fitted_act == pytest.approx(true_act, rel=1e-9)
-    assert fitted_opt == pytest.approx(true_opt, rel=1e-9)
+
+    def synth(seq_len: int) -> FitPoint:
+        return _synthesize_fit_point(
+            shape=shape, calib=calib, batch=1, seq_len=seq_len, lora_rank=8, lora_layers=2,
+            grad_checkpoint=True, base=1e9, a_lin_ckpt=3.0, a_lin_full=999.0, a_quad=5.0)
+
+    c = fit_memory_coeffs([synth(512), synth(1024), synth(2048)], calib=calib)
+    assert (c["act_bytes_per_token_hidden_layer_full"]
+            == calib.act_bytes_per_token_hidden_layer_full)
 
 
-def test_fit_activation_and_optimizer_bytes_rejects_fewer_than_two_points() -> None:
+def test_fit_memory_coeffs_rejects_fewer_than_three_gc_true_points() -> None:
     shape = _shape()
     calib = load_calibration()
-    points = [
-        _synthesize_fit_point(shape=shape, calib=calib, batch=1, seq_len=512,
-                              lora_rank=8, lora_layers=2, true_act=1.0, true_opt=1.0),
-    ]
-    with pytest.raises(PlanInputError, match="at least 2"):
-        fit_activation_and_optimizer_bytes(points, calib=calib)
+
+    def synth(seq_len: int) -> FitPoint:
+        return _synthesize_fit_point(
+            shape=shape, calib=calib, batch=1, seq_len=seq_len, lora_rank=8, lora_layers=2,
+            grad_checkpoint=True, base=1.0, a_lin_ckpt=1.0, a_lin_full=1.0, a_quad=1.0)
+
+    with pytest.raises(PlanInputError, match="at least 3"):
+        fit_memory_coeffs([synth(512), synth(1024)], calib=calib)
 
 
-def test_fit_activation_and_optimizer_bytes_rejects_non_kernel_impl() -> None:
+def test_fit_memory_coeffs_rejects_single_seq_len_gc_true() -> None:
+    """Three gc=True points but all the SAME seq_len cannot separate the linear from the
+    quadratic term (both driven only by seq) -- needs >= 2 distinct seq_len."""
+    shape = _shape()
+    calib = load_calibration()
+
+    def synth(batch: int) -> FitPoint:
+        return _synthesize_fit_point(
+            shape=shape, calib=calib, batch=batch, seq_len=512, lora_rank=8, lora_layers=2,
+            grad_checkpoint=True, base=1.0, a_lin_ckpt=1.0, a_lin_full=1.0, a_quad=1.0)
+
+    with pytest.raises(PlanInputError, match="distinct seq_len"):
+        fit_memory_coeffs([synth(1), synth(2), synth(4)], calib=calib)
+
+
+def test_fit_memory_coeffs_rejects_non_kernel_impl() -> None:
     shape = _shape()
     calib = load_calibration()
     cfg = TrainConfig(batch=1, seq_len=512, dtype="bfloat16", lora_rank=8, lora_layers=2,
                       grad_checkpoint=True, impl="naive")
-    points = [
-        FitPoint(shape=shape, cfg=cfg, marginal_peak_bytes=1.0),
-        FitPoint(shape=shape, cfg=cfg, marginal_peak_bytes=2.0),
-    ]
+    points = [FitPoint(shape=shape, cfg=cfg, marginal_peak_bytes=float(i)) for i in (1, 2, 3)]
     with pytest.raises(PlanInputError, match="kernel"):
-        fit_activation_and_optimizer_bytes(points, calib=calib)
-
-
-def test_fit_activation_and_optimizer_bytes_rejects_collinear_points() -> None:
-    """True collinearity in this THROUGH-THE-ORIGIN model needs the two drivers
-    PROPORTIONAL across every point, not merely equal -- `lora_rank` doubling exactly
-    when `seq_len` doubles makes the optimizer-bytes driver (linear in `lora_rank`,
-    `_lora_param_count`) a constant multiple of the activation-bytes driver (linear in
-    `batch*seq_len*layers`) at every point, so the 2x2 normal-equations matrix is
-    singular (verified by hand: det=0 exactly for this construction, whereas merely
-    repeating the SAME `lora_rank` across differing `seq_len` values is NOT collinear
-    here -- confirmed separately before writing this test)."""
-    shape = _shape()
-    calib = load_calibration()
-    points = [
-        _synthesize_fit_point(shape=shape, calib=calib, batch=1, seq_len=512,
-                              lora_rank=8, lora_layers=2, true_act=1.0, true_opt=1.0),
-        _synthesize_fit_point(shape=shape, calib=calib, batch=1, seq_len=1024,
-                              lora_rank=16, lora_layers=2, true_act=1.0, true_opt=1.0),
-    ]
-    with pytest.raises(PlanInputError, match="collinear"):
-        fit_activation_and_optimizer_bytes(points, calib=calib)
+        fit_memory_coeffs(points, calib=calib)
