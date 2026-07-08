@@ -35,6 +35,22 @@ mlx-train-perf = "mlx_train_perf.cli:main"
 [tool.hatch.version]
 source = "vcs"
 
+[tool.hatch.build.targets.sdist]
+# Explicit allowlist: the repo carries gitignored working-state (.superpowers/ SDD
+# ledger, .codegraph/ index, docs/, _artifacts/, CLAUDE.md) that hatchling would
+# otherwise sweep into the sdist. Ship only the source, tests, bench scripts, CI, and
+# the user-facing docs. (The wheel already ships just the `mlx_train_perf` package.)
+include = [
+    "/src",
+    "/tests",
+    "/scripts",
+    "/.github",
+    "/README.md",
+    "/CHANGELOG.md",
+    "/ROADMAP.md",
+    "/LICENSE",
+]
+
 [dependency-groups]
 dev = [
     "pytest>=8", "pytest-cov", "hypothesis", "ruff", "mypy", "basedpyright",
