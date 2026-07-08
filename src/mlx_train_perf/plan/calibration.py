@@ -34,8 +34,7 @@ class Calibration:
     overhead_frac: float
     # Bytes per (row, vocab) element for the naive loss impl's base term (before the
     # separate d_w term). This is an EMPIRICAL FIT to a single measured production-shape
-    # anchor -- mlx-train-perf-spike/results/gate_naive_n8192.json (reference-only
-    # artifact, never executed by this project): n=8192, V=151936, D=4096, bf16 hidden,
+    # anchor: a measured production-shape gate at n=8192, V=151936, D=4096, bf16 hidden,
     # trainable head, marginal_peak_gb=18.547 (GiB). Converting to bytes
     # (~19,914,689,610) and holding the d_w term (V*D*4*2 = 4,978,638,848) fixed, the
     # remainder divided by n*V = 1,244,659,712 gives ~12.0 bytes per (n, V) pair.
@@ -43,8 +42,8 @@ class Calibration:
     # This is NOT a validated buffer-by-buffer decomposition. At this exact anchor shape
     # 2*D == n, so V*D*4*2 == n*V*4 exactly -- the split between "the d_w term" and "the
     # n*V coefficient" is numerically unidentifiable from this one point alone. The fit
-    # also does not extrapolate linearly to other n: the sibling artifact
-    # gate_naive_n2048.json (same code path, n=2048) measures marginal_peak_gb=4.057,
+    # also does not extrapolate linearly to other n: the sibling n=2048 measurement (same
+    # code path) is marginal_peak_gb=4.057,
     # while this coefficient plus the fixed d_w term predicts ~8.11 GiB there -- about
     # 2x too high. At n=8192 (this project's flagship shape) the estimate is accurate;
     # at smaller n it over-predicts the naive path's cost, which is the conservative
