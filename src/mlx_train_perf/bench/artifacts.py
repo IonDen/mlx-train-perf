@@ -1,8 +1,8 @@
 """Bench artifact conventions: identity-keyed JSON results with resume integrity.
 
-Same shape as the committed `scripts/bench_quant_thresholds.py` house pattern (itself a
-port of `mlx-train-perf-spike/common.py:47-62`): a run's identity captures everything a
-stale-vs-fresh decision depends on, results are written atomically (`.tmp` + rename), and
+Same shape as the committed `scripts/bench_quant_thresholds.py` house pattern: a run's
+identity captures everything a stale-vs-fresh decision depends on, results are written
+atomically (`.tmp` + rename), and
 freshness requires an EXACT identity match plus `status == "ok"`.
 
 Identity carries a `code_sha` -- the same SHA-256-over-name+bytes pattern

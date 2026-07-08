@@ -14,8 +14,8 @@ activation coefficients + a fixed base transient, AdamW optimizer bytes/param, a
 margin) comes from `Calibration`, loaded from a versioned, provenance-carrying data file --
 never hardcoded here.
 
-Sanity-anchored (not tolerance-pinned) against the mlx-train-perf-spike gate
-measurements at production shape (n=8192, V=151936, D=4096, bf16, M1 Max 32 GB): the
+Sanity-anchored (not tolerance-pinned) against the measured gate at production shape
+(n=8192, V=151936, D=4096, bf16, M1 Max 32 GB): the
 kernel loss term is negligible next to naive's, and the naive loss term's own
 coefficient is fit to a persisted gate artifact at that shape (see
 `Calibration.naive_loss_bytes_per_nv`'s docstring for the derivation and its known
