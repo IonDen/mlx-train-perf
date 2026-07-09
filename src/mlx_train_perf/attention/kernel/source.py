@@ -538,3 +538,124 @@ def build_bwd_D_source(head_dim: int, *, drop_product: bool = False) -> str:  # 
             "PROD_FACTOR", prod_factor
         )
     )
+
+
+# ---------------------------------------------------------------------------------------
+# Backward: dQ kernel v1 (ONE OWNER PER QUERY ROW) -- T8, spec Section 4.2.3. One program
+# owns dQ[i]; it loops the causally-allowed keys, recomputes S/P from Q, K and the SAVED L
+# (never re-materializing the (N, N) probability matrix), and accumulates the query gradient
+# in fp32 registers, writing dQ[i] exactly once. The math mirrors api.py's pure-MLX
+# `_flash_attention_backward` dQ path EXACTLY, specialized to Bk=1 (per key):
+#   s   = scale * (q_row . k_row)                 (recomputed QK^T, causal-masked)
+#   p   = exp(s - L_row)                           (L_row is the forward's saved row logsumexp)
+#   dp  = dO_row . v_row                           (the dP = dO @ V^T term, per key)
+#   ds  = p * (dp - D_row)                         (D_row from T7's launch_bwd_D -- CONSUMED,
+#                                                    never recomputed in-kernel)
+#   dQ_row += scale * ds * k_row                   (accumulated over the causally-allowed keys)
+#
+# ONE-OWNER, NO ATOMICS: each (b, hq, row) triple's dQ is written by exactly one thread over
+# disjoint output elements, so the result is bit-identical run to run (no accumulation races)
+# and the query-range split stays bit-identical to a single dispatch -- a row's dQ depends
+# ONLY on its own absolute position and the keys, never on its query block. This mirrors the
+# v0 FORWARD scalar body's per-row structure (`_FWD_TEMPLATE`): register q/dO rows, fp32
+# accumulator, full buffers + an in-kernel query-row offset (`qoffs`), tile-local dQ output.
+#
+# CAUSAL SKIP = the concrete per-key inequality `kk <= row` applied BEFORE a key contributes
+# (masked keys have p=0 in the reference, so skipping them is exact) -- the named bug site of
+# T8. `flip_causal` is TEST-ONLY: it flips the inequality to the WRONG triangle (`kk >= row`)
+# so a parity run against the causal oracle FAILS -- the off-by-one perturbation that proves
+# the parity grid can detect a causal-skip bug. Never used by production code.
+#
+# GQA `kv_head = q_head // group_size` in-kernel (K/V never expanded); fp32 accumulators
+# throughout regardless of the input template `T` (bf16 or fp32); L and D are read as fixed
+# fp32 device buffers (never templated -- the residuals that seed the backward stay fp32,
+# matching the forward's L convention); dQ is cast to the input dtype `T` on the single store.
+_BWD_DQ_TEMPLATE = """
+    uint local_row = thread_position_in_grid.x;   // 0..rows_this-1 (output row, tile-local)
+    uint bh = thread_position_in_grid.y;          // 0..(b*hq)-1
+    uint r0 = qoffs[0];
+    uint r1 = qoffs[1];
+    uint rows_this = r1 - r0;
+    if (local_row >= rows_this) return;           // defensive (dispatchThreads clamps x)
+
+    uint hq = q_shape[1];
+    uint n = q_shape[2];
+    uint hkv = k_shape[1];
+    uint group_size = hq / hkv;
+
+    uint b = bh / hq;
+    uint h = bh % hq;
+    uint kvh = h / group_size;
+    uint row = r0 + local_row;                     // absolute query position
+
+    float scale = scale_in[0];
+
+    // Row-contiguous base offsets (ensure_row_contiguous=True). dO shares q's (B,Hq,N,D)
+    // layout; K/V index by kv head; L and D are (B, Hq, N).
+    size_t q_base = ((size_t)(b * hq + h) * n + row) * HEAD_DIM;
+    size_t kv_base = (size_t)(b * hkv + kvh) * n * HEAD_DIM;   // + kk * HEAD_DIM per key
+    size_t row_idx = (size_t)(b * hq + h) * n + row;
+
+    float qreg[HEAD_DIM];
+    float doreg[HEAD_DIM];
+    for (uint dd = 0; dd < HEAD_DIM; ++dd) {
+        qreg[dd] = (float)q[q_base + dd];
+        doreg[dd] = (float)d_o[q_base + dd];
+    }
+
+    float l_row = lse[row_idx];
+    float d_row = d_arr[row_idx];
+
+    float dq[HEAD_DIM];
+    for (uint dd = 0; dd < HEAD_DIM; ++dd) {
+        dq[dd] = 0.0f;
+    }
+
+    for (uint kk = 0; kk < n; ++kk) {
+        bool keep = (KEEP_CMP);
+        if (!keep) { continue; }
+        const device T* krow = k + kv_base + (size_t)kk * HEAD_DIM;
+        const device T* vrow = v + kv_base + (size_t)kk * HEAD_DIM;
+        float s = 0.0f;
+        for (uint dd = 0; dd < HEAD_DIM; ++dd) {
+            s += qreg[dd] * (float)krow[dd];
+        }
+        float p = metal::exp(s * scale - l_row);
+        float dp = 0.0f;
+        for (uint dd = 0; dd < HEAD_DIM; ++dd) {
+            dp += doreg[dd] * (float)vrow[dd];
+        }
+        float sds = scale * p * (dp - d_row);
+        for (uint dd = 0; dd < HEAD_DIM; ++dd) {
+            dq[dd] += sds * (float)krow[dd];
+        }
+    }
+
+    size_t dq_base = ((size_t)bh * rows_this + local_row) * HEAD_DIM;
+    for (uint dd = 0; dd < HEAD_DIM; ++dd) {
+        dq_out[dq_base + dd] = (T)dq[dd];
+    }
+"""
+
+
+def build_bwd_dq_source(head_dim: int, *, causal: bool, flip_causal: bool = False) -> str:
+    """MSL function body for the v1 one-owner-per-query-row dQ backward kernel.
+
+    `head_dim` in {64, 96, 128} is baked in as a compile-time constant (fixing the per-thread
+    `qreg`/`doreg`/`dq` array sizes and the D-loop bounds). `causal=True` loops only keys
+    `kk <= row` (the causal skip); `causal=False` loops every key. `flip_causal` is TEST-ONLY
+    -- it flips the causal-skip inequality to the WRONG triangle (`kk >= row`) so a parity run
+    against the causal oracle FAILS (the named-bug-site perturbation)."""
+    if head_dim not in _KERNEL_HEAD_DIMS:
+        raise ValueError(
+            f"head_dim must be one of {_KERNEL_HEAD_DIMS}, got {head_dim}"
+        )
+    if flip_causal and not causal:
+        raise ValueError("flip_causal is only meaningful with causal=True")
+    if not causal:
+        keep = "true"
+    elif flip_causal:
+        keep = "kk >= row"
+    else:
+        keep = "kk <= row"
+    return _BWD_DQ_TEMPLATE.replace("HEAD_DIM", str(head_dim)).replace("KEEP_CMP", keep)
