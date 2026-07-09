@@ -15,14 +15,31 @@ user-metal-kernels workflow-and-gotchas.md).
 
 Rate calibration (`calibrated_fwd_rate`) runs at first-launch time and is CACHED (mirrors
 `core/kernel/launch._RATE_CACHE`), never inside a compiled region or a vjp (host-sync
-timing is compile-hostile). It follows the CE calibration discipline -- warmup dispatch
-unmeasured (pays the Metal JIT + cold clocks), median-of-3 timed, halved by a safety
-factor -- but does NOT reuse the CE's vocab-tile ramp: that ramp exists because the MMA
-kernel's rate is occupancy-dependent up to n~8192, whereas this v0 scalar kernel launches
-b*hq*rows threads (thousands even at the small probe shape) and is latency-bound at
-saturation, so a warm median at a fixed small probe shape is representative.
+timing is compile-hostile). It RAMPS the probe key-count toward the caller's real n
+(`_calibrate_fwd`, mirroring `core/kernel/launch.calibrate`'s ramp/sustain/median shape --
+read that function's docstring for the DVFS rationale) rather than measuring at one fixed
+small shape: v0 re-streams all N keys per query row with ZERO cross-row reuse (no
+`simdgroup_matrix`, no threadgroup-resident K/V), so a small, cache-resident probe
+(~128 KB/head) measures a fundamentally different memory regime than the flagship (8k+ N,
+~8-16 MB/head) DRAM-bound working set -- a fixed micro-probe risks an optimistic rate the
+same way the CE kernel's own micro-probe once read ~3.6x off at production shape (see
+`core/kernel/launch`'s module docstring). This is a CACHE -> DRAM transition, not just an
+occupancy effect, so ramping toward large n is load-bearing here, not cosmetic. The ramp's
+own sizing (`_next_probe_n`) is QUADRATIC in probe size (a probe of size `np` sets BOTH the
+query-row count and the key count, so its cost is O(np^2)), unlike the CE kernel's
+tile-linear cost -- the ramp/sustain/median SHAPE is mirrored, the sizing arithmetic is
+adapted, not reused. Each stage's own probe dispatch is sized so its projected cost stays
+within budget at that stage's own SAFETY_FACTOR-halved measured rate, so calibration itself
+never risks the watchdog. Probe QKV are drawn from a LOCAL `mx.random.key` (never
+`mx.random.seed`), so calibration never mutates the caller's global RNG stream -- the first
+kernel call can fire inside a user's grad/training run and desync downstream consumers.
+
+T6's KV-block tiling changes the kernel's cache-residency and reuse pattern entirely
+(threadgroup-resident K/V tiles instead of v0's zero-reuse re-stream), so this calibration
+must be re-validated once T6 lands -- do not assume v0's rates or ramp behavior transfer.
 """
 import functools
+import math
 import statistics
 import time
 from collections.abc import Callable
@@ -37,7 +54,11 @@ from mlx_train_perf.errors import LaunchBudgetError
 MAX_DISPATCH_SECONDS = 1.0
 MAX_TOTAL_SECONDS = 60.0
 SAFETY_FACTOR = 0.5      # halve the measured rate (session drift + probe noise, 2x margin)
-_PROBE_N = 128           # fixed small probe shape; the scalar kernel saturates well below it
+_PROBE_N_FLOOR = 128     # ramp's minimum/starting probe key-count -- the original fixed
+                         # probe shape, small enough to be safe at any plausible v0 rate
+_PROBE_N_HARD_CAP = 8192 # never probe past this many keys/queries during calibration,
+                         # regardless of the caller's real n (mirrors core/kernel/launch's
+                         # 8192 tile cap)
 
 # key: (head_dim, dtype, causal, b, hq, n-bucket)
 _FWD_RATE_CACHE: dict[tuple[int, str, bool, int, int, int], float] = {}
@@ -147,36 +168,129 @@ def launch_flash_fwd(
     return mx.concatenate(o_chunks, axis=2), mx.concatenate(l_chunks, axis=2)
 
 
+def _start_probe_n(n: int) -> int:
+    """Ramp's starting probe key-count: `_PROBE_N_FLOOR` (the original fixed probe size,
+    small enough to be safe at any plausible v0 rate) capped at the caller's real `n` -- a
+    caller whose real context is already smaller than the floor gets measured AT n
+    directly rather than padded up to a probe size it will never actually run."""
+    return min(_PROBE_N_FLOOR, n)
+
+
+def _next_probe_n(
+    *, rate_macs_per_s: float, n: int, d: int, b: int, hq: int,
+    budget_s: float = MAX_DISPATCH_SECONDS,
+) -> int:
+    """Largest power-of-two probe key-count <= min(n, `_PROBE_N_HARD_CAP`) whose projected
+    SELF-attention dispatch (`np` query rows over `np` keys -- QUADRATIC in `np`, unlike
+    the CE kernel's tile-linear cost) stays within `budget_s` at `rate_macs_per_s`. Mirrors
+    `core/kernel/launch.next_probe_tile`'s role in the ramp: callers pass the
+    SAFETY_FACTOR-halved rate, and `_calibrate_fwd`'s ramp uses this to size the NEXT probe
+    one stage ahead of what it has actually measured.
+
+    When the caller's real `n` is already <= `_PROBE_N_FLOOR`, this returns `n` directly
+    without a budget check -- that shape was already measured successfully as the ramp's
+    OWN starting probe (`_start_probe_n` never exceeds the floor either), so re-deriving it
+    here is redundant, not unsafe. Otherwise floors at `_PROBE_N_FLOOR` even if that probe
+    still projects over budget -- refusing an over-budget PRODUCTION dispatch is
+    `check_fwd_budget`'s job, not this sizing heuristic's."""
+    cap = min(n, _PROBE_N_HARD_CAP)
+    if cap <= _PROBE_N_FLOOR:
+        return cap
+    np_ = 1 << (cap.bit_length() - 1)   # largest power of two <= cap
+    np_ = max(np_, _PROBE_N_FLOOR)
+    while np_ > _PROBE_N_FLOOR and (
+        _fwd_macs_per_row(n=np_, d=d, b=b, hq=hq) * np_ / rate_macs_per_s > budget_s
+    ):
+        np_ //= 2
+    return np_
+
+
+def _sustain_reps(*, per_dispatch_s: float, target_s: float = 0.75, cap: int = 8) -> int:
+    """Extra back-to-back probe dispatches at the ramp's final size so cumulative
+    sustained work reaches `target_s` before the timed median-of-3 -- Apple's GPU DVFS
+    needs on the order of a second of continuous load to reach peak clocks from cold (same
+    rationale as `core/kernel/launch.sustain_reps`, reimplemented here rather than imported
+    so the two kernels' calibration paths stay independently reviewable -- see that
+    function's docstring). Floors at 1 (always sustain past the rate-measuring dispatch
+    itself); caps at 8 (bounds calibration wall time)."""
+    if per_dispatch_s <= 0:
+        return cap
+    reps = math.ceil(target_s / per_dispatch_s)
+    return min(max(reps, 1), cap)
+
+
+def _calibrate_fwd(
+    *, measure: Callable[[int], float], n: int, d: int, b: int, hq: int,
+    start_n: int, max_stages: int = 3,
+) -> float:
+    """Ramp through probe key-counts under real (or, in unit tests, fake) dispatch
+    timings, mirroring `core/kernel/launch.calibrate`'s ramp/sustain/median shape exactly
+    (see that function's docstring) -- adapted to THIS kernel's quadratic-in-probe-size
+    cost model via `_next_probe_n` in place of `next_probe_tile`. Each stage times one
+    dispatch at the current probe size and projects a SAFETY_FACTOR-conservative next size
+    from that stage's own rate, advancing only while the projection keeps growing; a
+    caller whose real n is already small converges in one stage. The final size then gets
+    extra sustained dispatches (`_sustain_reps`) to reach ramped GPU clocks, and the
+    reported rate is the MEDIAN of 3 timed dispatches at that size -- a single sample is
+    exactly the un-ramped, occupancy/cache-starved measurement this function exists to
+    avoid. Returns the raw (un-halved) rate -- the caller applies SAFETY_FACTOR."""
+    np_ = start_n
+    per_dispatch_s = 0.0
+    for _stage in range(max_stages):
+        per_dispatch_s = measure(np_)
+        raw_rate = _fwd_macs_per_row(n=np_, d=d, b=b, hq=hq) * np_ / max(per_dispatch_s, 1e-9)
+        candidate = _next_probe_n(rate_macs_per_s=SAFETY_FACTOR * raw_rate, n=n, d=d, b=b, hq=hq)
+        if candidate <= np_:
+            break
+        np_ = candidate
+    for _rep in range(_sustain_reps(per_dispatch_s=per_dispatch_s)):
+        measure(np_)
+    timings = [measure(np_) for _ in range(3)]
+    median_s = statistics.median(timings)
+    return _fwd_macs_per_row(n=np_, d=d, b=b, hq=hq) * np_ / max(median_s, 1e-9)
+
+
 def calibrated_fwd_rate(
     *, head_dim: int, dtype: mx.Dtype, b: int, hq: int, hkv: int, n: int, causal: bool
 ) -> float:
-    """Cached, safety-factored MAC/s throughput for the v0 forward kernel, used to size the
-    query-row split. Probes at a fixed small shape (`_PROBE_N` rows and keys, the caller's
-    real b/hq/hkv/d/causal): warmup dispatch unmeasured (Metal JIT + cold clocks), then the
-    median of 3 timed dispatches, halved by `SAFETY_FACTOR`. Cached per
-    (head_dim, dtype, causal, b, hq, n-bucket) so repeated calls in an occupancy regime
+    """Cached, safety-factored, N-AWARE MAC/s throughput for the v0 forward kernel, used to
+    size the query-row split. Ramps the probe key-count toward the caller's real `n` via
+    `_calibrate_fwd` (see the module docstring for why a fixed small probe reads the wrong
+    cache-resident regime at flagship N) rather than measuring at one fixed shape; probe
+    QKV are drawn from a LOCAL `mx.random.key(0)` (split into per-tensor sub-keys), never
+    `mx.random.seed`, so calibration never mutates the caller's global RNG stream. Cached
+    per (head_dim, dtype, causal, b, hq, n-bucket) so repeated calls in an occupancy regime
     don't re-probe. Must never be called inside a compiled region (host-sync timing)."""
     key = (head_dim, str(dtype), causal, b, hq, _n_bucket(n))
     if key in _FWD_RATE_CACHE:
         return _FWD_RATE_CACHE[key]
 
-    np = min(n, _PROBE_N)
-    mx.random.seed(0)
-    q = mx.random.normal((b, hq, np, head_dim)).astype(dtype)
-    kk = mx.random.normal((b, hkv, np, head_dim)).astype(dtype)
-    vv = mx.random.normal((b, hkv, np, head_dim)).astype(dtype)
-    mx.eval(q, kk, vv)
+    key_q, key_k, key_v = mx.random.split(mx.random.key(0), 3)
     scale = 1.0 / (head_dim ** 0.5)
-    macs = _fwd_macs_per_row(n=np, d=head_dim, b=b, hq=hq) * np
+    probes: dict[int, tuple[mx.array, mx.array, mx.array]] = {}
 
-    def once() -> float:
+    def measure(np_: int) -> float:
+        if np_ not in probes:
+            q = mx.random.normal((b, hq, np_, head_dim), key=key_q).astype(dtype)
+            kk = mx.random.normal((b, hkv, np_, head_dim), key=key_k).astype(dtype)
+            vv = mx.random.normal((b, hkv, np_, head_dim), key=key_v).astype(dtype)
+            mx.eval(q, kk, vv)
+            probes[np_] = (q, kk, vv)
+            # Metal JIT compiles on the first dispatch at a new probe shape, and GPU
+            # clocks/caches are cold -- this dispatch is deliberately unmeasured (mirrors
+            # core/kernel/launch.calibrated_rate's per-tile warmup).
+            o, lse = launch_flash_fwd(q, kk, vv, scale=scale, causal=causal, tile=TileShape())
+            mx.eval(o, lse)
+        q, kk, vv = probes[np_]
         t0 = time.perf_counter()
         o, lse = launch_flash_fwd(q, kk, vv, scale=scale, causal=causal, tile=TileShape())
         mx.eval(o, lse)
         return time.perf_counter() - t0
 
-    once()  # warmup: pays the Metal JIT + cold GPU clocks; deliberately unmeasured
-    median_s = statistics.median([once() for _ in range(3)])
-    rate = SAFETY_FACTOR * macs / max(median_s, 1e-9)
+    start_n = _start_probe_n(n)
+    raw_rate = _calibrate_fwd(
+        measure=measure, n=n, d=head_dim, b=b, hq=hq, start_n=start_n,
+    )
+    rate = SAFETY_FACTOR * raw_rate
     _FWD_RATE_CACHE[key] = rate
     return rate
