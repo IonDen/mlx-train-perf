@@ -60,6 +60,7 @@ import mlx.core as mx
 
 from mlx_train_perf.attention.kernel.source import (
     build_bwd_D_source,
+    build_bwd_dq_source,
     build_fwd_mma_source,
     build_fwd_source,
 )
@@ -138,11 +139,13 @@ def _fwd_macs_per_row(*, n: int, d: int, b: int, hq: int) -> int:
     return 2 * d * n * b * hq
 
 
-def check_fwd_budget(*, n: int, d: int, b: int, hq: int, rows: int, rate: float) -> None:
-    """Refuse-before-launch: the GPU watchdog SIGABRT is uncatchable. Projects both the
-    per-dispatch time (this range of `rows` query rows) and the whole forward's total time
-    from the conservative MAC model, and raises if either exceeds its budget."""
-    per_row = _fwd_macs_per_row(n=n, d=d, b=b, hq=hq)
+def _check_launch_budget(*, per_row: int, n: int, rows: int, rate: float) -> None:
+    """Refuse-before-launch, shared by the forward and the dQ backward (query-range split
+    kernels with the same watchdog exposure): the GPU watchdog SIGABRT is uncatchable.
+    Projects both the per-dispatch time (this range of `rows` query rows at the given
+    per-row MAC cost) and the whole pass's total time, and raises if either exceeds its
+    budget. `per_row` is the caller's conservative per-query-row MAC upper bound (2*D*n*b*hq
+    for the forward, 3*D*n*b*hq for dQ) -- the only kernel-specific input to this math."""
     per_dispatch = rows * per_row / rate
     total = n * per_row / rate
     if per_dispatch > MAX_DISPATCH_SECONDS or total > MAX_TOTAL_SECONDS:
@@ -151,6 +154,22 @@ def check_fwd_budget(*, n: int, d: int, b: int, hq: int, rows: int, rate: float)
             f"at {rate / 1e9:.1f} G MAC/s (budget {MAX_DISPATCH_SECONDS} s / "
             f"{MAX_TOTAL_SECONDS} s). Reduce shape/context, or pass a measured rate."
         )
+
+
+def _rows_within_dispatch_budget(*, per_row: int, n: int, rate: float) -> int:
+    """Largest query-row range whose projected dispatch stays within the per-dispatch budget
+    at `rate` for the given per-row MAC cost -- shared by the forward and dQ splits. Floors at
+    1 row (refusing an over-budget single row is `_check_launch_budget`'s job, not this sizing
+    heuristic's); never exceeds `n`."""
+    rows = int(MAX_DISPATCH_SECONDS * rate / per_row)
+    return max(1, min(n, rows))
+
+
+def check_fwd_budget(*, n: int, d: int, b: int, hq: int, rows: int, rate: float) -> None:
+    """Refuse-before-launch for the forward (see `_check_launch_budget`)."""
+    _check_launch_budget(
+        per_row=_fwd_macs_per_row(n=n, d=d, b=b, hq=hq), n=n, rows=rows, rate=rate
+    )
 
 
 @functools.cache
@@ -188,12 +207,11 @@ def _fwd_kernel(
 
 
 def _rows_per_dispatch(*, n: int, d: int, b: int, hq: int, rate: float) -> int:
-    """Largest query-row range whose projected dispatch stays within the per-dispatch
-    budget at `rate`. Floors at 1 row -- refusing an over-budget single row is
-    `check_fwd_budget`'s job, not this sizing heuristic's."""
-    per_row = _fwd_macs_per_row(n=n, d=d, b=b, hq=hq)
-    rows = int(MAX_DISPATCH_SECONDS * rate / per_row)
-    return max(1, min(n, rows))
+    """Largest forward query-row range within the per-dispatch budget (see
+    `_rows_within_dispatch_budget`)."""
+    return _rows_within_dispatch_budget(
+        per_row=_fwd_macs_per_row(n=n, d=d, b=b, hq=hq), n=n, rate=rate
+    )
 
 
 def launch_flash_fwd(
@@ -496,3 +514,157 @@ def launch_bwd_D(  # noqa: N802 -- D is the paper's name
         output_dtypes=[mx.float32],
     )
     return d_out
+
+
+# ---------------------------------------------------------------------------------------
+# Backward: dQ launcher -- T8. One owner per query row (see source.py's block comment above
+# `_BWD_DQ_TEMPLATE`). dQ rows are DISJOINT across query blocks -- no accumulator chaining --
+# so this reuses the FORWARD's query-range multi-dispatch split machinery (`_check_launch_
+# budget` / `_rows_within_dispatch_budget`, the same watchdog budgets), differing only in the
+# per-row MAC cost (3*D vs the forward's 2*D: a QK dot + a dO.V dot + a dq accumulate per key)
+# and the single dQ output. It SPLITS rather than refuses; `LaunchBudgetError` is raised only
+# when even one minimal range (or the whole dQ pass's total) over-budgets.
+#
+# The BACKWARD-specific calibrated rate is NOT wired here: T8 accepts `rate_macs_per_s=None`
+# (single dispatch, the tiny-shape/test path) or a caller-passed rate; the calibrated-rate
+# wiring into api.py lands with T9. Calibration must never run inside the compiled backward
+# (a host-synced probe there breaks compile / dumps ~1s of probe dispatches into every step).
+# ---------------------------------------------------------------------------------------
+
+_BWD_DQ_THREADGROUP = 32   # one thread per query row; 32 (SIMD width) groups them for occupancy
+
+
+def _bwd_dq_macs_per_row(*, n: int, d: int, b: int, hq: int) -> int:
+    """Conservative per-query-row MAC upper bound for dQ: each of the n keys costs a QK dot
+    (D), a dO.V dot (D), and a dq accumulate (D) == 3*D MACs, across every (batch, q-head).
+    Over-counts causal (a row near the top loops fewer keys), the safe direction for a
+    launch-budget guard -- over-estimating cost splits MORE, never under-budgets."""
+    return 3 * d * n * b * hq
+
+
+def _validate_bwd_dq_shapes(
+    q: mx.array, k: mx.array, v: mx.array, d_o: mx.array,
+    lse: mx.array, d_arr: mx.array,
+) -> None:
+    """Raise `AttentionInputError` on a rank/shape/dtype mismatch at the dQ boundary, before
+    any Metal kernel is built. q/k/v/dO are 4-D (B,H,N,D); lse/D are 3-D (B,Hq,N); dO shares
+    q's shape; k/v share Hkv with Hq a multiple of it; N/D match across q/k/v; and q/k/v/dO
+    share one dtype (the kernel templates a single `T` and reads k/v/dO through it)."""
+    for name, arr in (("q", q), ("k", k), ("v", v), ("dO", d_o)):
+        if arr.ndim != 4:
+            raise AttentionInputError(
+                f"{name} must be 4-D (B, H, N, D); got shape {arr.shape}"
+            )
+    for name, arr in (("lse", lse), ("D", d_arr)):
+        if arr.ndim != 3:
+            raise AttentionInputError(
+                f"{name} must be 3-D (B, Hq, N); got shape {arr.shape}"
+            )
+    b, hq, n, d = q.shape
+    if not (k.shape[0] == v.shape[0] == d_o.shape[0] == b):
+        raise AttentionInputError(
+            f"batch mismatch: q={b}, k={k.shape[0]}, v={v.shape[0]}, dO={d_o.shape[0]}"
+        )
+    hkv = k.shape[1]
+    if v.shape[1] != hkv:
+        raise AttentionInputError(
+            f"k/v head-count mismatch: k has {hkv} heads, v has {v.shape[1]}"
+        )
+    if hq % hkv != 0:
+        raise AttentionInputError(f"Hq={hq} must be a multiple of Hkv={hkv} for GQA grouping")
+    if d_o.shape != q.shape:
+        raise AttentionInputError(f"dO/q shape mismatch: dO={d_o.shape}, q={q.shape}")
+    if not (k.shape[2] == v.shape[2] == n):
+        raise AttentionInputError(
+            f"sequence length mismatch: q={n}, k={k.shape[2]}, v={v.shape[2]}"
+        )
+    if not (k.shape[3] == v.shape[3] == d):
+        raise AttentionInputError(
+            f"head_dim mismatch: q={d}, k={k.shape[3]}, v={v.shape[3]}"
+        )
+    if lse.shape != (b, hq, n) or d_arr.shape != (b, hq, n):
+        raise AttentionInputError(
+            f"lse/D must be (B={b}, Hq={hq}, N={n}); got lse={lse.shape}, D={d_arr.shape}"
+        )
+    if len({q.dtype, k.dtype, v.dtype, d_o.dtype}) != 1:
+        raise AttentionInputError(
+            f"q/k/v/dO must share a dtype; got q={q.dtype}, k={k.dtype}, "
+            f"v={v.dtype}, dO={d_o.dtype}"
+        )
+
+
+@functools.cache
+def _bwd_dq_kernel(head_dim: int, causal: bool, flip_causal: bool) -> _MetalKernel:
+    """Build (and cache) the dQ kernel for a given (head_dim, causal, flip_causal).
+    `flip_causal` is TEST-ONLY (see `build_bwd_dq_source`); it stays part of the cache key so
+    a perturbed and a correct kernel at the same (head_dim, causal) never collide."""
+    kernel = mx.fast.metal_kernel(
+        name=(
+            f"mtp_flash_bwd_dq_d{head_dim}_"
+            f"{'c' if causal else 'f'}{'x' if flip_causal else ''}"
+        ),
+        input_names=["q", "k", "v", "d_o", "lse", "d_arr", "qoffs", "scale_in"],
+        output_names=["dq_out"],
+        source=build_bwd_dq_source(head_dim, causal=causal, flip_causal=flip_causal),
+    )
+    return cast(_MetalKernel, kernel)
+
+
+def _dispatch_bwd_dq_range(
+    kernel: _MetalKernel, q: mx.array, k: mx.array, v: mx.array, d_o: mx.array,
+    lse: mx.array, d_arr: mx.array, scale_in: mx.array, *, r0: int, r1: int,
+) -> mx.array:
+    """One dQ dispatch covering query rows [r0, r1) of the full problem -- one thread per
+    query row (grid.x == rows), writing this range's own tile-local (b, hq, rows, d) dQ chunk.
+    Full q/k/v/dO/L/D buffers + an in-kernel `qoffs` row offset (never a Python-side slice)."""
+    b, hq, _, d = q.shape
+    rows_this = r1 - r0
+    qoffs = mx.array([r0, r1], dtype=mx.uint32)
+    (dq_c,) = kernel(
+        inputs=[q, k, v, d_o, lse, d_arr, qoffs, scale_in],
+        template=[("T", q.dtype)],
+        grid=(rows_this, b * hq, 1),
+        threadgroup=(min(_BWD_DQ_THREADGROUP, rows_this), 1, 1),
+        output_shapes=[(b, hq, rows_this, d)],
+        output_dtypes=[q.dtype],
+    )
+    return dq_c
+
+
+def launch_bwd_dq(
+    q: mx.array, k: mx.array, v: mx.array, d_o: mx.array,
+    lse: mx.array, d_arr: mx.array, *,
+    scale: float, causal: bool, rate_macs_per_s: float | None = None,
+    _flip_causal: bool = False,
+) -> mx.array:
+    """dQ backward -> the query gradient, with q's shape/dtype. Consumes the forward's saved
+    L (`lse`, fp32 (B, Hq, N)) and T7's D (`d_arr`, fp32 (B, Hq, N)); recomputes S/P from
+    q/k and accumulates `dQ_i += scale*P*(dP - D)*k` in fp32 per causally-allowed key.
+
+    `rate_macs_per_s`: when None, a single dispatch over all rows with no budget check (safe
+    only at small N -- the tiny-shape/test path); when given, the launcher sizes the query-row
+    split from it and refuses (`LaunchBudgetError`) if even one minimal range or the total
+    over-budgets. dQ rows are disjoint across query blocks, so the reassembly (a plain
+    `mx.concatenate` over the row axis) needs no accumulator chaining.
+
+    `_flip_causal` is TEST-ONLY (wrong-triangle causal-skip perturbation -- see source.py)."""
+    _validate_bwd_dq_shapes(q, k, v, d_o, lse, d_arr)
+    b, hq, n, d = q.shape
+    if rate_macs_per_s is None:
+        rows_per = n
+    else:
+        per_row = _bwd_dq_macs_per_row(n=n, d=d, b=b, hq=hq)
+        rows_per = _rows_within_dispatch_budget(per_row=per_row, n=n, rate=rate_macs_per_s)
+        _check_launch_budget(per_row=per_row, n=n, rows=rows_per, rate=rate_macs_per_s)
+
+    kernel = _bwd_dq_kernel(d, causal, _flip_causal)
+    scale_in = mx.array([scale], dtype=mx.float32)
+    dq_chunks: list[mx.array] = []
+    for r0 in range(0, n, rows_per):
+        r1 = min(r0 + rows_per, n)
+        dq_chunks.append(
+            _dispatch_bwd_dq_range(
+                kernel, q, k, v, d_o, lse, d_arr, scale_in, r0=r0, r1=r1,
+            )
+        )
+    return mx.concatenate(dq_chunks, axis=2)
