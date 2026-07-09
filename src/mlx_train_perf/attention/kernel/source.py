@@ -160,13 +160,21 @@ def build_fwd_source(head_dim: int, *, causal: bool = True, flip_causal: bool = 
 #   (mirror of GEMM-B's W_sub load). Each lane's two C_o thread_elements both live at matrix
 #   row 8*rt+fm, so the online-softmax rescale multiplies them by that row's `alpha[rt]` in
 #   place (NOT a simdgroup matmul -- a per-thread-element scale, the P-formation access pattern).
-# - D-SLABBING (the register-budget lever): a full C_o[4][HEAD_DIM/8] is 64 tiles at d=128 ==
-#   128 fp32/lane, and with the 16 live P tiles (32 fp32/lane) that is deep in the spill zone
-#   (user-metal-kernels: 32 C-tiles = 64 fp32/lane collapse; the ~32-fp32/lane accumulator
-#   optimum is family-independent). So the D dimension is SLABBED: the D-slab is the OUTER loop
-#   and the KV loop the INNER, with C_o holding only D_SLAB columns at a time. Live simdgroup
-#   state during GEMM-B = 16 P tiles + RT*(D_SLAB/8) C_o tiles; D_SLAB is chosen from the
-#   regpressure ceilings so this stays under the ~128-GPR budget (see `_FWD_MMA_D_SLAB`).
+# - D-SLABBING (a register-budget KNOB whose measured winner defied the spill arithmetic):
+#   a full C_o[4][HEAD_DIM/8] is 64 tiles at d=128 == 128 fp32/lane — nominally deep in the
+#   spill zone by the ~32-fp32/lane accumulator heuristic. THE MEASUREMENT SAYS OTHERWISE:
+#   at saturation (N=8192 flagship, rung 2b, `_artifacts/attention_fwd_rungs/rung2b_dslab*
+#   .json`) the FULL-D single-pass d_slab=128 is the fastest (1462.7 G MAC/s, +57% over
+#   slab-32, +7.5% over slab-64) — fewer QK^T recompute passes beat the predicted spill
+#   cost, and the compiled-ceiling probe was non-discriminating (flat 384 at every width).
+#   The spill heuristic OVER-predicts for simdgroup accumulators at saturation
+#   (user-metal-kernels workflow-and-gotchas — the rung-2b entry). So: the dispatch table
+#   ships d_slab=128 for the MEASURED head_dim=128 saturation bucket, while `_FWD_MMA_D_SLAB
+#   = 32` below stays only as the register-SAFE DEFAULT for the UNMEASURED head dims
+#   (64/96) — it is NOT the optimum; sweep at saturation before tuning any new head dim.
+#   Mechanics: the D-slab is the OUTER loop and the KV loop the INNER, with C_o holding
+#   D_SLAB columns at a time; live simdgroup state during GEMM-B = 16 P tiles +
+#   RT*(D_SLAB/8) C_o tiles.
 #   BOUNDING C_o forces RECOMPUTING the QK^T + softmax per slab (re-reading K): the OUTER-slab
 #   structure means the score block is regenerated for each slab pass (m/l are deterministic
 #   and recomputed identically). This was chosen over "stage P to threadgroup and re-load per
@@ -191,13 +199,13 @@ def build_fwd_source(head_dim: int, *, causal: bool = True, flip_causal: bool = 
 # braces), and `D_SLAB_TILES` is substituted BEFORE `D_SLAB` (the longer token first, so the
 # shared prefix does not corrupt it) -- the 0.1.0 convention.
 
-# D-slab width for the register-resident C_o accumulator, chosen from the regpressure ceilings
-# (tests/test_devtools.py, mlx 0.32.0 / M1 Max) at the ~128-GPR budget: C_o holds RT*(D_SLAB/8)
-# simdgroup tiles (2 fp32/lane each) live SIMULTANEOUSLY with the 16 QK/P tiles (32 fp32/lane)
-# during GEMM-B. A single value divides all supported head dims {64,96,128} (their GCD is 32),
-# keeps the compiled ceiling in the healthy MMA class at every head dim, and bounds the QK^T
-# recompute to HEAD_DIM/D_SLAB passes. See the ceiling test for the measured per-slab-width
-# comparison that justifies this pick.
+# Default D-slab width — the register-SAFE fallback for UNMEASURED head dims (64/96), NOT
+# the measured optimum. At the measured head_dim=128 saturation bucket the dispatch table
+# overrides to d_slab=128 (single pass), which beat this default by 57% at rung 2b — the
+# spill arithmetic that motivated 32 OVER-predicts simdgroup-accumulator cost at saturation
+# (artifacts `_artifacts/attention_fwd_rungs/rung2b_dslab*.json`; user-metal-kernels entry).
+# 32 divides all supported head dims (GCD) and is the conservative starting point for any
+# new head dim's saturation sweep.
 _FWD_MMA_D_SLAB = 32
 
 _FWD_MMA_TEMPLATE = """

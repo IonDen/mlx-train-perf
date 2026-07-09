@@ -215,22 +215,28 @@ def test_backward_dhidden_mma_kernel_ceiling_is_plausible() -> None:
 
 
 @pytest.mark.metal
-@pytest.mark.parametrize("head_dim", [64, 96, 128])
-def test_flash_fwd_mma_ceiling_stays_in_the_mma_class(head_dim: int) -> None:
+@pytest.mark.parametrize(
+    ("head_dim", "d_slab"),
+    [(64, None), (96, None), (128, None), (128, 128)],
+    ids=["hd64-default", "hd96-default", "hd128-default", "hd128-SHIPPED-slab128"],
+)
+def test_flash_fwd_mma_ceiling_stays_in_the_mma_class(head_dim: int, d_slab: int | None) -> None:
     # The 4x4 simdgroup-matrix flash-attention forward (rung 2, register-resident P@V O-path
     # with D-slabbing) shares the v0 scalar body's (q, k, v, qoffs, scale_in) -> (o_out, l_out)
-    # contract, so it probes through the same parameterized path with the shipped _FWD_MMA_D_SLAB.
-    # Rung 2 removed ALL threadgroup memory (register C_o accumulator + simd_shuffle softmax); its
+    # contract, so it probes through the same parameterized path. `None` = the builder's
+    # register-safe DEFAULT slab (32); the (128, 128) case is the FLAGSHIP config the rung-3
+    # dispatch table actually SHIPS at the measured saturation bucket (single-pass full-D C_o)
+    # -- the shipped kernel's own pressure telltale must be pinned, not just the default's.
+    # Rung 2 removed ALL threadgroup memory (register C_o accumulator + simd_shuffle softmax);
     # live per-lane state is the 16 QK/P tiles (32 fp32/lane) plus the RT*(D_SLAB/8) C_o tiles.
-    # MEASURED (mlx 0.32.0, M1 Max): head_dim 64/96/128 -> 384/384/384 at the shipped D_SLAB=32.
-    # A regpressure sweep over slab widths {16,32,48,64,head_dim} read a FLAT 384 at EVERY width
-    # AND every head dim -- maxTotalThreadsPerThreadgroup cannot distinguish "fits" from
-    # "spilled-to-fit" (user-metal-kernels), so the ceiling is non-discriminating here and the
-    # D_SLAB pick rests on the register arithmetic (C_o=16 tiles=32 fp32/lane == the family-
-    # independent accumulator optimum) + head-dim divisibility, not the ceiling. The value is a
-    # register-pressure telltale only, never a rate verdict (module docstring); the rung contract's
-    # bar is "restructure if a config collapses below ~256", and the measured 384 clears it, so
-    # pin >= 256.
+    # MEASURED (mlx 0.32.0, M1 Max): a regpressure sweep over slab widths {16,32,48,64,head_dim}
+    # read a FLAT 384 at EVERY width AND head dim -- maxTotalThreadsPerThreadgroup cannot
+    # distinguish "fits" from "spilled-to-fit" (user-metal-kernels), so the ceiling is
+    # NON-DISCRIMINATING here and the d_slab choice comes from the SATURATION RATE SWEEP
+    # (rung 2b artifacts: slab128 = 1462.7 G, +57% over the default 32 -- the spill arithmetic
+    # over-predicted). The value is a register-pressure telltale only, never a rate verdict
+    # (module docstring); the rung contract's bar is "restructure if a config collapses below
+    # ~256", and the measured 384 clears it, so pin >= 256.
     b, hq, hkv, n = 1, 8, 8, 8
     scale = 1.0 / (head_dim ** 0.5)
     mx.random.seed(2)
@@ -240,13 +246,14 @@ def test_flash_fwd_mma_ceiling_stays_in_the_mma_class(head_dim: int) -> None:
     qoffs = mx.array([0, n], dtype=mx.uint32)
     scale_in = mx.array([scale], dtype=mx.float32)
     mx.eval(q, k, v, qoffs, scale_in)
+    kwargs = {} if d_slab is None else {"d_slab": d_slab}
     ceiling = compiled_ceiling(
-        build_fwd_mma_source(head_dim, causal=True),
+        build_fwd_mma_source(head_dim, causal=True, **kwargs),
         input_names=["q", "k", "v", "qoffs", "scale_in"],
         inputs=[q, k, v, qoffs, scale_in],
         output_names=["o_out", "l_out"],
         output_shapes=[(b, hq, n, head_dim), (b, hq, n)],
         output_dtypes=[mx.bfloat16, mx.float32],
     )
-    print(f"flash fwd MMA head_dim={head_dim} compiled ceiling (observed): {ceiling}")
+    print(f"flash fwd MMA head_dim={head_dim} d_slab={d_slab} ceiling (observed): {ceiling}")
     assert 256 <= ceiling <= 1024

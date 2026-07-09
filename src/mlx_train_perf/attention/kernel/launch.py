@@ -34,18 +34,19 @@ never risks the watchdog. Probe QKV are drawn from a LOCAL `mx.random.key` (neve
 `mx.random.seed`), so calibration never mutates the caller's global RNG stream -- the first
 kernel call can fire inside a user's grad/training run and desync downstream consumers.
 
-T6's KV-block tiling changes the kernel's cache-residency and reuse pattern entirely
-(threadgroup-resident K/V tiles instead of v0's zero-reuse re-stream) -- do not assume v0's
-RATES transfer to the mma body (rung 3's dispatch table treats every mma bucket off the one
-directly-measured saturation shape as PROVISIONAL for exactly this reason, see
-`kernel/dispatch.py`). The cache key IS now variant/d_slab-aware (rung 3: `calibrated_
-fwd_rate`'s `_FWD_RATE_CACHE` key includes `tile.variant`/`tile.d_slab`, and `measure()`
-builds/dispatches the SAME kernel `tile` names -- probe what you rate), so an mma call never
-reads a scalar-measured rate or vice versa. What remains UNVALIDATED is the ramp/canary
-SHAPE itself: the DRAM-vs-cache-resident-probe rationale above was derived from v0's
-zero-cross-row-reuse memory pattern, and the mma body's threadgroup-resident K/V reuse has
-not been separately re-derived -- the ramp mechanics are REUSED for mma calibration, not
-re-justified for it.
+T6's MMA body changes the kernel's cache-residency and reuse pattern entirely
+(register/simdgroup-level K/V reuse within each 32-row query block -- NO threadgroup
+staging; rung 2 removed all threadgroup memory -- versus v0's zero-reuse per-row
+re-stream) -- do not assume v0's RATES transfer to the mma body (rung 3's dispatch table
+treats every mma bucket off the one directly-measured saturation shape as PROVISIONAL for
+exactly this reason, see `kernel/dispatch.py`). The cache key IS now variant/d_slab-aware
+(rung 3: `calibrated_fwd_rate`'s `_FWD_RATE_CACHE` key includes `tile.variant`/
+`tile.d_slab`, and `measure()` builds/dispatches the SAME kernel `tile` names -- probe
+what you rate), so an mma call never reads a scalar-measured rate or vice versa. What
+remains UNVALIDATED is the ramp/canary SHAPE itself: the DRAM-vs-cache-resident-probe
+rationale above was derived from v0's zero-cross-row-reuse memory pattern, and the mma
+body's block-level reuse has not been separately re-derived -- the ramp mechanics are
+REUSED for mma calibration, not re-justified for it.
 """
 import functools
 import math
