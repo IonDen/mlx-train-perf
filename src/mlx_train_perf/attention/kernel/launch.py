@@ -442,9 +442,10 @@ def calibrated_fwd_rate(
 # ---------------------------------------------------------------------------------------
 # Backward: D-preprocess launcher -- T7. See source.py's block comment above
 # `_BWD_D_TEMPLATE` for the full design (one simdgroup per (b, hq, row) triple, no
-# splitting/chaining needed -- this kernel is thousands of times under any per-dispatch
-# budget this project has ever measured, so there is no LaunchBudgetError guard here,
-# unlike the forward's query-range split or the CE kernel's chained vocab tiles).
+# splitting/chaining needed -- MEASURED 0.638 ms/dispatch at the flagship shape, ~780x
+# under the 0.5 s per-dispatch budget (T7 review probe), so there is no LaunchBudgetError
+# guard here, unlike the forward's query-range split or the CE kernel's chained vocab
+# tiles).
 # ---------------------------------------------------------------------------------------
 
 

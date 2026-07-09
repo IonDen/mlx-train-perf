@@ -488,8 +488,9 @@ def build_fwd_mma_source(
 # NO query-range splitting, NO chained-launch accumulator (unlike the CE d_hidden kernel's
 # vocab-tile chain, or the forward's qoffs-split): a row's D depends ONLY on its own
 # (b, hq, row) triple -- fully disjoint output, one dispatch, no LaunchBudgetError guard
-# needed (the whole flagship D is ~34 M MACs total, thousands of times under any per-
-# dispatch budget this project has ever measured).
+# needed (the whole flagship D is ~34 M MACs total; MEASURED 0.638 ms/dispatch at the
+# flagship shape b=1/hq=32/n=8192/d=128 -- ~780x under the 0.5 s per-dispatch budget, and
+# ~149x under it even at the project's slowest-ever measured rate class; T7 review probe).
 #
 # fp32 accumulation throughout regardless of the input template `T` (bf16 or fp32): both
 # dO and O are upcast `(float)` before multiplying, exactly mirroring the pure-MLX
