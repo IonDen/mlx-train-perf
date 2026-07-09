@@ -2,13 +2,18 @@
 
 ## Released
 
-### 0.1.0
+### 0.1.0 - 2026-07-08
 - Fused, logit-free linear-cross-entropy Metal kernel (forward), with a chunked pure-MLX
   fallback and a materialized correctness oracle.
 - Quantized (4-bit group-size-64) head support.
 - mlx-lm training adapter, RAM-fit planner, and benchmark harness.
 
 ## Planned
+
+### Community benchmark contribution kit
+Package the benchmark harness into a one-command contribution flow for Apple-Silicon users
+on other memory sizes. The goal is a provenance-complete artifact that users can submit
+without hand-editing numbers, plus a generated table of community-measured results.
 
 ### Memory-efficient attention backward
 This is the highest-leverage item. The measured bottleneck for long-context training on
