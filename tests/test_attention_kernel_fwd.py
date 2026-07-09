@@ -19,9 +19,15 @@ import pytest
 
 from mlx_train_perf.attention import api
 from mlx_train_perf.attention.api import flash_attention, resolve_attention_impl
+from mlx_train_perf.attention.kernel import launch as fwd_launch
 from mlx_train_perf.attention.kernel.launch import (
+    _PROBE_N_HARD_CAP,
     TileShape,
+    _calibrate_fwd,
     _fwd_macs_per_row,
+    _next_probe_n,
+    _start_probe_n,
+    calibrated_fwd_rate,
     check_fwd_budget,
     launch_flash_fwd,
 )
@@ -101,6 +107,114 @@ def test_check_fwd_budget_refuses_over_total_budget() -> None:
     rate = per_row * 100.0  # 1 row ~ 0.01 s (ok), all 16384 rows ~ 164 s (> 60 s)
     with pytest.raises(LaunchBudgetError):
         check_fwd_budget(n=16384, d=128, b=1, hq=32, rows=1, rate=rate)
+
+
+# ---------------------------------------------------------------------------------------
+# review-round FINDING 1: N-aware forward calibration ramp planner (DEFAULT lane, no GPU).
+# `_start_probe_n` / `_next_probe_n` / `_calibrate_fwd` size the probe key-count instead of
+# the pre-fix fixed `_PROBE_N=128` -- exercised here through FAKE `measure` closures, the
+# same convention tests/test_kernel_launch_calibration.py uses for the CE kernel's ramp.
+# ---------------------------------------------------------------------------------------
+
+
+def test_start_probe_n_measures_a_small_context_directly() -> None:
+    # a real n smaller than the old fixed probe is measured AT n, never padded up to it
+    assert _start_probe_n(16) == 16
+    assert _start_probe_n(61) == 61
+
+
+def test_start_probe_n_floors_at_the_old_fixed_probe_for_a_large_context() -> None:
+    assert _start_probe_n(128) == 128
+    assert _start_probe_n(8192) == 128
+
+
+def test_next_probe_n_caps_at_n_when_n_is_small() -> None:
+    # n=61 < the 128 floor: a generous rate must not push the probe past the real n
+    assert _next_probe_n(rate_macs_per_s=1e18, n=61, d=64, b=1, hq=4) == 61
+
+
+def test_next_probe_n_reaches_n_when_rate_is_generous() -> None:
+    # n=8192 is itself a power of two: a generous rate lets the ramp reach it directly
+    assert _next_probe_n(rate_macs_per_s=1e15, n=8192, d=64, b=1, hq=4) == 8192
+
+
+def test_next_probe_n_never_exceeds_the_hard_cap() -> None:
+    np_ = _next_probe_n(rate_macs_per_s=1e18, n=100_000, d=64, b=1, hq=4)
+    assert np_ <= _PROBE_N_HARD_CAP
+
+
+def test_next_probe_n_shrinks_when_the_full_cap_over_budgets() -> None:
+    # quadratic cost: at n=8192, d=128, b=1, hq=32 the full 8192-key probe projects ~5 s at
+    # this rate -- well over the 1 s budget -- so the sizing heuristic must shrink it.
+    full_cap_macs = _fwd_macs_per_row(n=8192, d=128, b=1, hq=32) * 8192
+    slow_rate = full_cap_macs / 5.0
+    np_ = _next_probe_n(rate_macs_per_s=slow_rate, n=8192, d=128, b=1, hq=32)
+    assert np_ < 8192
+
+
+def test_next_probe_n_is_a_power_of_two_above_the_floor() -> None:
+    for rate in (1e9, 5e10, 1e12, 1e15):
+        np_ = _next_probe_n(rate_macs_per_s=rate, n=8192, d=64, b=1, hq=4)
+        assert np_ & (np_ - 1) == 0
+
+
+def test_calibrate_fwd_ramps_past_the_old_fixed_probe_despite_underestimating_it() -> None:
+    """Finding-1 regression: a 128-key micro-probe reading a rate well below the
+    production-shape rate must not anchor the calibration -- the ramp climbs through
+    intermediate probe sizes and lands its final (median-of-3) measurement at the size a
+    flagship dispatch actually runs at, matching the CE kernel's own false-refusal
+    regression test (test_kernel_launch_calibration.py
+    ::test_calibrate_lands_high_tile_despite_underestimating_micro_probe)."""
+    n, d, b, hq = 8192, 64, 1, 4
+    high_rate = 200e9
+    low_rate = high_rate / 2.7
+    calls: list[int] = []
+
+    def fake_measure(np_: int) -> float:
+        calls.append(np_)
+        rate = low_rate if np_ <= 128 else high_rate
+        macs = _fwd_macs_per_row(n=np_, d=d, b=b, hq=hq) * np_
+        return macs / rate
+
+    result = _calibrate_fwd(measure=fake_measure, n=n, d=d, b=b, hq=hq, start_n=128, max_stages=3)
+
+    assert calls[0] == 128                        # the ramp STARTS at the old fixed probe
+    assert calls[-1] > 128                         # ... but does not STOP there
+    assert result == pytest.approx(high_rate, rel=1e-6)
+
+
+def test_calibrate_fwd_stops_ramping_once_the_probe_stops_growing() -> None:
+    """A kernel whose rate already projects the same (cap-limited) probe size stage over
+    stage must not burn every one of max_stages measuring dispatches -- it converges in
+    the first stage and moves straight to the sustain + median-of-3 phase."""
+    n, d, b, hq = 512, 32, 1, 2
+    calls: list[int] = []
+
+    def fake_measure(np_: int) -> float:
+        calls.append(np_)
+        macs = _fwd_macs_per_row(n=np_, d=d, b=b, hq=hq) * np_
+        return macs / 1e12   # constant rate: the projected probe size never grows
+
+    _calibrate_fwd(measure=fake_measure, n=n, d=d, b=b, hq=hq, start_n=512, max_stages=5)
+
+    per_dispatch_s = (_fwd_macs_per_row(n=512, d=d, b=b, hq=hq) * 512) / 1e12
+    expected_reps = fwd_launch._sustain_reps(per_dispatch_s=per_dispatch_s)
+    assert calls == [512] * (1 + expected_reps + 3)   # 1 ramp stage + sustain + median
+
+
+def test_calibrate_fwd_returns_raw_unhalved_rate() -> None:
+    """The returned rate is the raw measured rate, not SAFETY_FACTOR-halved -- halving is
+    the caller's (calibrated_fwd_rate's) responsibility, applied once to the final
+    result -- matching the CE kernel's own `calibrate` contract."""
+    n, d, b, hq = 8192, 64, 1, 4
+    rate = 4e11
+
+    def fake_measure(np_: int) -> float:
+        macs = _fwd_macs_per_row(n=np_, d=d, b=b, hq=hq) * np_
+        return macs / rate
+
+    result = _calibrate_fwd(measure=fake_measure, n=n, d=d, b=b, hq=hq, start_n=8192, max_stages=1)
+    assert result == pytest.approx(rate, rel=1e-6)
 
 
 # ---------------------------------------------------------------------------------------
@@ -319,3 +433,60 @@ def test_kernel_forward_reference_backward_grads_match_oracle() -> None:
     # convention as test_attention_api.py::test_flash_attention_grads_match_autodiff_oracle).
     assert worst < 2e-5, f"worst |grad diff|={worst}"
     assert api.VJP_CALLS.get("flash_attention", 0) > 0
+
+
+# ---------------------------------------------------------------------------------------
+# review round: calibration-path fixes (Metal integration; the pure ramp-planner logic
+# above already RED/GREEN-covers Finding 1's arithmetic).
+# ---------------------------------------------------------------------------------------
+
+
+@pytest.mark.metal
+def test_calibrated_fwd_rate_ramps_the_probe_past_the_old_fixed_128(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Finding-1 integration regression: before the fix, `calibrated_fwd_rate` measured
+    EVERY call at a fixed 128-key probe, regardless of the caller's real n. Wraps
+    `launch_flash_fwd` to record the key-count of every probe dispatch during a flagship
+    (n=8192) calibration -- the largest recorded probe must exceed the old fixed 128, i.e.
+    the calibration actually ramps toward the caller's real n instead of staying pinned to
+    a cache-resident micro-shape."""
+    monkeypatch.setattr(fwd_launch, "_FWD_RATE_CACHE", {})
+    seen_n: list[int] = []
+    real_launch = fwd_launch.launch_flash_fwd
+
+    def recording_launch(q: mx.array, k: mx.array, v: mx.array, **kwargs: object) -> object:
+        seen_n.append(k.shape[2])
+        return real_launch(q, k, v, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(fwd_launch, "launch_flash_fwd", recording_launch)
+    calibrated_fwd_rate(head_dim=64, dtype=mx.float32, b=1, hq=4, hkv=4, n=8192, causal=True)
+
+    assert max(seen_n) > 128, f"probe never grew past the old fixed 128: {sorted(set(seen_n))}"
+
+
+@pytest.mark.metal
+def test_calibrated_fwd_rate_leaves_the_global_rng_stream_untouched() -> None:
+    """Finding-2 regression: `calibrated_fwd_rate` must not call `mx.random.seed` -- a
+    global-stream mutation would desync any `mx.random` draw a caller makes after the
+    first (uncached) kernel invocation, which can fire mid-training. Seeds the GLOBAL
+    stream, snapshots the draw immediately AFTER an uncached calibration call, and
+    compares it against a CONTROL sequence that never calibrates -- the two must match."""
+    fwd_launch._FWD_RATE_CACHE.clear()
+    mx.random.seed(123)
+    control_before = mx.random.normal((4,))
+    control_after = mx.random.normal((4,))
+    mx.eval(control_before, control_after)
+
+    fwd_launch._FWD_RATE_CACHE.clear()
+    mx.random.seed(123)
+    calibrated = mx.random.normal((4,))  # same draw as control_before, pre-calibration
+    mx.eval(calibrated)
+    calibrated_fwd_rate(head_dim=64, dtype=mx.float32, b=1, hq=4, hkv=4, n=16, causal=True)
+    next_draw = mx.random.normal((4,))   # must match control_after: untouched global stream
+    mx.eval(next_draw)
+
+    assert mx.array_equal(calibrated, control_before).item()
+    assert mx.array_equal(next_draw, control_after).item(), (
+        "calibrated_fwd_rate perturbed the global mx.random stream"
+    )
