@@ -170,16 +170,16 @@ def test_calibrate_fwd_ramps_past_the_old_fixed_probe_despite_underestimating_it
     low_rate = high_rate / 2.7
     calls: list[int] = []
 
-    def fake_measure(np_: int) -> float:
-        calls.append(np_)
-        rate = low_rate if np_ <= 128 else high_rate
-        macs = _fwd_macs_per_row(n=np_, d=d, b=b, hq=hq) * np_
+    def fake_measure(rows: int, keys: int) -> float:
+        calls.append((rows, keys))
+        rate = low_rate if keys <= 128 else high_rate
+        macs = _fwd_macs_per_row(n=keys, d=d, b=b, hq=hq) * rows
         return macs / rate
 
     result = _calibrate_fwd(measure=fake_measure, n=n, d=d, b=b, hq=hq, start_n=128, max_stages=3)
 
-    assert calls[0] == 128                        # the ramp STARTS at the old fixed probe
-    assert calls[-1] > 128                         # ... but does not STOP there
+    assert calls[0] == (128, 128)                  # the ramp STARTS at the old fixed probe
+    assert calls[-1][1] > 128                       # ... but does not STOP there
     assert result == pytest.approx(high_rate, rel=1e-6)
 
 
@@ -188,18 +188,20 @@ def test_calibrate_fwd_stops_ramping_once_the_probe_stops_growing() -> None:
     stage must not burn every one of max_stages measuring dispatches -- it converges in
     the first stage and moves straight to the sustain + median-of-3 phase."""
     n, d, b, hq = 512, 32, 1, 2
-    calls: list[int] = []
+    calls: list[tuple[int, int]] = []
 
-    def fake_measure(np_: int) -> float:
-        calls.append(np_)
-        macs = _fwd_macs_per_row(n=np_, d=d, b=b, hq=hq) * np_
+    def fake_measure(rows: int, keys: int) -> float:
+        calls.append((rows, keys))
+        macs = _fwd_macs_per_row(n=keys, d=d, b=b, hq=hq) * rows
         return macs / 1e12   # constant rate: the projected probe size never grows
 
     _calibrate_fwd(measure=fake_measure, n=n, d=d, b=b, hq=hq, start_n=512, max_stages=5)
 
     per_dispatch_s = (_fwd_macs_per_row(n=512, d=d, b=b, hq=hq) * 512) / 1e12
+    # 1 ramp stage + sustain + median -- and NO canary: the ramp already measured the
+    # full n x n shape, which is harsher than any production range dispatch.
     expected_reps = fwd_launch._sustain_reps(per_dispatch_s=per_dispatch_s)
-    assert calls == [512] * (1 + expected_reps + 3)   # 1 ramp stage + sustain + median
+    assert calls == [(512, 512)] * (1 + expected_reps + 3)
 
 
 def test_calibrate_fwd_returns_raw_unhalved_rate() -> None:
@@ -209,12 +211,75 @@ def test_calibrate_fwd_returns_raw_unhalved_rate() -> None:
     n, d, b, hq = 8192, 64, 1, 4
     rate = 4e11
 
-    def fake_measure(np_: int) -> float:
-        macs = _fwd_macs_per_row(n=np_, d=d, b=b, hq=hq) * np_
+    def fake_measure(rows: int, keys: int) -> float:
+        macs = _fwd_macs_per_row(n=keys, d=d, b=b, hq=hq) * rows
         return macs / rate
 
     result = _calibrate_fwd(measure=fake_measure, n=n, d=d, b=b, hq=hq, start_n=8192, max_stages=1)
     assert result == pytest.approx(rate, rel=1e-6)
+
+
+def test_calibrate_fwd_final_canary_measures_small_rows_against_full_n_keys() -> None:
+    """Interactivity-kill regression (T6 rung 0, macOS 26 / mlx 0.32.0): the ramp's probes
+    size THEIR OWN working set (rows == keys == np_), which stays cache-friendlier than a
+    production dispatch (few rows x ALL n keys x every head) -- the measured kill: a
+    projected-1.0s flagship dispatch sized from the SAFETY-halved ramp rate (106 G MAC/s)
+    still ran long enough for macOS to kill the command buffer
+    (kIOGPUCommandBufferCallbackErrorImpactingInteractivity). The fix: calibration ends
+    with a CANARY -- one small-row-range measurement against FULL-n keys (the true
+    DRAM-bound production working set), and the returned rate derives from the canary
+    alone. Fake rates here make the canary regime 3x slower than the ramp regime; a
+    calibration that anchors on ramp-regime measurements returns ~ramp_rate and fails."""
+    # n ABOVE _PROBE_N_HARD_CAP: the ramp legitimately reaches the cap and stops short of
+    # n, which is exactly the regime the canary exists for (ramp == n skips it by design).
+    n, d, b, hq = 16384, 64, 1, 4
+    ramp_rate = 300e9
+    dram_rate = ramp_rate / 3.0
+    calls: list[tuple[int, int]] = []
+
+    def fake_measure(rows: int, keys: int) -> float:
+        calls.append((rows, keys))
+        rate = dram_rate if keys == n and rows < keys else ramp_rate
+        macs = _fwd_macs_per_row(n=keys, d=d, b=b, hq=hq) * rows
+        return macs / rate
+
+    result = _calibrate_fwd(measure=fake_measure, n=n, d=d, b=b, hq=hq, start_n=128, max_stages=3)
+
+    last_rows, last_keys = calls[-1]
+    assert last_keys == n            # the canary sees the FULL key working set
+    assert last_rows < n             # ... at a small, budget-safe row count
+    assert result == pytest.approx(dram_rate, rel=1e-6)  # rate derives from the canary
+
+
+def test_canary_rows_respects_its_budget() -> None:
+    """Pure arithmetic: the canary row count keeps its projected dispatch inside the canary
+    budget at the SAFETY-halved ramp rate, floors at 1 row, and never exceeds n."""
+    n, d, b, hq = 8192, 128, 1, 32
+    raw_ramp_rate = 212e9
+    rows = fwd_launch._canary_rows(raw_ramp_rate=raw_ramp_rate, n=n, d=d, b=b, hq=hq)
+    per_row = _fwd_macs_per_row(n=n, d=d, b=b, hq=hq)
+    projected_s = rows * per_row / (fwd_launch.SAFETY_FACTOR * raw_ramp_rate)
+    assert 1 <= rows <= n
+    assert projected_s <= fwd_launch._CANARY_BUDGET_S * 1.01
+    # and a rate so low that even one row over-budgets still yields the 1-row floor:
+    assert fwd_launch._canary_rows(raw_ramp_rate=1e6, n=n, d=d, b=b, hq=hq) == 1
+
+
+def test_max_dispatch_budget_is_pinned_to_the_interactivity_kill_evidence() -> None:
+    """Safety pin: macOS killed a command buffer whose projected time was 1.0s at a
+    2x-optimistic rate (~2-4s real) with ErrorImpactingInteractivity -- a SOFTER, earlier
+    kill than the assumed 5-10s GPU watchdog. The CE kernel's shipped dispatches run
+    ~0.5s real and have never been killed (0.1.0 T13: zero watchdog events). 0.5s
+    projected (x SAFETY margin 2 => ~0.25s real) sits in the proven-safe class. Raising
+    this constant requires NEW kill-threshold evidence, not convenience."""
+    assert fwd_launch.MAX_DISPATCH_SECONDS == 0.5
+    # The second half of the same evidence: 35 honest ~0.25s-real dispatches PACKED INTO
+    # ONE EVAL (~8.7s cumulative GPU work) were ALSO killed -- the OS kill is per command
+    # buffer / cumulative, not per dispatch, and MLX packs consecutive custom dispatches.
+    # The CE kernel's ~2.2s evals have never been killed, so ~2s is the proven-safe class
+    # for the TOTAL cap too (a flagship v0 scalar forward now refuses honestly instead of
+    # dying; MMA-class rates fit a full forward well inside it).
+    assert fwd_launch.MAX_TOTAL_SECONDS == 2.0
 
 
 # ---------------------------------------------------------------------------------------
@@ -351,10 +416,11 @@ def test_fwd_split_matches_single_dispatch() -> None:
         q, k, v, scale=scale, causal=True, tile=TileShape(bq=32),
         rate_macs_per_s=GENEROUS_RATE,   # one dispatch over all rows
     )
-    # Force ~32 rows/dispatch (9 disjoint dispatches over n=257) via a low rate; the +0.5
-    # keeps the projected per-dispatch strictly under the 1 s bound.
+    # Force ~80 rows/dispatch (4 disjoint dispatches over n=257) via a low rate, keeping
+    # the projected per-dispatch inside MAX_DISPATCH_SECONDS (0.5 s) AND the projected
+    # total (257/160 = 1.6 s) inside the 2.0 s per-eval cap.
     per_row = _fwd_macs_per_row(n=n, d=d, b=b, hq=hq)
-    split_rate = per_row * 32.5 / 1.0
+    split_rate = per_row * 160.0
     split_o, split_l = launch_flash_fwd(
         q, k, v, scale=scale, causal=True, tile=TileShape(bq=32),
         rate_macs_per_s=split_rate,
@@ -453,13 +519,14 @@ def test_calibrated_fwd_rate_ramps_the_probe_past_the_old_fixed_128(
     a cache-resident micro-shape."""
     monkeypatch.setattr(fwd_launch, "_FWD_RATE_CACHE", {})
     seen_n: list[int] = []
-    real_launch = fwd_launch.launch_flash_fwd
+    real_dispatch = fwd_launch._dispatch_range
 
-    def recording_launch(q: mx.array, k: mx.array, v: mx.array, **kwargs: object) -> object:
-        seen_n.append(k.shape[2])
-        return real_launch(q, k, v, **kwargs)  # type: ignore[arg-type]
+    def recording_dispatch(*args: object, **kwargs: object) -> object:
+        k = args[2]
+        seen_n.append(k.shape[2])  # type: ignore[union-attr]
+        return real_dispatch(*args, **kwargs)  # type: ignore[arg-type]
 
-    monkeypatch.setattr(fwd_launch, "launch_flash_fwd", recording_launch)
+    monkeypatch.setattr(fwd_launch, "_dispatch_range", recording_dispatch)
     calibrated_fwd_rate(head_dim=64, dtype=mx.float32, b=1, hq=4, hkv=4, n=8192, causal=True)
 
     assert max(seen_n) > 128, f"probe never grew past the old fixed 128: {sorted(set(seen_n))}"

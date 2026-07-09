@@ -44,15 +44,31 @@ import statistics
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import cast
+from typing import Any, cast
 
 import mlx.core as mx
 
 from mlx_train_perf.attention.kernel.source import build_fwd_source
 from mlx_train_perf.errors import LaunchBudgetError
 
-MAX_DISPATCH_SECONDS = 1.0
-MAX_TOTAL_SECONDS = 60.0
+# 0.5, NOT 1.0 (T6 rung-0 kill evidence, macOS 26 / mlx 0.32.0): a projected-1.0s flagship
+# dispatch sized from the SAFETY-halved calibrated rate was killed by the OS with
+# kIOGPUCommandBufferCallbackErrorImpactingInteractivity -- a softer, EARLIER kill than the
+# 5-10s GPU watchdog the 1.0s figure assumed. The CE kernel's shipped ~0.5s-real dispatches
+# have never been killed (0.1.0 T13: zero watchdog events), so 0.5s projected (~0.25s real
+# behind the 2x SAFETY margin) sits in the proven-safe class. Raising this needs new
+# kill-threshold evidence.
+MAX_DISPATCH_SECONDS = 0.5
+_CANARY_BUDGET_S = 0.1   # projected cost of the calibration's final full-working-set probe
+# 2.0, NOT 60 (T6 rung-0, second measurement): the OS kill is per COMMAND BUFFER /
+# cumulative eval GPU-time, not per dispatch -- 35 honest ~0.25s-real range dispatches
+# packed into one eval (~8.7s total) were killed even though every dispatch was inside its
+# own budget; MLX packs consecutive custom-kernel dispatches, and Python cannot flush
+# buffers from inside a compiled/traced region. The CE kernel's ~2.2s evals have never
+# been killed, so ~2s is the proven-safe class for one eval's packed custom-kernel work.
+# Consequence: a flagship v0-scalar forward REFUSES honestly (its 8.7s total cannot ship);
+# MMA-class rates fit a full forward far inside this cap.
+MAX_TOTAL_SECONDS = 2.0
 SAFETY_FACTOR = 0.5      # halve the measured rate (session drift + probe noise, 2x margin)
 _PROBE_N_FLOOR = 128     # ramp's minimum/starting probe key-count -- the original fixed
                          # probe shape, small enough to be safe at any plausible v0 rate
@@ -153,19 +169,34 @@ def launch_flash_fwd(
     l_chunks: list[mx.array] = []
     for r0 in range(0, n, rows_per):
         r1 = min(r0 + rows_per, n)
-        rows_this = r1 - r0
-        qoffs = mx.array([r0, r1], dtype=mx.uint32)
-        o_c, l_c = kernel(
-            inputs=[q, k, v, qoffs, scale_in],
-            template=[("T", q.dtype)],
-            grid=(rows_this, b * hq, 1),
-            threadgroup=(min(tile.bq, rows_this), 1, 1),
-            output_shapes=[(b, hq, rows_this, d), (b, hq, rows_this)],
-            output_dtypes=[q.dtype, mx.float32],
+        o_c, l_c = _dispatch_range(
+            kernel, q, k, v, scale_in, r0=r0, r1=r1, tile=tile,
         )
         o_chunks.append(o_c)
         l_chunks.append(l_c)
     return mx.concatenate(o_chunks, axis=2), mx.concatenate(l_chunks, axis=2)
+
+
+def _dispatch_range(
+    kernel: Any, q: mx.array, k: mx.array, v: mx.array, scale_in: mx.array,
+    *, r0: int, r1: int, tile: TileShape,
+) -> tuple[mx.array, mx.array]:
+    """One kernel dispatch covering query rows [r0, r1) of the full problem -- the loop
+    body of `launch_flash_fwd`, extracted so the calibration canary can dispatch exactly
+    one production-shaped range (the LAST rows: under causal masking only high row
+    indices scan the full key working set)."""
+    b, hq, _, d = q.shape
+    rows_this = r1 - r0
+    qoffs = mx.array([r0, r1], dtype=mx.uint32)
+    o_c, l_c = kernel(
+        inputs=[q, k, v, qoffs, scale_in],
+        template=[("T", q.dtype)],
+        grid=(rows_this, b * hq, 1),
+        threadgroup=(min(tile.bq, rows_this), 1, 1),
+        output_shapes=[(b, hq, rows_this, d), (b, hq, rows_this)],
+        output_dtypes=[q.dtype, mx.float32],
+    )
+    return o_c, l_c
 
 
 def _start_probe_n(n: int) -> int:
@@ -219,35 +250,56 @@ def _sustain_reps(*, per_dispatch_s: float, target_s: float = 0.75, cap: int = 8
     return min(max(reps, 1), cap)
 
 
+def _canary_rows(*, raw_ramp_rate: float, n: int, d: int, b: int, hq: int) -> int:
+    """Row count for the calibration's final CANARY probe: the largest query-row range
+    whose dispatch against the FULL n-key working set projects within `_CANARY_BUDGET_S`
+    at the SAFETY-halved ramp rate. Floors at 1 (a 1-row full-n dispatch is the smallest
+    measurable production-shaped unit); never exceeds n."""
+    per_row = _fwd_macs_per_row(n=n, d=d, b=b, hq=hq)
+    rows = int(_CANARY_BUDGET_S * SAFETY_FACTOR * raw_ramp_rate / per_row)
+    return max(1, min(n, rows))
+
+
 def _calibrate_fwd(
-    *, measure: Callable[[int], float], n: int, d: int, b: int, hq: int,
+    *, measure: Callable[[int, int], float], n: int, d: int, b: int, hq: int,
     start_n: int, max_stages: int = 3,
 ) -> float:
     """Ramp through probe key-counts under real (or, in unit tests, fake) dispatch
     timings, mirroring `core/kernel/launch.calibrate`'s ramp/sustain/median shape exactly
     (see that function's docstring) -- adapted to THIS kernel's quadratic-in-probe-size
-    cost model via `_next_probe_n` in place of `next_probe_tile`. Each stage times one
-    dispatch at the current probe size and projects a SAFETY_FACTOR-conservative next size
-    from that stage's own rate, advancing only while the projection keeps growing; a
-    caller whose real n is already small converges in one stage. The final size then gets
-    extra sustained dispatches (`_sustain_reps`) to reach ramped GPU clocks, and the
-    reported rate is the MEDIAN of 3 timed dispatches at that size -- a single sample is
-    exactly the un-ramped, occupancy/cache-starved measurement this function exists to
-    avoid. Returns the raw (un-halved) rate -- the caller applies SAFETY_FACTOR."""
+    cost model via `_next_probe_n` in place of `next_probe_tile`. `measure(rows, keys)`
+    times one dispatch of `rows` query rows against `keys` keys; ramp stages are
+    self-shaped (rows == keys == np_). The final ramp size gets sustained dispatches
+    (`_sustain_reps`) to reach ramped GPU clocks and a median-of-3 measurement -- and then
+    the rate is re-derived from a CANARY: a small-row-range dispatch against the FULL
+    n-key working set. The ramp's self-shaped probes under-populate the production
+    working set (few rows x ALL keys x every head is DRAM-bound where a self-probe still
+    partly fits cache), and the measured consequence of trusting them was a
+    macOS-interactivity-killed command buffer at flagship shape (T6 rung 0) -- so the
+    returned rate comes from the canary, the only probe that sees production conditions.
+    Skipped only when the ramp already measured the full n x n shape (harsher than any
+    range dispatch). Returns the raw (un-halved) rate -- the caller applies SAFETY_FACTOR.
+    T6's KV-block tiling changes the cost model: re-validate both budgets then."""
     np_ = start_n
     per_dispatch_s = 0.0
     for _stage in range(max_stages):
-        per_dispatch_s = measure(np_)
+        per_dispatch_s = measure(np_, np_)
         raw_rate = _fwd_macs_per_row(n=np_, d=d, b=b, hq=hq) * np_ / max(per_dispatch_s, 1e-9)
         candidate = _next_probe_n(rate_macs_per_s=SAFETY_FACTOR * raw_rate, n=n, d=d, b=b, hq=hq)
         if candidate <= np_:
             break
         np_ = candidate
     for _rep in range(_sustain_reps(per_dispatch_s=per_dispatch_s)):
-        measure(np_)
-    timings = [measure(np_) for _ in range(3)]
+        measure(np_, np_)
+    timings = [measure(np_, np_) for _ in range(3)]
     median_s = statistics.median(timings)
-    return _fwd_macs_per_row(n=np_, d=d, b=b, hq=hq) * np_ / max(median_s, 1e-9)
+    ramp_rate = _fwd_macs_per_row(n=np_, d=d, b=b, hq=hq) * np_ / max(median_s, 1e-9)
+    if np_ >= n:
+        return ramp_rate
+    rows = _canary_rows(raw_ramp_rate=ramp_rate, n=n, d=d, b=b, hq=hq)
+    canary_timings = [measure(rows, n) for _ in range(3)]
+    canary_median = statistics.median(canary_timings)
+    return _fwd_macs_per_row(n=n, d=d, b=b, hq=hq) * rows / max(canary_median, 1e-9)
 
 
 def calibrated_fwd_rate(
@@ -267,23 +319,34 @@ def calibrated_fwd_rate(
 
     key_q, key_k, key_v = mx.random.split(mx.random.key(0), 3)
     scale = 1.0 / (head_dim ** 0.5)
-    probes: dict[int, tuple[mx.array, mx.array, mx.array]] = {}
+    probes: dict[tuple[int, int], tuple[mx.array, mx.array, mx.array]] = {}
 
-    def measure(np_: int) -> float:
-        if np_ not in probes:
-            q = mx.random.normal((b, hq, np_, head_dim), key=key_q).astype(dtype)
-            kk = mx.random.normal((b, hkv, np_, head_dim), key=key_k).astype(dtype)
-            vv = mx.random.normal((b, hkv, np_, head_dim), key=key_v).astype(dtype)
+    kernel = _fwd_kernel(head_dim, causal, False)
+    scale_in = mx.array([scale], dtype=mx.float32)
+
+    def measure(rows: int, keys: int) -> float:
+        # Dispatches query rows [keys-rows, keys) against a full `keys`-key working set --
+        # under causal masking only HIGH row indices scan every key, so the canary (rows <
+        # keys) must be the LAST range, exactly the production tail dispatch. Self-shaped
+        # ramp probes (rows == keys) reduce to the full [0, keys) dispatch.
+        if (rows, keys) not in probes:
+            q = mx.random.normal((b, hq, keys, head_dim), key=key_q).astype(dtype)
+            kk = mx.random.normal((b, hkv, keys, head_dim), key=key_k).astype(dtype)
+            vv = mx.random.normal((b, hkv, keys, head_dim), key=key_v).astype(dtype)
             mx.eval(q, kk, vv)
-            probes[np_] = (q, kk, vv)
+            probes[(rows, keys)] = (q, kk, vv)
             # Metal JIT compiles on the first dispatch at a new probe shape, and GPU
             # clocks/caches are cold -- this dispatch is deliberately unmeasured (mirrors
             # core/kernel/launch.calibrated_rate's per-tile warmup).
-            o, lse = launch_flash_fwd(q, kk, vv, scale=scale, causal=causal, tile=TileShape())
+            o, lse = _dispatch_range(
+                kernel, q, kk, vv, scale_in, r0=keys - rows, r1=keys, tile=TileShape(),
+            )
             mx.eval(o, lse)
-        q, kk, vv = probes[np_]
+        q, kk, vv = probes[(rows, keys)]
         t0 = time.perf_counter()
-        o, lse = launch_flash_fwd(q, kk, vv, scale=scale, causal=causal, tile=TileShape())
+        o, lse = _dispatch_range(
+            kernel, q, kk, vv, scale_in, r0=keys - rows, r1=keys, tile=TileShape(),
+        )
         mx.eval(o, lse)
         return time.perf_counter() - t0
 
