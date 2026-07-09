@@ -469,3 +469,71 @@ def build_fwd_mma_source(
         .replace("KV_LIMIT", kv_limit)
         .replace("KEEP_CMP", keep)
     )
+
+
+# ---------------------------------------------------------------------------------------
+# Backward: D-preprocess kernel -- T7. `D_i = sum_d dO_i,d * O_i,d`, the flash-attention
+# paper's row-correction term for `dS` (spec Section 4.2.2). Small and independently
+# tested on purpose: a wrong D silently corrupts EVERY downstream gradient (dQ/dK/dV,
+# T8/T9) while forward parity still passes -- see tests/test_attention_kernel_bwd.py's
+# module docstring.
+#
+# ONE SIMDGROUP (32 lanes) PER (batch, q_head, row) TRIPLE -- the CE backward's proven
+# `simd_sum` reduction idiom (`core/kernel/source.py::build_backward_dhidden_source`),
+# specialized to a single elementwise-then-reduce pass instead of that kernel's
+# per-vocab-column GEMM-dot: each lane strides over `HEAD_DIM` at stride 32, accumulating
+# a partial `dO[i]*O[i]` sum in an fp32 register, then `simd_sum` collapses the 32 partials
+# into the row's D value in one instruction, written by lane 0.
+#
+# NO query-range splitting, NO chained-launch accumulator (unlike the CE d_hidden kernel's
+# vocab-tile chain, or the forward's qoffs-split): a row's D depends ONLY on its own
+# (b, hq, row) triple -- fully disjoint output, one dispatch, no LaunchBudgetError guard
+# needed (the whole flagship D is ~34 M MACs total, thousands of times under any per-
+# dispatch budget this project has ever measured).
+#
+# fp32 accumulation throughout regardless of the input template `T` (bf16 or fp32): both
+# dO and O are upcast `(float)` before multiplying, exactly mirroring the pure-MLX
+# reference's `.astype(mx.float32)` -- so bf16 rounding is common-mode to both sides, not
+# doubled. D is written as a FIXED fp32 output, never cast down to `T` (matching the
+# forward kernel's L convention: the residual that seeds the backward stays fp32 always).
+#
+# `drop_product` is TEST-ONLY (mirrors the forward kernel's `flip_causal`): it replaces
+# the product's second factor with a constant `1.0f`, so the generated body computes
+# rowsum(dO) instead of rowsum(dO*O) -- the deliberate wrong-value perturbation that
+# proves the parity suite can detect a real D bug. Never used by production code.
+_BWD_D_TEMPLATE = """
+    uint lane = thread_position_in_threadgroup.x;   // 0..31 == simd lane
+    uint row = thread_position_in_grid.y;            // 0..n-1 (absolute query row)
+    uint bh = thread_position_in_grid.z;              // 0..(b*hq)-1
+    uint n = d_o_shape[2];
+
+    size_t base = ((size_t)bh * n + row) * HEAD_DIM;
+    float part = 0.0f;
+    for (uint i = lane; i < HEAD_DIM; i += 32) {
+        part += (float)d_o[base + i] * PROD_FACTOR;
+    }
+    float d_val = metal::simd_sum(part);
+    if (lane == 0) {
+        d_out[(size_t)bh * n + row] = d_val;
+    }
+"""
+
+
+def build_bwd_D_source(head_dim: int, *, drop_product: bool = False) -> str:  # noqa: N802 -- D is the paper's name
+    """MSL function body for the D-preprocess backward kernel (`D = rowsum(dO * O)`).
+
+    `head_dim` in {64, 96, 128} (the kernel's supported head dims) is baked in as a
+    compile-time constant, same contract as the forward's `build_fwd_source`.
+    `drop_product` is TEST-ONLY -- it replaces the elementwise product's second factor
+    with `1.0f`, so a parity run against the correct rowsum FAILS (see the module-level
+    block comment above)."""
+    if head_dim not in _KERNEL_HEAD_DIMS:
+        raise ValueError(
+            f"head_dim must be one of {_KERNEL_HEAD_DIMS}, got {head_dim}"
+        )
+    prod_factor = "1.0f" if drop_product else "(float)o[base + i]"
+    return (
+        _BWD_D_TEMPLATE.replace("HEAD_DIM", str(head_dim)).replace(
+            "PROD_FACTOR", prod_factor
+        )
+    )

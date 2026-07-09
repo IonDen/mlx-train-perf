@@ -58,8 +58,12 @@ from typing import Any, cast
 
 import mlx.core as mx
 
-from mlx_train_perf.attention.kernel.source import build_fwd_mma_source, build_fwd_source
-from mlx_train_perf.errors import LaunchBudgetError
+from mlx_train_perf.attention.kernel.source import (
+    build_bwd_D_source,
+    build_fwd_mma_source,
+    build_fwd_source,
+)
+from mlx_train_perf.errors import AttentionInputError, LaunchBudgetError
 
 # 0.5, NOT 1.0 (T6 rung-0 kill evidence, macOS 26 / mlx 0.32.0): a projected-1.0s flagship
 # dispatch sized from the SAFETY-halved calibrated rate was killed by the OS with
@@ -433,3 +437,61 @@ def calibrated_fwd_rate(
     rate = SAFETY_FACTOR * raw_rate
     _FWD_RATE_CACHE[key] = rate
     return rate
+
+
+# ---------------------------------------------------------------------------------------
+# Backward: D-preprocess launcher -- T7. See source.py's block comment above
+# `_BWD_D_TEMPLATE` for the full design (one simdgroup per (b, hq, row) triple, no
+# splitting/chaining needed -- this kernel is thousands of times under any per-dispatch
+# budget this project has ever measured, so there is no LaunchBudgetError guard here,
+# unlike the forward's query-range split or the CE kernel's chained vocab tiles).
+# ---------------------------------------------------------------------------------------
+
+
+def _validate_bwd_D_shapes(d_o: mx.array, o: mx.array) -> None:  # noqa: N802 -- D is the paper's name
+    for name, arr in (("dO", d_o), ("O", o)):
+        if arr.ndim != 4:
+            raise AttentionInputError(
+                f"{name} must be 4-D (B, Hq, N, D); got shape {arr.shape}"
+            )
+    if d_o.shape != o.shape:
+        raise AttentionInputError(f"dO/O shape mismatch: dO={d_o.shape}, O={o.shape}")
+
+
+@functools.cache
+def _bwd_d_kernel(head_dim: int, drop_product: bool) -> _MetalKernel:
+    """Build (and cache) the D-preprocess kernel for a given (head_dim, drop_product).
+    `drop_product` is TEST-ONLY (see `build_bwd_D_source`'s docstring); it stays part of
+    the cache key so a perturbed and a correct kernel at the same head_dim never collide."""
+    kernel = mx.fast.metal_kernel(
+        name=f"mtp_bwd_D_d{head_dim}" + ("_dropx" if drop_product else ""),
+        input_names=["d_o", "o"],
+        output_names=["d_out"],
+        source=build_bwd_D_source(head_dim, drop_product=drop_product),
+    )
+    return cast(_MetalKernel, kernel)
+
+
+def launch_bwd_D(  # noqa: N802 -- D is the paper's name
+    d_o: mx.array, o: mx.array, *, _drop_product: bool = False,
+) -> mx.array:
+    """`D (B, Hq, N)` fp32 = rowsum(dO * O) -- the flash-attention paper's row-correction
+    term for `dS`. `dO`/`O` are both `(B, Hq, N, D)`, bf16 or fp32 (matched by the `T`
+    template, taken from `d_o.dtype`); `head_dim` (`d_o.shape[-1]`) must be one of
+    `build_bwd_D_source`'s supported {64, 96, 128}. Raises `AttentionInputError` on a
+    rank or shape mismatch between `dO` and `O`.
+
+    `_drop_product` is TEST-ONLY (wrong-value perturbation -- see source.py's
+    `build_bwd_D_source`). Never used by production code."""
+    _validate_bwd_D_shapes(d_o, o)
+    b, hq, n, d = d_o.shape
+    kernel = _bwd_d_kernel(d, _drop_product)
+    (d_out,) = kernel(
+        inputs=[d_o, o],
+        template=[("T", d_o.dtype)],
+        grid=(32, n, b * hq),
+        threadgroup=(32, 1, 1),
+        output_shapes=[(b, hq, n)],
+        output_dtypes=[mx.float32],
+    )
+    return d_out
