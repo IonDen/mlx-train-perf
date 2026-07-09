@@ -3,6 +3,7 @@ import builtins
 import mlx.core as mx
 import pytest
 
+from mlx_train_perf.attention.kernel.source import build_fwd_mma_source
 from mlx_train_perf.core.kernel.source import (
     QUANT_HELPERS,
     build_backward_dhidden_mma_source,
@@ -211,3 +212,38 @@ def test_backward_dhidden_mma_kernel_ceiling_is_plausible() -> None:
     )
     print(f"backward d_hidden MMA RT=4 compiled ceiling (observed): {ceiling}")
     assert 0 < ceiling <= 1024
+
+
+@pytest.mark.metal
+@pytest.mark.parametrize("head_dim", [64, 96, 128])
+def test_flash_fwd_mma_ceiling_stays_in_the_mma_class(head_dim: int) -> None:
+    # The 4x4 simdgroup-matrix flash-attention forward (rung 1) shares the v0 scalar body's
+    # (q, k, v, qoffs, scale_in) -> (o_out, l_out) contract, so it probes through the same
+    # parameterized path. Unlike the v0 SCALAR body -- whose per-lane qreg[HEAD_DIM]/acc[HEAD_DIM]
+    # arrays SPILL at head_dim 128 and INVERT the ceiling to 1024 (user-metal-kernels
+    # spill-inversion entry; v0 measured 384/384/1024 for 64/96/128) -- the mma body keeps S and
+    # O in THREADGROUP memory, so its only large per-lane state is the 4x4 C-tile set (32 fp32/
+    # lane). MEASURED (mlx 0.32.0, M1 Max): head_dim 64 -> 576, 96 -> 384, 128 -> 384 -- all in
+    # the healthy mma class with NO spill and NO inversion (the d=128 case, which inverted the
+    # scalar body to 1024, sits at a normal 384 here). The value is a register-pressure telltale
+    # only, never a rate verdict (module docstring); the rung contract's bar is "restructure if a
+    # config collapses below ~256", and the measured floor (384) clears it, so pin >= 256.
+    b, hq, hkv, n = 1, 8, 8, 8
+    scale = 1.0 / (head_dim ** 0.5)
+    mx.random.seed(2)
+    q = mx.random.normal((b, hq, n, head_dim)).astype(mx.bfloat16)
+    k = mx.random.normal((b, hkv, n, head_dim)).astype(mx.bfloat16)
+    v = mx.random.normal((b, hkv, n, head_dim)).astype(mx.bfloat16)
+    qoffs = mx.array([0, n], dtype=mx.uint32)
+    scale_in = mx.array([scale], dtype=mx.float32)
+    mx.eval(q, k, v, qoffs, scale_in)
+    ceiling = compiled_ceiling(
+        build_fwd_mma_source(head_dim, causal=True),
+        input_names=["q", "k", "v", "qoffs", "scale_in"],
+        inputs=[q, k, v, qoffs, scale_in],
+        output_names=["o_out", "l_out"],
+        output_shapes=[(b, hq, n, head_dim), (b, hq, n)],
+        output_dtypes=[mx.bfloat16, mx.float32],
+    )
+    print(f"flash fwd MMA head_dim={head_dim} compiled ceiling (observed): {ceiling}")
+    assert 256 <= ceiling <= 1024

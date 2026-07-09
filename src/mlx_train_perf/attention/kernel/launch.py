@@ -48,7 +48,7 @@ from typing import Any, cast
 
 import mlx.core as mx
 
-from mlx_train_perf.attention.kernel.source import build_fwd_source
+from mlx_train_perf.attention.kernel.source import build_fwd_mma_source, build_fwd_source
 from mlx_train_perf.errors import LaunchBudgetError
 
 # 0.5, NOT 1.0 (T6 rung-0 kill evidence, macOS 26 / mlx 0.32.0): a projected-1.0s flagship
@@ -86,11 +86,17 @@ _MetalKernel = Callable[..., list[mx.array]]
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class TileShape:
-    """v0 kernel tiling: `bq` = query rows per threadgroup (the x threadgroup dimension).
-    v0 is one-thread-per-query-row, so `bq` sets only occupancy grouping, not the math;
-    T6 introduces the KV-block tile and simdgroup_matrix dimensions."""
+    """Forward-kernel tiling + variant selector.
+
+    `variant` picks the kernel body: `"scalar"` (the v0 one-thread-per-query-row body,
+    default -- unchanged behaviour) or `"mma"` (the rung-1 4x4 simdgroup-matrix body, one
+    32-row query block per threadgroup). `bq` is the scalar body's query-rows-per-threadgroup
+    occupancy grouping (no effect on the mma body, whose threadgroup is a fixed 32-lane
+    simdgroup); the mma body's KV-block and simdgroup-matrix dimensions are baked into its
+    source, not carried here."""
 
     bq: int = 32
+    variant: str = "scalar"
 
 
 def _n_bucket(n: int) -> int:
@@ -121,12 +127,27 @@ def check_fwd_budget(*, n: int, d: int, b: int, hq: int, rows: int, rate: float)
 
 
 @functools.cache
-def _fwd_kernel(head_dim: int, causal: bool, flip_causal: bool) -> _MetalKernel:
+def _fwd_kernel(
+    head_dim: int, causal: bool, flip_causal: bool, variant: str
+) -> _MetalKernel:
+    """Build (and cache) the forward kernel for a given (head_dim, causal, flip, variant).
+    `variant="scalar"` uses the v0 one-thread-per-row body; `"mma"` uses the rung-1 4x4
+    simdgroup-matrix body. Both share the same (q,k,v,qoffs,scale_in)->(o_out,l_out)
+    contract, so `_dispatch_range` swaps only the grid/threadgroup shape between them."""
+    if variant == "mma":
+        source = build_fwd_mma_source(head_dim, causal=causal, flip_causal=flip_causal)
+    elif variant == "scalar":
+        source = build_fwd_source(head_dim, causal=causal, flip_causal=flip_causal)
+    else:
+        raise ValueError(f"unknown forward kernel variant {variant!r}")
     kernel = mx.fast.metal_kernel(
-        name=f"mtp_flash_fwd_d{head_dim}_{'c' if causal else 'f'}{'x' if flip_causal else ''}",
+        name=(
+            f"mtp_flash_fwd_{variant}_d{head_dim}_"
+            f"{'c' if causal else 'f'}{'x' if flip_causal else ''}"
+        ),
         input_names=["q", "k", "v", "qoffs", "scale_in"],
         output_names=["o_out", "l_out"],
-        source=build_fwd_source(head_dim, causal=causal, flip_causal=flip_causal),
+        source=source,
     )
     return cast(_MetalKernel, kernel)
 
@@ -163,7 +184,7 @@ def launch_flash_fwd(
         rows_per = _rows_per_dispatch(n=n, d=d, b=b, hq=hq, rate=rate_macs_per_s)
         check_fwd_budget(n=n, d=d, b=b, hq=hq, rows=rows_per, rate=rate_macs_per_s)
 
-    kernel = _fwd_kernel(d, causal, _flip_causal)
+    kernel = _fwd_kernel(d, causal, _flip_causal, tile.variant)
     scale_in = mx.array([scale], dtype=mx.float32)
     o_chunks: list[mx.array] = []
     l_chunks: list[mx.array] = []
@@ -184,15 +205,28 @@ def _dispatch_range(
     """One kernel dispatch covering query rows [r0, r1) of the full problem -- the loop
     body of `launch_flash_fwd`, extracted so the calibration canary can dispatch exactly
     one production-shaped range (the LAST rows: under causal masking only high row
-    indices scan the full key working set)."""
+    indices scan the full key working set).
+
+    The two variants differ ONLY in the launch shape: `"scalar"` runs one thread per query
+    row (grid.x == rows), while `"mma"` runs one 32-lane simdgroup per 32-row query block
+    (grid.x == ceil(rows/32)*32, threadgroup.x == 32). Output shapes/dtypes and the full
+    qoffs/buffer contract are identical, so the reassembly in `launch_flash_fwd` is
+    variant-agnostic."""
     b, hq, _, d = q.shape
     rows_this = r1 - r0
     qoffs = mx.array([r0, r1], dtype=mx.uint32)
+    if tile.variant == "mma":
+        num_blocks = (rows_this + 31) // 32              # one 32-row query block per simdgroup
+        grid = (num_blocks * 32, b * hq, 1)
+        threadgroup = (32, 1, 1)
+    else:
+        grid = (rows_this, b * hq, 1)
+        threadgroup = (min(tile.bq, rows_this), 1, 1)
     o_c, l_c = kernel(
         inputs=[q, k, v, qoffs, scale_in],
         template=[("T", q.dtype)],
-        grid=(rows_this, b * hq, 1),
-        threadgroup=(min(tile.bq, rows_this), 1, 1),
+        grid=grid,
+        threadgroup=threadgroup,
         output_shapes=[(b, hq, rows_this, d), (b, hq, rows_this)],
         output_dtypes=[q.dtype, mx.float32],
     )
@@ -321,7 +355,7 @@ def calibrated_fwd_rate(
     scale = 1.0 / (head_dim ** 0.5)
     probes: dict[tuple[int, int], tuple[mx.array, mx.array, mx.array]] = {}
 
-    kernel = _fwd_kernel(head_dim, causal, False)
+    kernel = _fwd_kernel(head_dim, causal, False, "scalar")
     scale_in = mx.array([scale], dtype=mx.float32)
 
     def measure(rows: int, keys: int) -> float:

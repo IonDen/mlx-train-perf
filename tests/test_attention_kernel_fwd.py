@@ -31,7 +31,7 @@ from mlx_train_perf.attention.kernel.launch import (
     check_fwd_budget,
     launch_flash_fwd,
 )
-from mlx_train_perf.attention.kernel.source import build_fwd_source
+from mlx_train_perf.attention.kernel.source import build_fwd_mma_source, build_fwd_source
 from mlx_train_perf.attention.reference import (
     flash_attention_reference,
     kv_head_for,
@@ -86,6 +86,56 @@ def test_build_fwd_source_rejects_bad_head_dim() -> None:
 def test_build_fwd_source_rejects_flip_without_causal() -> None:
     with pytest.raises(ValueError, match="flip_causal"):
         build_fwd_source(64, causal=False, flip_causal=True)
+
+
+# ---------------------------------------------------------------------------------------
+# Rung 1: 4x4 simdgroup-matrix (MMA) forward source templating (DEFAULT lane, no GPU).
+# ---------------------------------------------------------------------------------------
+
+
+def test_build_fwd_mma_source_substitutes_head_dim() -> None:
+    for hd in (64, 96, 128):
+        s = build_fwd_mma_source(hd, causal=True)
+        assert f"o_acc[32 * {hd}]" in s          # threadgroup O accumulator sized by head_dim
+        assert f"dd < {hd}" in s                  # the D-wide loops are baked to head_dim
+        assert "HEAD_DIM" not in s                # every sentinel substituted (lossless)
+        assert "KEEP_CMP" not in s
+        assert "KV_LIMIT" not in s
+
+
+def test_build_fwd_mma_source_causal_keep_and_loop_bound() -> None:
+    s = build_fwd_mma_source(64, causal=True)
+    assert "kk <= row" in s
+    assert "kk >= row" not in s
+    # causal KV-block loop bound: blocks fully above the diagonal are never entered
+    assert "metal::min(n, r0 + block_base + 32u)" in s
+
+
+def test_build_fwd_mma_source_noncausal_keeps_all_keys_and_scans_all() -> None:
+    s = build_fwd_mma_source(64, causal=False)
+    assert "kk <= row" not in s
+    assert "kk >= row" not in s
+    assert "(kk < kb1) && (true)" in s            # boundary check kept, causal predicate open
+    assert "uint kv_limit = n;" in s              # non-causal scans every KV block
+
+
+def test_build_fwd_mma_source_flip_causal_inverts_the_comparison() -> None:
+    # The test-only wrong-mask arm: the causal predicate is flipped to the WRONG triangle
+    # (the KV-block loop bound stays causal -- at the tiny flip-test N it covers all keys).
+    s = build_fwd_mma_source(64, causal=True, flip_causal=True)
+    assert "kk >= row" in s
+    assert "kk <= row" not in s
+
+
+def test_build_fwd_mma_source_rejects_bad_head_dim() -> None:
+    for hd in (0, 32, 80, 256):
+        with pytest.raises(ValueError, match="head_dim"):
+            build_fwd_mma_source(hd, causal=True)
+
+
+def test_build_fwd_mma_source_rejects_flip_without_causal() -> None:
+    with pytest.raises(ValueError, match="flip_causal"):
+        build_fwd_mma_source(64, causal=False, flip_causal=True)
 
 
 def test_check_fwd_budget_passes_a_cheap_dispatch() -> None:
@@ -293,7 +343,9 @@ _HEAD_N_CASES = [
     (32, 8, 64),                            # flagship group_size-4 pattern
 ]
 
-# Measured worsts over the whole grid (mlx 0.32.0, M1 Max, seed=7):
+# Measured worsts over the whole grid, PER VARIANT (mlx 0.32.0, M1 Max, seed=7).
+#
+# scalar (the 0.2.0-T5 v0 body -- pins UNCHANGED):
 #   O vs math_attention / vs sdpa: fp32 9.537e-07, bf16 7.812e-03
 #   L vs reference (always fp32):  fp32 9.537e-07, bf16 1.431e-06
 # The kernel accumulates fp32 in-register for both input dtypes, so fp32 O/L diffs are pure
@@ -303,8 +355,21 @@ _HEAD_N_CASES = [
 # Pins are the smallest honest bound over THIS grid (fp32 ~2.1x, bf16 O ~1.5x margin, same
 # measure-first convention as tests/test_kernel_parity.py). A future case landing between a
 # pin and 2 bf16 ULP is not a regression -- widen toward 2 ULP with a note.
-_TOL_O = {mx.float32: 2e-6, mx.bfloat16: 1.2e-2}
-_TOL_L = {mx.float32: 2e-6, mx.bfloat16: 5e-6}
+#
+# mma (rung-1 4x4 simdgroup-matrix body): the score reduction reassociates (fp32 MMA over
+# the head dim + block-level online softmax vs scalar's per-key recurrence). MEASURED worsts
+# over THIS grid (mlx 0.32.0, M1 Max, seed=7): O fp32 9.537e-07, O bf16 7.812e-03, L fp32
+# 9.537e-07, L bf16 9.537e-07 -- the reassociation lands in the SAME ~1e-6 fp32 / one-bf16-ULP
+# class as scalar (L bf16 is actually tighter than scalar's 1.431e-06). So the honest mma pins
+# equal the scalar pins here -- measured separately per the rung contract, NOT widened.
+_TOL_O = {
+    "scalar": {mx.float32: 2e-6, mx.bfloat16: 1.2e-2},
+    "mma": {mx.float32: 2e-6, mx.bfloat16: 1.2e-2},
+}
+_TOL_L = {
+    "scalar": {mx.float32: 2e-6, mx.bfloat16: 5e-6},
+    "mma": {mx.float32: 2e-6, mx.bfloat16: 5e-6},
+}
 
 
 def _rand_qkv(
@@ -319,18 +384,19 @@ def _rand_qkv(
 
 
 @pytest.mark.metal
+@pytest.mark.parametrize("variant", ["scalar", "mma"])
 @pytest.mark.parametrize(("hq", "hkv", "n"), _HEAD_N_CASES)
 @pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize("batch", [1, 2])
 @pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16], ids=["fp32", "bf16"])
 def test_fwd_parity_vs_both_oracles_and_reference_lse(
-    hq: int, hkv: int, n: int, head_dim: int, batch: int, dtype: mx.Dtype
+    hq: int, hkv: int, n: int, head_dim: int, batch: int, dtype: mx.Dtype, variant: str
 ) -> None:
     scale = 1.0 / math.sqrt(head_dim)
     q, k, v = _rand_qkv(b=batch, hq=hq, hkv=hkv, n=n, d=head_dim, dtype=dtype)
 
     o_k, l_k = launch_flash_fwd(
-        q, k, v, scale=scale, causal=True, tile=TileShape(bq=32),
+        q, k, v, scale=scale, causal=True, tile=TileShape(bq=32, variant=variant),
         rate_macs_per_s=GENEROUS_RATE,
     )
     o_math = math_attention(q, k, v, scale=scale, causal=True)
@@ -344,13 +410,13 @@ def test_fwd_parity_vs_both_oracles_and_reference_lse(
     d_sdpa = mx.abs(o_k.astype(f) - o_sdpa.astype(f)).max().item()
     d_l = mx.abs(l_k - l_ref).max().item()
     print(
-        f"[{['fp32','bf16'][dtype==mx.bfloat16]} b{batch} {hq}/{hkv} n{n} d{head_dim}] "
-        f"O-math={d_math:.3e} O-sdpa={d_sdpa:.3e} L={d_l:.3e}"
+        f"[{variant} {['fp32','bf16'][dtype==mx.bfloat16]} b{batch} {hq}/{hkv} n{n} "
+        f"d{head_dim}] O-math={d_math:.3e} O-sdpa={d_sdpa:.3e} L={d_l:.3e}"
     )
 
-    assert d_math < _TOL_O[dtype], f"O vs math {d_math}"
-    assert d_sdpa < _TOL_O[dtype], f"O vs sdpa {d_sdpa}"
-    assert d_l < _TOL_L[dtype], f"L vs reference {d_l}"
+    assert d_math < _TOL_O[variant][dtype], f"O vs math {d_math}"
+    assert d_sdpa < _TOL_O[variant][dtype], f"O vs sdpa {d_sdpa}"
+    assert d_l < _TOL_L[variant][dtype], f"L vs reference {d_l}"
 
 
 def _reference_o_l(
@@ -360,14 +426,15 @@ def _reference_o_l(
 
 
 @pytest.mark.metal
-def test_fwd_row0_attends_only_itself() -> None:
+@pytest.mark.parametrize("variant", ["scalar", "mma"])
+def test_fwd_row0_attends_only_itself(variant: str) -> None:
     """Causal row 0 attends only key 0: O[.,.,0]==V[.,kv,0], L[.,.,0]==scale*(q0.k0)."""
     b, hq, hkv, n, d = 2, 4, 2, 8, 64
     scale = 1.0 / math.sqrt(d)
     q, k, v = _rand_qkv(b=b, hq=hq, hkv=hkv, n=n, d=d, dtype=mx.float32, seed=1)
 
     o_k, l_k = launch_flash_fwd(
-        q, k, v, scale=scale, causal=True, tile=TileShape(bq=32),
+        q, k, v, scale=scale, causal=True, tile=TileShape(bq=32, variant=variant),
         rate_macs_per_s=GENEROUS_RATE,
     )
     group = hq // hkv
@@ -384,18 +451,20 @@ def test_fwd_row0_attends_only_itself() -> None:
 
 
 @pytest.mark.metal
-def test_fwd_bitwise_deterministic_across_runs() -> None:
-    """No atomics by design -> bit-identical O and L across repeated runs. Lock it."""
+@pytest.mark.parametrize("variant", ["scalar", "mma"])
+def test_fwd_bitwise_deterministic_across_runs(variant: str) -> None:
+    """No atomics by design (mma stages S/O in threadgroup memory, each lane owning
+    disjoint rows/cols) -> bit-identical O and L across repeated runs. Lock it."""
     q, k, v = _rand_qkv(b=2, hq=4, hkv=2, n=129, d=64, dtype=mx.float32, seed=2)
     scale = 1.0 / math.sqrt(64)
     o0, l0 = launch_flash_fwd(
-        q, k, v, scale=scale, causal=True, tile=TileShape(bq=32),
+        q, k, v, scale=scale, causal=True, tile=TileShape(bq=32, variant=variant),
         rate_macs_per_s=GENEROUS_RATE,
     )
     mx.eval(o0, l0)
     for _ in range(4):
         o, lse = launch_flash_fwd(
-            q, k, v, scale=scale, causal=True, tile=TileShape(bq=32),
+            q, k, v, scale=scale, causal=True, tile=TileShape(bq=32, variant=variant),
             rate_macs_per_s=GENEROUS_RATE,
         )
         mx.eval(o, lse)
@@ -404,16 +473,19 @@ def test_fwd_bitwise_deterministic_across_runs() -> None:
 
 
 @pytest.mark.metal
-def test_fwd_split_matches_single_dispatch() -> None:
+@pytest.mark.parametrize("variant", ["scalar", "mma"])
+def test_fwd_split_matches_single_dispatch(variant: str) -> None:
     """Query-range multi-dispatch writes DISJOINT O/L rows; the reassembled result must
     be bit-identical to a single dispatch. This is the outer-grid offset guard (a wrong
-    r0 offset corrupts a chunk) -- run at batch>1 and an N that is not a block multiple."""
+    r0 offset corrupts a chunk) -- run at batch>1 and an N that is not a block multiple.
+    For mma, a dispatch boundary that is not 32-aligned (~80 rows) exercises per-row
+    independence: a row's O/L depend only on its own absolute position, never its block."""
     b, hq, hkv, n, d = 2, 4, 2, 257, 64
     scale = 1.0 / math.sqrt(d)
     q, k, v = _rand_qkv(b=b, hq=hq, hkv=hkv, n=n, d=d, dtype=mx.float32, seed=3)
 
     single_o, single_l = launch_flash_fwd(
-        q, k, v, scale=scale, causal=True, tile=TileShape(bq=32),
+        q, k, v, scale=scale, causal=True, tile=TileShape(bq=32, variant=variant),
         rate_macs_per_s=GENEROUS_RATE,   # one dispatch over all rows
     )
     # Force ~80 rows/dispatch (4 disjoint dispatches over n=257) via a low rate, keeping
@@ -422,7 +494,7 @@ def test_fwd_split_matches_single_dispatch() -> None:
     per_row = _fwd_macs_per_row(n=n, d=d, b=b, hq=hq)
     split_rate = per_row * 160.0
     split_o, split_l = launch_flash_fwd(
-        q, k, v, scale=scale, causal=True, tile=TileShape(bq=32),
+        q, k, v, scale=scale, causal=True, tile=TileShape(bq=32, variant=variant),
         rate_macs_per_s=split_rate,
     )
     mx.eval(single_o, single_l, split_o, split_l)
@@ -431,16 +503,19 @@ def test_fwd_split_matches_single_dispatch() -> None:
 
 
 @pytest.mark.metal
-def test_fwd_wrong_mask_perturbation_fails_parity() -> None:
+@pytest.mark.parametrize("variant", ["scalar", "mma"])
+def test_fwd_wrong_mask_perturbation_fails_parity(variant: str) -> None:
     """Deliberate wrong-mask: build the kernel with the causal comparison flipped to the
     WRONG triangle. Its O/L must DIVERGE from the causal reference -- if this ever matched,
-    the parity tests above could not detect a real mask bug (the suite would be unfalsifiable)."""
+    the parity tests above could not detect a real mask bug (the suite would be
+    unfalsifiable). For mma the flip perturbs the in-tile KEEP_CMP predicate; the diagonal
+    block is masked before the row max, so a flipped predicate genuinely changes the output."""
     b, hq, hkv, n, d = 2, 4, 2, 16, 64
     scale = 1.0 / math.sqrt(d)
     q, k, v = _rand_qkv(b=b, hq=hq, hkv=hkv, n=n, d=d, dtype=mx.float32, seed=4)
 
     o_wrong, l_wrong = launch_flash_fwd(
-        q, k, v, scale=scale, causal=True, tile=TileShape(bq=32),
+        q, k, v, scale=scale, causal=True, tile=TileShape(bq=32, variant=variant),
         rate_macs_per_s=GENEROUS_RATE, _flip_causal=True,
     )
     o_ref, l_ref = _reference_o_l(q, k, v, scale=scale)
