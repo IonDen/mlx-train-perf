@@ -1,6 +1,9 @@
 from mlx_train_perf.errors import UnverifiedMlxError
 
-VERIFIED_MLX_VERSIONS: frozenset[str] = frozenset({"0.31.2"})
+# 0.31.2: the 0.1.0 release contract. 0.32.0: re-verified 2026-07-09 (0.2.0 T1 — full
+# metal lane + parity pins + regpressure ceilings on M1 Max; entry is added ONLY after
+# that ritual passes on a new version, never by range wording).
+VERIFIED_MLX_VERSIONS: frozenset[str] = frozenset({"0.31.2", "0.32.0"})
 
 
 def _installed_mlx_version() -> str:

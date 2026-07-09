@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
 authors = [{ name = "Denis Ineshin", email = "denis.ineshin@gmail.com" }]
-dependencies = ["mlx>=0.31.2"]
+dependencies = ["mlx>=0.32.0,<0.33"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Programming Language :: Python :: 3.11",
@@ -63,6 +63,7 @@ dev = [
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+extend-exclude = ["typings"]  # vendored mlx.core stubs (see [tool.mypy] note) -- not ours to lint
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "N", "UP", "B", "A", "C4", "PT", "RET", "SIM", "ARG", "PTH", "PL", "RUF"]
@@ -77,10 +78,21 @@ ignore = ["PLR0913", "PLR2004"]
 [tool.mypy]
 strict = true
 python_version = "3.12"
+# mlx 0.32.0's wheel ships py.typed but NO .pyi for the compiled mlx.core (0.31.2 had a
+# full stub package; the 0.32.0 mlx/mlx-metal split dropped it). typings/ vendors the
+# 0.31.2 core stubs verbatim so `mx.*` stays fully attribute-checked under --strict.
+# Delete typings/ the moment an mlx release ships core stubs again (re-check per bump).
+mypy_path = "typings"
 
 [[tool.mypy.overrides]]
 module = ["mlx_lm.*", "Metal"]
 ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# The vendored 0.31.2 stubs are not strict-clean AS FILES (upstream wrote them loose);
+# suppress errors INSIDE them while still consuming them to check src/ call sites.
+module = ["mlx.core", "mlx.core.*"]
+ignore_errors = true
 
 [[tool.mypy.overrides]]
 module = ["numpy", "numpy.*"]

@@ -1,11 +1,27 @@
 import pytest
 
-from mlx_train_perf._compat import VERIFIED_MLX_VERSIONS, check_mlx_verified
+from mlx_train_perf._compat import (
+    VERIFIED_MLX_VERSIONS,
+    _installed_mlx_version,
+    check_mlx_verified,
+)
 from mlx_train_perf.errors import MlxTrainPerfError, UnverifiedMlxError
 
 
 def test_verified_list_contains_the_spike_version() -> None:
     assert "0.31.2" in VERIFIED_MLX_VERSIONS
+
+
+def test_verified_list_contains_the_0_2_0_bump_version() -> None:
+    """0.2.0 T1: mlx 0.32.0 joins the allowlist ONLY after the full 0.1.0 kernel-contract
+    re-verification (metal lane + parity pins + regpressure ceilings) passes on it."""
+    assert "0.32.0" in VERIFIED_MLX_VERSIONS
+
+
+def test_installed_mlx_is_verified() -> None:
+    """The dev environment must always run a kernel-verified mlx — a bump without the
+    re-verification ritual (and allowlist entry) fails here before anything else does."""
+    assert _installed_mlx_version() in VERIFIED_MLX_VERSIONS
 
 
 def test_current_mlx_passes_when_listed(monkeypatch: pytest.MonkeyPatch) -> None:
