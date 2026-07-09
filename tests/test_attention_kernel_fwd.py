@@ -13,6 +13,7 @@ Tolerances are measured-first: the per-case worst is printed, and the committed 
 the smallest honest value over the grid (see the pin comments).
 """
 import math
+from typing import cast
 
 import mlx.core as mx
 import pytest
@@ -20,6 +21,7 @@ import pytest
 from mlx_train_perf.attention import api
 from mlx_train_perf.attention.api import flash_attention, resolve_attention_impl
 from mlx_train_perf.attention.kernel import launch as fwd_launch
+from mlx_train_perf.attention.kernel.dispatch import select_fwd_tile
 from mlx_train_perf.attention.kernel.launch import (
     _PROBE_N_HARD_CAP,
     TileShape,
@@ -638,7 +640,10 @@ def test_calibrated_fwd_rate_ramps_the_probe_past_the_old_fixed_128(
         return real_dispatch(*args, **kwargs)  # type: ignore[arg-type]
 
     monkeypatch.setattr(fwd_launch, "_dispatch_range", recording_dispatch)
-    calibrated_fwd_rate(head_dim=64, dtype=mx.float32, b=1, hq=4, hkv=4, n=8192, causal=True)
+    calibrated_fwd_rate(
+        head_dim=64, dtype=mx.float32, b=1, hq=4, hkv=4, n=8192, causal=True,
+        tile=TileShape(),
+    )
 
     assert max(seen_n) > 128, f"probe never grew past the old fixed 128: {sorted(set(seen_n))}"
 
@@ -660,11 +665,148 @@ def test_calibrated_fwd_rate_leaves_the_global_rng_stream_untouched() -> None:
     mx.random.seed(123)
     calibrated = mx.random.normal((4,))  # same draw as control_before, pre-calibration
     mx.eval(calibrated)
-    calibrated_fwd_rate(head_dim=64, dtype=mx.float32, b=1, hq=4, hkv=4, n=16, causal=True)
+    calibrated_fwd_rate(
+        head_dim=64, dtype=mx.float32, b=1, hq=4, hkv=4, n=16, causal=True,
+        tile=TileShape(),
+    )
     next_draw = mx.random.normal((4,))   # must match control_after: untouched global stream
     mx.eval(next_draw)
 
     assert mx.array_equal(calibrated, control_before).item()
     assert mx.array_equal(next_draw, control_after).item(), (
         "calibrated_fwd_rate perturbed the global mx.random stream"
+    )
+
+
+# ---------------------------------------------------------------------------------------
+# T6 rung 3: dispatch-table wiring -- `d_slab` cache-key threading, calibration probing the
+# SELECTED variant (not a hardcoded scalar), and the api-level dispatch-table integration.
+# ---------------------------------------------------------------------------------------
+
+
+def test_fwd_kernel_cache_key_separates_by_d_slab(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`_fwd_kernel`'s cache key must include `d_slab`: two mma kernels built at the same
+    (head_dim, causal, flip_causal) but different `d_slab` are DIFFERENT compiled sources
+    (different D_SLAB/D_SLAB_TILES baked in) and must never collapse onto one cache entry.
+    Monkeypatches `mx.fast.metal_kernel` itself (the real GPU-touching constructor) so this
+    stays in the DEFAULT lane -- only `_fwd_kernel`'s own caching/source-building logic is
+    under test, not the Metal JIT. Explicitly clears/restores `_fwd_kernel`'s module-level
+    `functools.cache` so this never leaks fake kernel objects into a later `--run-metal` test
+    reusing the same (head_dim, causal, flip_causal, variant, d_slab) key."""
+    fwd_launch._fwd_kernel.cache_clear()
+    built: list[str] = []  # compiled source per REAL build (cache misses only)
+
+    def fake_metal_kernel(
+        *, name: str, input_names: list[str], output_names: list[str], source: str,  # noqa: ARG001
+    ) -> object:
+        built.append(source)
+        return object()
+
+    monkeypatch.setattr(mx.fast, "metal_kernel", fake_metal_kernel)
+    try:
+        k_slab128 = fwd_launch._fwd_kernel(128, True, False, "mma", 128)
+        k_slab64 = fwd_launch._fwd_kernel(128, True, False, "mma", 64)
+        k_slab128_again = fwd_launch._fwd_kernel(128, True, False, "mma", 128)
+
+        assert k_slab128 is not k_slab64
+        assert k_slab128 is k_slab128_again          # same key -> cache hit, no rebuild
+        assert len(built) == 2                        # only 2 REAL builds happened
+        assert built[0] != built[1]                    # the two sources actually differ
+        assert "C_o[4][16]" in built[0]                 # 128 / 8 col-tiles
+        assert "C_o[4][8]" in built[1]                  # 64 / 8 col-tiles
+    finally:
+        fwd_launch._fwd_kernel.cache_clear()
+
+
+def test_calibrated_fwd_rate_probes_the_selected_variant_and_d_slab(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Finding (T6 rung 3): before this fix, `calibrated_fwd_rate`'s `measure()` always built
+    the SCALAR kernel regardless of the caller's `tile` -- rating the scalar kernel while the
+    launcher dispatches mma sizes the query-row split from the WRONG rate. Spies on
+    `_fwd_kernel` (the kernel-construction seam) with a fake that fabricates zero-cost output
+    arrays instead of touching Metal, so this stays in the DEFAULT lane, and asserts the
+    recorded (variant, d_slab) matches the `tile` passed in -- probe what you rate."""
+    monkeypatch.setattr(fwd_launch, "_FWD_RATE_CACHE", {})
+    calls: list[tuple[str, int | None]] = []
+
+    def fake_kernel(
+        *, inputs: list[mx.array], template: list[tuple[str, mx.Dtype]],  # noqa: ARG001
+        grid: tuple[int, int, int], threadgroup: tuple[int, int, int],  # noqa: ARG001
+        output_shapes: list[tuple[int, ...]], output_dtypes: list[mx.Dtype],
+    ) -> list[mx.array]:
+        return [
+            mx.zeros(shape, dtype=dtype)
+            for shape, dtype in zip(output_shapes, output_dtypes, strict=True)
+        ]
+
+    def fake_fwd_kernel(
+        head_dim: int, causal: bool, flip_causal: bool, variant: str,  # noqa: ARG001
+        d_slab: int | None,
+    ) -> object:
+        calls.append((variant, d_slab))
+        return fake_kernel
+
+    monkeypatch.setattr(fwd_launch, "_fwd_kernel", fake_fwd_kernel)
+    tile = TileShape(variant="mma", d_slab=64)
+    fwd_launch.calibrated_fwd_rate(
+        head_dim=64, dtype=mx.float32, b=1, hq=4, hkv=4, n=256, causal=True, tile=tile,
+    )
+
+    assert calls == [("mma", 64)], (
+        f"calibration built {calls}, but the caller selected variant='mma' d_slab=64 -- "
+        "measure() must probe the SAME kernel the launcher will dispatch"
+    )
+
+
+@pytest.mark.metal
+def test_flash_attention_kernel_path_uses_the_dispatch_table_selection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T6 rung 3: `api.py`'s kernel path must call `select_fwd_tile(n, head_dim)` instead of
+    a hardcoded `TileShape()` -- spies on `launch_flash_fwd` (the seam `api.py` calls into)
+    to record the ACTUAL tile the api passed, and checks it against the table's own
+    selection for this shape. Pre-fix this reads `TileShape()` (scalar) regardless of shape;
+    post-fix it must equal `select_fwd_tile`'s own answer."""
+    b, hq, hkv, n, d = 1, 4, 2, 61, 64
+    scale = 1.0 / math.sqrt(d)
+    q, k, v = _rand_qkv(b=b, hq=hq, hkv=hkv, n=n, d=d, dtype=mx.float32, seed=22)
+
+    seen_tiles: list[TileShape] = []
+    real_launch = api.launch_flash_fwd
+
+    def recording_launch(*args: object, **kwargs: object) -> object:
+        seen_tiles.append(cast(TileShape, kwargs["tile"]))
+        return real_launch(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(api, "launch_flash_fwd", recording_launch)
+    flash_attention(q, k, v, scale=scale, causal=True, impl="kernel")
+
+    assert seen_tiles == [select_fwd_tile(n, d)]
+
+
+@pytest.mark.metal
+@pytest.mark.parametrize(("hq", "hkv", "n"), [(4, 4, 61), (4, 2, 257), (32, 8, 64)])
+@pytest.mark.parametrize("head_dim", [64, 96, 128])
+def test_impl_kernel_matches_oracle_through_dispatch_table_selection(
+    hq: int, hkv: int, n: int, head_dim: int,
+) -> None:
+    """impl='kernel' at small production-shaped configs now routes through
+    `select_fwd_tile` (T6 rung 3) instead of a hardcoded scalar `TileShape()`. Looks up the
+    ACTUAL table selection for this shape so the test tracks whatever the table picks (mma
+    or scalar, measured or provisional) rather than assuming one variant, and confirms it
+    still produces a correct forward -- the dispatch-table wiring changing WHICH kernel runs
+    must not change correctness."""
+    selected = select_fwd_tile(n, head_dim)
+    scale = 1.0 / math.sqrt(head_dim)
+    q, k, v = _rand_qkv(b=1, hq=hq, hkv=hkv, n=n, d=head_dim, dtype=mx.float32, seed=23)
+
+    o_kernel = flash_attention(q, k, v, scale=scale, causal=True, impl="kernel")
+    o_math = math_attention(q, k, v, scale=scale, causal=True)
+    mx.eval(o_kernel, o_math)
+
+    diff = mx.abs(o_kernel.astype(mx.float32) - o_math.astype(mx.float32)).max().item()
+    assert diff < _TOL_O[selected.variant][mx.float32], (
+        f"[{selected.variant} d_slab={selected.d_slab} provisional={selected.provisional}] "
+        f"head_dim={head_dim} n={n}: O diff {diff}"
     )
