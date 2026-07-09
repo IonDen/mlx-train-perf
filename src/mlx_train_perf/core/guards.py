@@ -2,10 +2,19 @@
 clean MLX OOM instead of a kernel panic (unified memory; wired pages can't swap)."""
 import mlx.core as mx
 
+# Device-proportional growth above the 32 GB-class reference (0019): the fixed wired_gb
+# ceiling was tuned for THIS project's 32 GB baseline (the M1 Max reports ~24.96 GiB, just
+# UNDER the reference, so every machine the 0.1.0 evidence was measured on gets
+# byte-identical caps by construction). Above the reference the caps grow with 85%/92% of
+# the excess working set — a 512 GB Ultra can measure big shapes while always keeping
+# real headroom below dev_max (clean MLX OOM, never a wired-memory kernel panic).
+_PROPORTIONAL_REF_BYTES = 25 * 1024**3
+
 
 def clamped_caps(dev_max: int, *, wired_gb: int = 20, soft_gb: int = 22) -> tuple[int, int]:
-    wired = min(wired_gb * 1024**3, int(0.85 * dev_max))
-    soft = min(soft_gb * 1024**3, int(0.92 * dev_max))
+    excess = max(0, dev_max - _PROPORTIONAL_REF_BYTES)
+    wired = min(wired_gb * 1024**3 + int(0.85 * excess), int(0.85 * dev_max))
+    soft = min(soft_gb * 1024**3 + int(0.92 * excess), int(0.92 * dev_max))
     if wired >= dev_max:  # pragma: no cover — arithmetic guarantee, kept as a tripwire
         raise AssertionError(f"wired cap {wired} >= device max {dev_max}")
     return wired, soft
