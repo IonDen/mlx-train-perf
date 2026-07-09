@@ -22,6 +22,7 @@ from typing import Literal, cast
 import mlx.core as mx
 
 from mlx_train_perf._compat import check_mlx_verified
+from mlx_train_perf.attention.kernel.dispatch import select_fwd_tile
 from mlx_train_perf.attention.kernel.launch import (
     TileShape,
     calibrated_fwd_rate,
@@ -181,21 +182,26 @@ def flash_attention(
     resolved = resolve_attention_impl(q, k, v, impl=impl, causal=causal)
 
     if resolved == "kernel":
-        # Calibrate the query-split rate OUTSIDE the custom_function (host-sync timing is
-        # compile-hostile) and close over it -- cached per occupancy regime, so a compiled
+        # Select the tile/variant from the T6 measured-dispatch table (see
+        # attention/kernel/dispatch.py) OUTSIDE the custom_function -- a fixed TileShape()
+        # (always scalar) is no longer used on the kernel path. Calibrate the query-split
+        # rate for THAT SAME tile OUTSIDE the custom_function too (host-sync timing is
+        # compile-hostile) and close over both -- cached per occupancy regime, so a compiled
         # caller re-probes only on the first trace.
+        tile = select_fwd_tile(q.shape[2], q.shape[-1])
         rate = calibrated_fwd_rate(
             head_dim=q.shape[-1], dtype=q.dtype, b=q.shape[0], hq=q.shape[1],
-            hkv=k.shape[1], n=q.shape[2], causal=causal,
+            hkv=k.shape[1], n=q.shape[2], causal=causal, tile=tile,
         )
     else:
+        tile = TileShape()
         rate = None
 
     @mx.custom_function
     def _core(q_: mx.array, k_: mx.array, v_: mx.array) -> tuple[mx.array, mx.array]:
         if resolved == "kernel":
             return launch_flash_fwd(
-                q_, k_, v_, scale=scale, causal=causal, tile=TileShape(),
+                q_, k_, v_, scale=scale, causal=causal, tile=tile,
                 rate_macs_per_s=rate,
             )
         return flash_attention_reference(q_, k_, v_, scale=scale, causal=causal)

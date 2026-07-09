@@ -35,8 +35,17 @@ never risks the watchdog. Probe QKV are drawn from a LOCAL `mx.random.key` (neve
 kernel call can fire inside a user's grad/training run and desync downstream consumers.
 
 T6's KV-block tiling changes the kernel's cache-residency and reuse pattern entirely
-(threadgroup-resident K/V tiles instead of v0's zero-reuse re-stream), so this calibration
-must be re-validated once T6 lands -- do not assume v0's rates or ramp behavior transfer.
+(threadgroup-resident K/V tiles instead of v0's zero-reuse re-stream) -- do not assume v0's
+RATES transfer to the mma body (rung 3's dispatch table treats every mma bucket off the one
+directly-measured saturation shape as PROVISIONAL for exactly this reason, see
+`kernel/dispatch.py`). The cache key IS now variant/d_slab-aware (rung 3: `calibrated_
+fwd_rate`'s `_FWD_RATE_CACHE` key includes `tile.variant`/`tile.d_slab`, and `measure()`
+builds/dispatches the SAME kernel `tile` names -- probe what you rate), so an mma call never
+reads a scalar-measured rate or vice versa. What remains UNVALIDATED is the ramp/canary
+SHAPE itself: the DRAM-vs-cache-resident-probe rationale above was derived from v0's
+zero-cross-row-reuse memory pattern, and the mma body's threadgroup-resident K/V reuse has
+not been separately re-derived -- the ramp mechanics are REUSED for mma calibration, not
+re-justified for it.
 """
 import functools
 import math
@@ -76,8 +85,9 @@ _PROBE_N_HARD_CAP = 8192 # never probe past this many keys/queries during calibr
                          # regardless of the caller's real n (mirrors core/kernel/launch's
                          # 8192 tile cap)
 
-# key: (head_dim, dtype, causal, b, hq, n-bucket)
-_FWD_RATE_CACHE: dict[tuple[int, str, bool, int, int, int], float] = {}
+# key: (head_dim, dtype, causal, b, hq, n-bucket, variant, d_slab) -- variant/d_slab-aware
+# (T6 rung 3): probe what you rate, see calibrated_fwd_rate's own docstring.
+_FWD_RATE_CACHE: dict[tuple[int, str, bool, int, int, int, str, int | None], float] = {}
 
 # The installed mlx stub types mx.fast.metal_kernel's return as `object`; it is a callable
 # kernel invoker (same cast convention as core/kernel/launch._MetalKernel).
@@ -92,11 +102,23 @@ class TileShape:
     default -- unchanged behaviour) or `"mma"` (the rung-1 4x4 simdgroup-matrix body, one
     32-row query block per threadgroup). `bq` is the scalar body's query-rows-per-threadgroup
     occupancy grouping (no effect on the mma body, whose threadgroup is a fixed 32-lane
-    simdgroup); the mma body's KV-block and simdgroup-matrix dimensions are baked into its
-    source, not carried here."""
+    simdgroup); the mma body's KV-block dimensions are baked into its source, not carried
+    here.
+
+    `d_slab` overrides the mma body's register-resident D-slab width (see `source.py`'s
+    `build_fwd_mma_source` / `_FWD_MMA_D_SLAB`) -- `None` means "use the source builder's own
+    default" (32, ignored by the scalar body entirely). `provisional` is selection metadata
+    only: it marks a `TileShape` picked by `dispatch.select_fwd_tile` for a shape the T6
+    ladder did not directly measure (same kernel body, unmeasured rate) -- it is never
+    consumed by `_fwd_kernel`/`_dispatch_range`, only carried through for callers/logging. A
+    `TileShape` built directly (every existing parity/determinism test does this) defaults
+    `provisional=False`, since a caller who names a variant explicitly isn't deferring to the
+    table's own confidence flag."""
 
     bq: int = 32
     variant: str = "scalar"
+    d_slab: int | None = None
+    provisional: bool = False
 
 
 def _n_bucket(n: int) -> int:
@@ -128,14 +150,21 @@ def check_fwd_budget(*, n: int, d: int, b: int, hq: int, rows: int, rate: float)
 
 @functools.cache
 def _fwd_kernel(
-    head_dim: int, causal: bool, flip_causal: bool, variant: str
+    head_dim: int, causal: bool, flip_causal: bool, variant: str, d_slab: int | None
 ) -> _MetalKernel:
-    """Build (and cache) the forward kernel for a given (head_dim, causal, flip, variant).
-    `variant="scalar"` uses the v0 one-thread-per-row body; `"mma"` uses the rung-1 4x4
-    simdgroup-matrix body. Both share the same (q,k,v,qoffs,scale_in)->(o_out,l_out)
-    contract, so `_dispatch_range` swaps only the grid/threadgroup shape between them."""
+    """Build (and cache) the forward kernel for a given (head_dim, causal, flip, variant,
+    d_slab). `variant="scalar"` uses the v0 one-thread-per-row body (`d_slab` has no effect
+    on its source, but stays part of the cache key regardless -- a harmless redundant cache
+    entry, never a correctness issue, if a caller ever varies it for scalar); `"mma"` uses the
+    rung-2 register-resident P@V MMA body, whose source genuinely changes with `d_slab` (see
+    `source.build_fwd_mma_source`'s D_SLAB/D_SLAB_TILES templating) -- `d_slab=None` builds
+    with the source builder's own default (`_FWD_MMA_D_SLAB`). Both variants share the same
+    (q,k,v,qoffs,scale_in)->(o_out,l_out) contract, so `_dispatch_range` swaps only the
+    grid/threadgroup shape between them."""
     if variant == "mma":
-        source = build_fwd_mma_source(head_dim, causal=causal, flip_causal=flip_causal)
+        source = build_fwd_mma_source(
+            head_dim, causal=causal, flip_causal=flip_causal, d_slab=d_slab,
+        )
     elif variant == "scalar":
         source = build_fwd_source(head_dim, causal=causal, flip_causal=flip_causal)
     else:
@@ -144,6 +173,7 @@ def _fwd_kernel(
         name=(
             f"mtp_flash_fwd_{variant}_d{head_dim}_"
             f"{'c' if causal else 'f'}{'x' if flip_causal else ''}"
+            + (f"_s{d_slab}" if variant == "mma" else "")
         ),
         input_names=["q", "k", "v", "qoffs", "scale_in"],
         output_names=["o_out", "l_out"],
@@ -184,7 +214,7 @@ def launch_flash_fwd(
         rows_per = _rows_per_dispatch(n=n, d=d, b=b, hq=hq, rate=rate_macs_per_s)
         check_fwd_budget(n=n, d=d, b=b, hq=hq, rows=rows_per, rate=rate_macs_per_s)
 
-    kernel = _fwd_kernel(d, causal, _flip_causal, tile.variant)
+    kernel = _fwd_kernel(d, causal, _flip_causal, tile.variant, tile.d_slab)
     scale_in = mx.array([scale], dtype=mx.float32)
     o_chunks: list[mx.array] = []
     l_chunks: list[mx.array] = []
@@ -337,17 +367,28 @@ def _calibrate_fwd(
 
 
 def calibrated_fwd_rate(
-    *, head_dim: int, dtype: mx.Dtype, b: int, hq: int, hkv: int, n: int, causal: bool
+    *, head_dim: int, dtype: mx.Dtype, b: int, hq: int, hkv: int, n: int, causal: bool,
+    tile: TileShape,
 ) -> float:
-    """Cached, safety-factored, N-AWARE MAC/s throughput for the v0 forward kernel, used to
-    size the query-row split. Ramps the probe key-count toward the caller's real `n` via
-    `_calibrate_fwd` (see the module docstring for why a fixed small probe reads the wrong
-    cache-resident regime at flagship N) rather than measuring at one fixed shape; probe
-    QKV are drawn from a LOCAL `mx.random.key(0)` (split into per-tensor sub-keys), never
-    `mx.random.seed`, so calibration never mutates the caller's global RNG stream. Cached
-    per (head_dim, dtype, causal, b, hq, n-bucket) so repeated calls in an occupancy regime
-    don't re-probe. Must never be called inside a compiled region (host-sync timing)."""
-    key = (head_dim, str(dtype), causal, b, hq, _n_bucket(n))
+    """Cached, safety-factored, N-AWARE MAC/s throughput for the forward kernel `tile`
+    actually names, used to size the query-row split. Ramps the probe key-count toward the
+    caller's real `n` via `_calibrate_fwd` (see the module docstring for why a fixed small
+    probe reads the wrong cache-resident regime at flagship N) rather than measuring at one
+    fixed shape; probe QKV are drawn from a LOCAL `mx.random.key(0)` (split into per-tensor
+    sub-keys), never `mx.random.seed`, so calibration never mutates the caller's global RNG
+    stream.
+
+    PROBE WHAT YOU RATE (T6 rung 3): `measure()` builds and dispatches the SAME
+    (`tile.variant`, `tile.d_slab`) kernel the launcher will actually run -- rating one
+    variant while dispatching another sizes the query-row split from the wrong rate. The
+    cache is keyed on (head_dim, dtype, causal, b, hq, n-bucket, variant, d_slab), so an mma
+    and a scalar call (or two mma calls with different `d_slab`) at the same shape are
+    calibrated independently and never share a rate. `provisional` is deliberately NOT part
+    of the key: it is a selection-confidence label on `tile`, not a distinct kernel/dispatch
+    configuration -- the rate for a given (variant, d_slab) is the same physical number
+    whichever confidence flag pointed at it. Must never be called inside a compiled region
+    (host-sync timing)."""
+    key = (head_dim, str(dtype), causal, b, hq, _n_bucket(n), tile.variant, tile.d_slab)
     if key in _FWD_RATE_CACHE:
         return _FWD_RATE_CACHE[key]
 
@@ -355,7 +396,7 @@ def calibrated_fwd_rate(
     scale = 1.0 / (head_dim ** 0.5)
     probes: dict[tuple[int, int], tuple[mx.array, mx.array, mx.array]] = {}
 
-    kernel = _fwd_kernel(head_dim, causal, False, "scalar")
+    kernel = _fwd_kernel(head_dim, causal, False, tile.variant, tile.d_slab)
     scale_in = mx.array([scale], dtype=mx.float32)
 
     def measure(rows: int, keys: int) -> float:
@@ -373,13 +414,13 @@ def calibrated_fwd_rate(
             # clocks/caches are cold -- this dispatch is deliberately unmeasured (mirrors
             # core/kernel/launch.calibrated_rate's per-tile warmup).
             o, lse = _dispatch_range(
-                kernel, q, kk, vv, scale_in, r0=keys - rows, r1=keys, tile=TileShape(),
+                kernel, q, kk, vv, scale_in, r0=keys - rows, r1=keys, tile=tile,
             )
             mx.eval(o, lse)
         q, kk, vv = probes[(rows, keys)]
         t0 = time.perf_counter()
         o, lse = _dispatch_range(
-            kernel, q, kk, vv, scale_in, r0=keys - rows, r1=keys, tile=TileShape(),
+            kernel, q, kk, vv, scale_in, r0=keys - rows, r1=keys, tile=tile,
         )
         mx.eval(o, lse)
         return time.perf_counter() - t0
