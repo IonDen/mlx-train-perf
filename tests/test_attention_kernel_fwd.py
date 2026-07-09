@@ -31,7 +31,11 @@ from mlx_train_perf.attention.kernel.launch import (
     check_fwd_budget,
     launch_flash_fwd,
 )
-from mlx_train_perf.attention.kernel.source import build_fwd_mma_source, build_fwd_source
+from mlx_train_perf.attention.kernel.source import (
+    _FWD_MMA_D_SLAB,
+    build_fwd_mma_source,
+    build_fwd_source,
+)
 from mlx_train_perf.attention.reference import (
     flash_attention_reference,
     kv_head_for,
@@ -96,11 +100,42 @@ def test_build_fwd_source_rejects_flip_without_causal() -> None:
 def test_build_fwd_mma_source_substitutes_head_dim() -> None:
     for hd in (64, 96, 128):
         s = build_fwd_mma_source(hd, causal=True)
-        assert f"o_acc[32 * {hd}]" in s          # threadgroup O accumulator sized by head_dim
-        assert f"dd < {hd}" in s                  # the D-wide loops are baked to head_dim
+        assert f"slab0 < {hd}" in s               # the D-slab OUTER loop spans the full head dim
+        assert "C_o[4][" in s                     # register-resident O accumulator tiles (rung 2)
+        assert "o_acc" not in s                   # NO threadgroup O accumulator (rung 2)
+        assert "threadgroup float" not in s       # rung 2 holds O + softmax in registers, no TG mem
         assert "HEAD_DIM" not in s                # every sentinel substituted (lossless)
         assert "KEEP_CMP" not in s
         assert "KV_LIMIT" not in s
+        assert "D_SLAB" not in s
+
+
+def test_build_fwd_mma_source_slabs_the_d_dimension() -> None:
+    # The register-resident C_o accumulator is held for D_SLAB columns at a time; the D-slab
+    # OUTER loop steps by D_SLAB and C_o carries RT=4 row-tiles x (D_SLAB/8) col-tiles.
+    slab = _FWD_MMA_D_SLAB
+    tiles = slab // 8
+    for hd in (64, 96, 128):
+        assert hd % slab == 0, f"D_SLAB {slab} must divide every supported head dim ({hd})"
+        s = build_fwd_mma_source(hd, causal=True)
+        assert f"C_o[4][{tiles}]" in s            # RT=4 x (D_SLAB/8) register O tiles
+        assert f"slab0 += {slab}" in s            # D-slab OUTER loop steps by D_SLAB
+
+
+def test_build_fwd_mma_source_d_slab_override_for_the_regpressure_probe() -> None:
+    # An explicit d_slab overrides the default -- the regpressure probe sweeps candidate
+    # slab widths at each head dim to justify the shipped `_FWD_MMA_D_SLAB`.
+    s16 = build_fwd_mma_source(64, causal=True, d_slab=16)
+    assert "C_o[4][2]" in s16                     # 16 / 8 == 2 col-tiles
+    assert "slab0 += 16" in s16
+    s64 = build_fwd_mma_source(128, causal=True, d_slab=64)
+    assert "C_o[4][8]" in s64                     # 64 / 8 == 8 col-tiles
+    assert "slab0 += 64" in s64
+
+
+def test_build_fwd_mma_source_rejects_indivisible_d_slab() -> None:
+    with pytest.raises(ValueError, match="d_slab"):
+        build_fwd_mma_source(96, causal=True, d_slab=64)   # 96 % 64 != 0
 
 
 def test_build_fwd_mma_source_causal_keep_and_loop_bound() -> None:
@@ -356,12 +391,13 @@ _HEAD_N_CASES = [
 # measure-first convention as tests/test_kernel_parity.py). A future case landing between a
 # pin and 2 bf16 ULP is not a regression -- widen toward 2 ULP with a note.
 #
-# mma (rung-1 4x4 simdgroup-matrix body): the score reduction reassociates (fp32 MMA over
-# the head dim + block-level online softmax vs scalar's per-key recurrence). MEASURED worsts
-# over THIS grid (mlx 0.32.0, M1 Max, seed=7): O fp32 9.537e-07, O bf16 7.812e-03, L fp32
-# 9.537e-07, L bf16 9.537e-07 -- the reassociation lands in the SAME ~1e-6 fp32 / one-bf16-ULP
-# class as scalar (L bf16 is actually tighter than scalar's 1.431e-06). So the honest mma pins
-# equal the scalar pins here -- measured separately per the rung contract, NOT widened.
+# mma (rung-2 register-resident P@V MMA O-path with D-slabbing): the score reduction
+# reassociates (fp32 QK^T MMA + a second fp32 P@V MMA for O, per-slab recompute, vs scalar's
+# per-key recurrence). MEASURED worsts over THIS grid (mlx 0.32.0, M1 Max, seed=7): O fp32
+# 9.537e-07, O bf16 7.812e-03, L fp32 9.537e-07, L bf16 9.537e-07 -- UNCHANGED from rung 1;
+# the P@V MMA + recompute reassociation stays in the SAME ~1e-6 fp32 / one-bf16-ULP class as
+# scalar (L bf16 is actually tighter than scalar's 1.431e-06). So the honest mma pins equal the
+# scalar pins here -- measured separately per the rung contract, NOT widened.
 _TOL_O = {
     "scalar": {mx.float32: 2e-6, mx.bfloat16: 1.2e-2},
     "mma": {mx.float32: 2e-6, mx.bfloat16: 1.2e-2},
@@ -453,8 +489,8 @@ def test_fwd_row0_attends_only_itself(variant: str) -> None:
 @pytest.mark.metal
 @pytest.mark.parametrize("variant", ["scalar", "mma"])
 def test_fwd_bitwise_deterministic_across_runs(variant: str) -> None:
-    """No atomics by design (mma stages S/O in threadgroup memory, each lane owning
-    disjoint rows/cols) -> bit-identical O and L across repeated runs. Lock it."""
+    """No atomics by design (mma holds S/O in registers + simd_shuffle reductions, each lane
+    owning disjoint output rows/cols) -> bit-identical O and L across repeated runs. Lock it."""
     q, k, v = _rand_qkv(b=2, hq=4, hkv=2, n=129, d=64, dtype=mx.float32, seed=2)
     scale = 1.0 / math.sqrt(64)
     o0, l0 = launch_flash_fwd(

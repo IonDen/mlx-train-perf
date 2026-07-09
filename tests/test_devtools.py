@@ -217,17 +217,20 @@ def test_backward_dhidden_mma_kernel_ceiling_is_plausible() -> None:
 @pytest.mark.metal
 @pytest.mark.parametrize("head_dim", [64, 96, 128])
 def test_flash_fwd_mma_ceiling_stays_in_the_mma_class(head_dim: int) -> None:
-    # The 4x4 simdgroup-matrix flash-attention forward (rung 1) shares the v0 scalar body's
-    # (q, k, v, qoffs, scale_in) -> (o_out, l_out) contract, so it probes through the same
-    # parameterized path. Unlike the v0 SCALAR body -- whose per-lane qreg[HEAD_DIM]/acc[HEAD_DIM]
-    # arrays SPILL at head_dim 128 and INVERT the ceiling to 1024 (user-metal-kernels
-    # spill-inversion entry; v0 measured 384/384/1024 for 64/96/128) -- the mma body keeps S and
-    # O in THREADGROUP memory, so its only large per-lane state is the 4x4 C-tile set (32 fp32/
-    # lane). MEASURED (mlx 0.32.0, M1 Max): head_dim 64 -> 576, 96 -> 384, 128 -> 384 -- all in
-    # the healthy mma class with NO spill and NO inversion (the d=128 case, which inverted the
-    # scalar body to 1024, sits at a normal 384 here). The value is a register-pressure telltale
-    # only, never a rate verdict (module docstring); the rung contract's bar is "restructure if a
-    # config collapses below ~256", and the measured floor (384) clears it, so pin >= 256.
+    # The 4x4 simdgroup-matrix flash-attention forward (rung 2, register-resident P@V O-path
+    # with D-slabbing) shares the v0 scalar body's (q, k, v, qoffs, scale_in) -> (o_out, l_out)
+    # contract, so it probes through the same parameterized path with the shipped _FWD_MMA_D_SLAB.
+    # Rung 2 removed ALL threadgroup memory (register C_o accumulator + simd_shuffle softmax); its
+    # live per-lane state is the 16 QK/P tiles (32 fp32/lane) plus the RT*(D_SLAB/8) C_o tiles.
+    # MEASURED (mlx 0.32.0, M1 Max): head_dim 64/96/128 -> 384/384/384 at the shipped D_SLAB=32.
+    # A regpressure sweep over slab widths {16,32,48,64,head_dim} read a FLAT 384 at EVERY width
+    # AND every head dim -- maxTotalThreadsPerThreadgroup cannot distinguish "fits" from
+    # "spilled-to-fit" (user-metal-kernels), so the ceiling is non-discriminating here and the
+    # D_SLAB pick rests on the register arithmetic (C_o=16 tiles=32 fp32/lane == the family-
+    # independent accumulator optimum) + head-dim divisibility, not the ceiling. The value is a
+    # register-pressure telltale only, never a rate verdict (module docstring); the rung contract's
+    # bar is "restructure if a config collapses below ~256", and the measured 384 clears it, so
+    # pin >= 256.
     b, hq, hkv, n = 1, 8, 8, 8
     scale = 1.0 / (head_dim ** 0.5)
     mx.random.seed(2)
