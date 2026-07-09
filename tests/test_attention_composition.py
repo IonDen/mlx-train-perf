@@ -21,12 +21,16 @@ valued gradient PROVES our vjp produced it (autodiff would give the unscaled val
 assertions are on gradient VALUES or measured peaks — never on Python trace-time side
 effects, which are unobservable under mx.compile.
 """
+import math
 import subprocess
 import sys
 from pathlib import Path
 
 import mlx.core as mx
 import pytest
+
+from mlx_train_perf.attention.api import flash_attention
+from mlx_train_perf.attention.reference import math_attention
 
 pytest.importorskip("mlx_lm")
 
@@ -200,3 +204,36 @@ def test_sdpa_backward_is_still_quadratic_on_installed_mlx() -> None:
         f"SDPA fwd+bwd peak ratio {ratio:.2f} for N 1024->2048 is not O(N^2)-class -- "
         "installed mlx may have gained a memory-efficient attention backward"
     )
+
+
+def test_flash_attention_under_compile_and_checkpoint() -> None:
+    """T4's real `flash_attention` (not a toy) under the T2-proven nesting: gradient
+    parity against the `math_attention` autodiff oracle, both INSIDE
+    `mx.compile(mx.grad(...))` and under `mx.grad(mx.checkpoint(...))`. Tiny shapes,
+    `impl='reference'` (the oracle -- never a production path)."""
+    b, hq, hkv, n, d = 1, 2, 1, 8, 8
+    mx.random.seed(20)
+    q = mx.random.normal((b, hq, n, d))
+    k = mx.random.normal((b, hkv, n, d))
+    v = mx.random.normal((b, hkv, n, d))
+    mx.eval(q, k, v)
+    scale = 1.0 / math.sqrt(d)
+
+    def flash_loss(q_: mx.array) -> mx.array:
+        return flash_attention(q_, k, v, scale=scale, causal=True, impl="reference").sum()
+
+    def math_loss(q_: mx.array) -> mx.array:
+        return math_attention(q_, k, v, scale=scale, causal=True).sum()
+
+    g_oracle = mx.grad(math_loss)(q)
+    g_compiled = mx.compile(mx.grad(flash_loss))(q)
+    g_checkpoint = mx.grad(mx.checkpoint(flash_loss))(q)
+    mx.eval(g_oracle, g_compiled, g_checkpoint)
+
+    # measured-first (mlx 0.32.0, fp32, seed=20, tiny shape 1x2x8x8): worst |diff|
+    # 2.980232e-07 (compiled), 2.384186e-07 (checkpoint) -- compile's op fusion
+    # reorders fp32 rounding vs the uncompiled oracle -> pin 1e-6 (~3.4x margin).
+    diff_compiled = mx.abs(g_compiled - g_oracle).max().item()
+    diff_checkpoint = mx.abs(g_checkpoint - g_oracle).max().item()
+    assert diff_compiled < 1e-6, diff_compiled
+    assert diff_checkpoint < 1e-6, diff_checkpoint

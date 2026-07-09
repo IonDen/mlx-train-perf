@@ -47,3 +47,13 @@ class WiredCapRegressionError(MlxTrainPerfError):
     """A `train_step` condition's wired limit was not at this project's house cap
     after training completed -- the in-loop re-assert did not hold; the condition is a
     failed result, not a silent pass."""
+
+
+class UnsupportedAttentionError(MlxTrainPerfError):
+    """Attention impl/config combination the requested impl cannot serve (no silent
+    fallback) -- e.g. an unsupported dtype, head_dim, or causal=False for impl='kernel'."""
+
+
+class AttentionInputError(MlxTrainPerfError):
+    """Shape validation failure at the flash_attention boundary (non-4D tensors,
+    Hq not a multiple of Hkv, mismatched N/D/batch across q/k/v)."""
