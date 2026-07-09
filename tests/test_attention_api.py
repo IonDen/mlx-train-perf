@@ -104,12 +104,19 @@ def test_impl_auto_refuses_non_causal() -> None:
         flash_attention(q, k, v, scale=1.0, causal=False, impl="auto")
 
 
-def test_impl_kernel_explicit_also_refuses_not_built_yet() -> None:
-    """Explicit impl='kernel' runs the same resolution checks as 'auto' (context note
-    5) -- a fully-supported config still refuses today, naming 'not built yet'."""
+@pytest.mark.metal
+def test_impl_kernel_now_runs_the_metal_forward() -> None:
+    """T5: a fully-supported config no longer refuses 'not built yet' -- impl='kernel'
+    resolves and routes the FORWARD through the Metal kernel. O matches the math_attention
+    oracle (the full parity grid lives in tests/test_attention_kernel_fwd.py). Metal-marked:
+    resolution needs a real GPU and the wired kernel launch."""
     q, k, v = _rand_qkv(b=1, hq=4, hkv=4, n=16, d=64, seed=16)
-    with pytest.raises(UnsupportedAttentionError, match="not built yet"):
-        flash_attention(q, k, v, scale=1.0, causal=True, impl="kernel")
+    scale = 1.0 / math.sqrt(64)
+    assert resolve_attention_impl(q, k, v, impl="kernel", causal=True) == "kernel"
+    o_kernel = flash_attention(q, k, v, scale=scale, causal=True, impl="kernel")
+    o_math = math_attention(q, k, v, scale=scale, causal=True)
+    mx.eval(o_kernel, o_math)
+    assert mx.abs(o_kernel - o_math).max().item() < 2e-6
 
 
 def test_impl_reference_always_allowed() -> None:
