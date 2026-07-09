@@ -22,6 +22,11 @@ from typing import Literal, cast
 import mlx.core as mx
 
 from mlx_train_perf._compat import check_mlx_verified
+from mlx_train_perf.attention.kernel.launch import (
+    TileShape,
+    calibrated_fwd_rate,
+    launch_flash_fwd,
+)
 from mlx_train_perf.attention.reference import flash_attention_reference, kv_head_for
 from mlx_train_perf.errors import AttentionInputError, UnsupportedAttentionError
 
@@ -63,10 +68,10 @@ def resolve_attention_impl(
     q: mx.array, k: mx.array, v: mx.array, *, impl: str, causal: bool = True
 ) -> str:
     """"reference" is always allowed (the oracle). "auto"/"kernel" run the full
-    kernel-support gate (dtype, head_dim, causal, Metal availability, mlx-verified)
-    and, until T5 lands a real Metal kernel, always refuse at the end naming
-    "kernel not built yet" -- the gate itself is real and tested; only the final
-    grant is pending."""
+    kernel-support gate (dtype, head_dim, causal, Metal availability, mlx-verified) and,
+    when every gate passes, resolve to "kernel" (T5 -- the Metal forward is built). An
+    unsupported dtype/head_dim/causal/device raises `UnsupportedAttentionError` with a
+    pointer to impl="reference"; there is no silent fallback."""
     _validate_shapes(q, k, v)
     if impl == "reference":
         return "reference"
@@ -96,10 +101,7 @@ def resolve_attention_impl(
         )
     check_mlx_verified(allow_unverified=False)
 
-    raise UnsupportedAttentionError(
-        "kernel impl not built yet (Metal kernel lands in T5); use impl='reference' "
-        "(an oracle, not a production path) until then."
-    )
+    return "kernel"
 
 
 def _bwd_D(d_o: mx.array, o: mx.array) -> mx.array:  # noqa: N802 -- D is the paper's name
@@ -171,18 +173,31 @@ def flash_attention(
     impl: Literal["auto", "kernel", "reference"] = "auto",
 ) -> mx.array:
     """`softmax(scale * Q K^T + causal_mask) @ V`, GQA via the pinned contiguous
-    convention. `impl='reference'` (the oracle -- never run it at flagship context, see
-    the module docstring) is the only impl that resolves today; `impl='auto'`/`'kernel'`
-    raise `UnsupportedAttentionError` (T5 lands the Metal kernel)."""
+    convention. `impl='auto'`/`'kernel'` route the FORWARD through the T5 Metal kernel
+    (O + L, query-range split); the BACKWARD is STILL the hand-written pure-MLX vjp below
+    -- staged, exactly like 0.1.0's loss (a memory-efficient backward is a later rung), so
+    the vjp materializes the full (N, N) score matrix and must be fenced to modest N.
+    `impl='reference'` is the oracle (never a production path)."""
     resolved = resolve_attention_impl(q, k, v, impl=impl, causal=causal)
-    if resolved != "reference":
-        # Unreachable until T5: resolve_attention_impl always raises before returning
-        # anything other than "reference" today. Kept so the kernel dispatch branch
-        # exists once T5 lands a real Metal-backed core.
-        raise UnsupportedAttentionError(f"unexpected resolved impl {resolved!r}")
+
+    if resolved == "kernel":
+        # Calibrate the query-split rate OUTSIDE the custom_function (host-sync timing is
+        # compile-hostile) and close over it -- cached per occupancy regime, so a compiled
+        # caller re-probes only on the first trace.
+        rate = calibrated_fwd_rate(
+            head_dim=q.shape[-1], dtype=q.dtype, b=q.shape[0], hq=q.shape[1],
+            hkv=k.shape[1], n=q.shape[2], causal=causal,
+        )
+    else:
+        rate = None
 
     @mx.custom_function
     def _core(q_: mx.array, k_: mx.array, v_: mx.array) -> tuple[mx.array, mx.array]:
+        if resolved == "kernel":
+            return launch_flash_fwd(
+                q_, k_, v_, scale=scale, causal=causal, tile=TileShape(),
+                rate_macs_per_s=rate,
+            )
         return flash_attention_reference(q_, k_, v_, scale=scale, causal=causal)
 
     @_core.vjp
