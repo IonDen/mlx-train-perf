@@ -219,7 +219,7 @@ def test_run_train_step_explicit_stock_attention_impl_skips_enable(
 
     monkeypatch.setattr(worker, "enable_flash_attention", spy_enable)
 
-    worker.run_train_step({**_BASE_PARAMS, "attention_impl": "stock"})
+    worker.run_train_step(dict(_BASE_PARAMS), attention_impl="stock")
 
     assert called["n"] == 0
 
@@ -260,7 +260,7 @@ def test_run_train_step_flash_attention_impl_enables_before_lora_injection(
 
     monkeypatch.setattr(lora_utils, "linear_to_lora_layers", spy_lora)
 
-    fields = worker.run_train_step({**_BASE_PARAMS, "attention_impl": "flash"})
+    fields = worker.run_train_step(dict(_BASE_PARAMS), attention_impl="flash")
 
     assert calls == ["enable_flash_attention", "freeze", "linear_to_lora_layers"]
     assert enable_args["model"] is model
@@ -294,9 +294,9 @@ def test_run_train_step_evaluates_parameters_before_enabling_flash_attention(
     monkeypatch.setattr(worker.mx, "eval", spy_eval)
     monkeypatch.setattr(worker, "enable_flash_attention", spy_enable)
 
-    worker.run_train_step({
-        **_BASE_PARAMS, "attention_impl": "flash", "compute_dtype": "bfloat16",
-    })
+    worker.run_train_step(
+        {**_BASE_PARAMS, "compute_dtype": "bfloat16"}, attention_impl="flash",
+    )
 
     assert "eval" in calls
     assert "enable_flash_attention" in calls
@@ -309,7 +309,7 @@ def test_run_train_step_rejects_unknown_attention_impl(
     _stub_load(monkeypatch)
     install_guardrails()
     with pytest.raises(MlxTrainPerfError, match="attention_impl"):
-        worker.run_train_step({**_BASE_PARAMS, "attention_impl": "bogus"})
+        worker.run_train_step(dict(_BASE_PARAMS), attention_impl="bogus")
 
 
 def test_require_mlx_lm_raises_missing_dependency_error_when_absent(
@@ -398,6 +398,69 @@ def test_worker_main_train_step_writes_ok_artifact(
     assert len(data["loss_all"]) == 2
 
 
+def test_worker_main_threads_config_attention_impl_into_identity_and_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`worker.main` must read the TOP-LEVEL `attention_impl` config field (the dedicated
+    slot `run_conditions` now writes it into, out of `params`) and thread it BOTH into its
+    own `condition_identity` call (so the artifact's identity carries it) AND into
+    `run_train_step`. Regression for the T13 step-1 seam: before the fix, `worker.main`
+    ignored the config field entirely, so the identity never carried `attention_impl` and
+    the run always defaulted to stock. `run_train_step` is stubbed here to capture the
+    keyword and keep this off the real training path."""
+    _stub_load(monkeypatch)
+    captured: dict[str, object] = {}
+
+    def _fake_run(
+        _params: dict[str, object], *, attention_impl: str | None = None,
+    ) -> dict[str, object]:
+        captured["attention_impl"] = attention_impl
+        return {"loss_all": [1.0, 1.0]}
+
+    monkeypatch.setattr(worker, "run_train_step", _fake_run)
+    out = tmp_path / "r.json"
+    cfg = tmp_path / "config.json"
+    cfg.write_text(json.dumps({
+        "kind": "train_step", "params": dict(_BASE_PARAMS), "session_id": "s1",
+        "attention_impl": "flash", "out": str(out),
+    }))
+    rc = worker.main(["--config", str(cfg)])
+    assert rc == 0
+    data = json.loads(out.read_text())
+    assert data["status"] == "ok"
+    assert data["identity"]["attention_impl"] == "flash"
+    assert captured["attention_impl"] == "flash"
+
+
+def test_worker_main_train_step_without_attention_impl_omits_it_from_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Backward compatibility: a config with NO top-level `attention_impl` (every
+    0.1.0-era train_step config) leaves the identity's keys unchanged -- the field is
+    omitted -- and the run defaults to stock (`run_train_step` gets `None`)."""
+    _stub_load(monkeypatch)
+    captured: dict[str, object] = {}
+
+    def _fake_run(
+        _params: dict[str, object], *, attention_impl: str | None = None,
+    ) -> dict[str, object]:
+        captured["attention_impl"] = attention_impl
+        return {"loss_all": [1.0, 1.0]}
+
+    monkeypatch.setattr(worker, "run_train_step", _fake_run)
+    out = tmp_path / "r.json"
+    cfg = tmp_path / "config.json"
+    cfg.write_text(json.dumps({
+        "kind": "train_step", "params": dict(_BASE_PARAMS), "session_id": "s1",
+        "out": str(out),
+    }))
+    rc = worker.main(["--config", str(cfg)])
+    assert rc == 0
+    data = json.loads(out.read_text())
+    assert "attention_impl" not in data["identity"]
+    assert captured["attention_impl"] is None
+
+
 def test_worker_main_train_step_wired_cap_regression_is_not_caught_and_writes_nothing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -407,7 +470,9 @@ def test_worker_main_train_step_wired_cap_regression_is_not_caught_and_writes_no
     envelope on the CALLER's side, never a silent "ok"."""
     _stub_load(monkeypatch)
 
-    def _raise(_params: dict[str, object]) -> dict[str, object]:
+    def _raise(
+        _params: dict[str, object], *, attention_impl: str | None = None,  # noqa: ARG001
+    ) -> dict[str, object]:
         raise WiredCapRegressionError("wired limit regressed")
 
     monkeypatch.setattr(worker, "run_train_step", _raise)

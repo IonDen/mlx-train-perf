@@ -26,6 +26,15 @@ class Condition:
     name: str
     kind: str
     params: dict[str, object]
+    # A dedicated, reserved identity input carried OUT of `params` -- the same kind of
+    # first-class field as `kind`, threaded to `condition_identity(attention_impl=...)`
+    # here and forwarded to the worker via its config so `worker.main` rebuilds the SAME
+    # identity and runs the matching attention path. `params` may NOT also set it
+    # (`condition_identity` rejects the reserved key). Left `None` for every condition
+    # that does not select an attention implementation (all loss_layer conditions, and any
+    # 0.1.0-era train_step config) -- `condition_identity` then OMITS it, keeping those
+    # identities byte-identical to before this field existed.
+    attention_impl: str | None = None
 
 
 def _spawn_worker(config_path: Path) -> subprocess.CompletedProcess[str]:
@@ -44,6 +53,7 @@ def run_conditions(
         out_path = out_dir / f"{condition.name}.json"
         ident = condition_identity(
             kind=condition.kind, session_id=session_id, params=condition.params,
+            attention_impl=condition.attention_impl,
         )
         paths.append(out_path)
         if result_is_fresh(out_path, ident):
@@ -57,7 +67,7 @@ def run_conditions(
 
         config = {
             "kind": condition.kind, "params": condition.params, "session_id": session_id,
-            "out": str(out_path),
+            "attention_impl": condition.attention_impl, "out": str(out_path),
         }
         # The config lives in the SYSTEM temp dir, deliberately never inside `out_dir` --
         # an interrupted run must not leave a stray `.json` there for a later glob over

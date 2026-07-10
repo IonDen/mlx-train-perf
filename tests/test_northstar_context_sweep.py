@@ -260,8 +260,9 @@ def test_build_probe_forces_flash_attention_for_ours_and_stock_for_stock() -> No
                        lora_layers=-1, seed=0, arm="ours", seq_len=2048)
     stock = build_probe(model=_RECIPE["model"], revision=None, batch=1, lora_rank=8,
                         lora_layers=-1, seed=0, arm="stock", seq_len=2048)
-    assert ours.params["attention_impl"] == "flash"
-    assert stock.params["attention_impl"] == "stock"
+    # Attention rides the dedicated `Condition` field (out of `params`), not a params entry.
+    assert ours.attention_impl == "flash"
+    assert stock.attention_impl == "stock"
 
 
 def test_recipe_session_id_changes_when_script_sha_changes(

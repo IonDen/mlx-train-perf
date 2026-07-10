@@ -104,11 +104,16 @@ def build_conditions(
                     "lora_layers": lora_layers, "impl": impl, "stock": stock,
                     "learning_rate": learning_rate, "seed": seed,
                     "compute_dtype": compute_dtype, "grad_checkpoint": grad_checkpoint,
-                    "attention_impl": attention_impl, "script_sha": sha,
+                    "script_sha": sha,
                 }
+                # `attention_impl` rides the dedicated `Condition` field (out of `params`,
+                # where the identity's reserved-key guard would reject it) -- held constant
+                # across BOTH arms here, so the ours/stock comparison isolates the loss
+                # layer at one attention implementation. A stock vs flash INVOCATION then
+                # gets a different artifact identity (the field is in the identity).
                 conditions.append(Condition(
                     name=condition_name(model=model, seq_len=seq_len, arm=arm),
-                    kind="train_step", params=params,
+                    kind="train_step", params=params, attention_impl=attention_impl,
                 ))
     return conditions
 

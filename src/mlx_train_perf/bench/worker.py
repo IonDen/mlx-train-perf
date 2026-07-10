@@ -280,7 +280,9 @@ def _run_train_steps(
     return callback.train_info
 
 
-def run_train_step(params: dict[str, object]) -> dict[str, object]:
+def run_train_step(
+    params: dict[str, object], *, attention_impl: str | None = None,
+) -> dict[str, object]:
     """Times `steps` real mlx-lm LoRA fine-tune steps end to end against a real
     (`mlx_lm.load`-resolved) model: ours, via the T12 adapter (`make_loss_fn`), or
     stock's own `mlx_lm.tuner.trainer.default_loss` when `params["stock"]` is true.
@@ -305,11 +307,15 @@ def run_train_step(params: dict[str, object]) -> dict[str, object]:
     default 1e-5), `seed` (int, default 0), `grad_checkpoint` (bool, default False),
     `compute_dtype` (str | None, default None -- when set, e.g. "bfloat16", the loaded
     model's floating params are cast to it before training; the kernel `impl` needs
-    this on 4-bit models that otherwise compute in fp16), `attention_impl` ("stock"
-    default | "flash" -- "flash" routes every decoder layer's attention through T12's
-    `enable_flash_attention`, hinted with THIS run's `seq_len`/`batch` so a compiled
-    `train()` traces with warm kernel rate caches; an unknown value raises
-    `MlxTrainPerfError`).
+    this on 4-bit models that otherwise compute in fp16).
+
+    `attention_impl` is a DEDICATED keyword (NOT a `params` entry): the same reserved
+    identity input `bench.runner.Condition` carries out of `params` and `worker.main`
+    forwards here, so identity and execution read one authoritative value. `None`
+    (unset -- every 0.1.0-era config) and "stock" both leave attention untouched; "flash"
+    routes every decoder layer's attention through T12's `enable_flash_attention`, hinted
+    with THIS run's `seq_len`/`batch` so a compiled `train()` traces with warm kernel rate
+    caches. Any other value raises `MlxTrainPerfError`.
     """
     _require_mlx_lm()
     import mlx.optimizers as optim  # noqa: PLC0415
@@ -329,7 +335,11 @@ def run_train_step(params: dict[str, object]) -> dict[str, object]:
     seed = int(cast(int, params.get("seed", 0)))
     grad_checkpoint = bool(params.get("grad_checkpoint", False))
     compute_dtype = cast("str | None", params.get("compute_dtype"))
-    attention_impl = str(params.get("attention_impl", "stock"))
+    # Unset (`None`, every 0.1.0-era config) resolves to the stock attention path -- the
+    # dedicated keyword is the ONE authoritative source; `params` never carries it (the
+    # identity's reserved-key guard rejects that).
+    if attention_impl is None:
+        attention_impl = "stock"
     if attention_impl not in _ATTENTION_IMPLS:
         raise MlxTrainPerfError(
             f"unknown attention_impl {attention_impl!r}; expected one of "
@@ -438,16 +448,23 @@ def main(argv: list[str] | None = None) -> int:
     kind = str(config["kind"])
     params = cast(dict[str, object], config["params"])
     session_id = str(config["session_id"])
+    # The dedicated attention identity input `runner.Condition` carries OUT of `params`
+    # (a config without the key -- every 0.1.0-era config -- reads `None`). Threaded into
+    # BOTH the identity (so this worker rebuilds the SAME identity the runner did) and
+    # `run_train_step`, the one authoritative execution source.
+    attention_impl = cast("str | None", config.get("attention_impl"))
     out = Path(cast(str, config["out"]))
 
     install_guardrails()  # FIRST -- before any allocation this condition makes
 
-    ident = condition_identity(kind=kind, session_id=session_id, params=params)
+    ident = condition_identity(
+        kind=kind, session_id=session_id, params=params, attention_impl=attention_impl,
+    )
     try:
         if kind == "loss_layer":
             fields = run_loss_layer(params)
         elif kind == "train_step":
-            fields = run_train_step(params)
+            fields = run_train_step(params, attention_impl=attention_impl)
         else:
             # Deliberately uncaught: an unsupported kind is a program error (a bad
             # Condition was constructed), not a recorded run outcome -- it crashes this

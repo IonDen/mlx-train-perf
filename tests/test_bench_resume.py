@@ -530,3 +530,69 @@ def test_bench_worker_module_runnable_as_main(tmp_path: Path) -> None:
     )
     assert proc.returncode == 0, proc.stderr
     assert json.loads(out.read_text())["status"] == "ok"
+
+
+# --- attention_impl is a FIRST-CLASS identity field through the runner seam ---------
+# Regression for the T13 step-1 crash: an attention-bearing condition must reach
+# `condition_identity` via `run_conditions`' DEDICATED slot, NOT through `params` (where
+# the reserved-key guard raises `BenchInputError`). The worker is stubbed at the
+# subprocess boundary, so the error-envelope path writes the SAME identity the runner
+# computed -- reading it back verifies the runner's own identity call, the exact line
+# that crashed. These tests drive the REAL `run_conditions`, above the identity
+# construction (unlike the 012fadb tests, which stubbed below it and so never built one).
+
+
+def _crash_worker(_config_path: Path) -> subprocess.CompletedProcess[str]:
+    """A `_spawn_worker` stand-in that "crashes" (nonzero exit, wrote nothing) -- so
+    `run_conditions` takes its error-envelope branch and writes the identity it built,
+    without ever loading a real model."""
+    return subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="stub crash")
+
+
+_TRAIN_STEP_PARAMS: dict[str, object] = {
+    "model": "m/a", "revision": None, "seq_len": 16, "batch": 1, "steps": 2,
+}
+
+
+def test_run_conditions_carries_attention_impl_into_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(runner, "_spawn_worker", _crash_worker)
+    cond = Condition(
+        name="flash_c", kind="train_step", params=dict(_TRAIN_STEP_PARAMS),
+        attention_impl="flash",
+    )
+    paths = run_conditions([cond], tmp_path, session_id=new_session_id())
+    identity = json.loads(paths[0].read_text())["identity"]
+    assert identity["attention_impl"] == "flash"
+
+
+def test_run_conditions_stock_and_flash_conditions_get_different_identities(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(runner, "_spawn_worker", _crash_worker)
+    session_id = new_session_id()
+    stock = Condition(name="stock_c", kind="train_step", params=dict(_TRAIN_STEP_PARAMS),
+                      attention_impl="stock")
+    flash = Condition(name="flash_c", kind="train_step", params=dict(_TRAIN_STEP_PARAMS),
+                      attention_impl="flash")
+    paths = run_conditions([stock, flash], tmp_path, session_id=session_id)
+    id_stock = json.loads(paths[0].read_text())["identity"]
+    id_flash = json.loads(paths[1].read_text())["identity"]
+    assert id_stock["attention_impl"] == "stock"
+    assert id_flash["attention_impl"] == "flash"
+    assert id_stock != id_flash
+
+
+def test_run_conditions_without_attention_impl_omits_it_from_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Backward compatibility: a `Condition` that never sets `attention_impl` (every
+    0.1.0-era loss_layer/train_step condition) produces an identity with the SAME keys as
+    before -- the field is omitted, not defaulted to `None`, so no prior artifact's shape
+    changes."""
+    monkeypatch.setattr(runner, "_spawn_worker", _crash_worker)
+    cond = _tiny_loss_layer("no_attn")
+    paths = run_conditions([cond], tmp_path, session_id=new_session_id())
+    identity = json.loads(paths[0].read_text())["identity"]
+    assert "attention_impl" not in identity
