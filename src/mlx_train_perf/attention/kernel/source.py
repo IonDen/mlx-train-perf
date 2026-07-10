@@ -659,3 +659,135 @@ def build_bwd_dq_source(head_dim: int, *, causal: bool, flip_causal: bool = Fals
     else:
         keep = "kk <= row"
     return _BWD_DQ_TEMPLATE.replace("HEAD_DIM", str(head_dim)).replace("KEEP_CMP", keep)
+
+
+# ---------------------------------------------------------------------------------------
+# Backward: dK/dV split-partials kernel v1 (ONE OWNER PER (batch, kv_head, key)) -- T9, spec
+# Section 4.2.4. One program owns dK[j] and dV[j] for a single key j; each DISPATCH covers a
+# bounded query-block range [q_lo, q_hi) and the owner accumulates that range's contribution
+# into fp32 dK/dV registers seeded FROM the incoming chained partial (`dk_in`/`dv_in`). The
+# math mirrors api.py's pure-MLX `_flash_attention_backward` dK/dV path EXACTLY, specialized to
+# one owner key (the swapped-roles analogue of the dQ v1 body -- there the owner is a query row
+# and the loop runs keys; here the owner is a key and the loop runs queries):
+#   s   = scale * (q_i . k_j)                          (recomputed QK^T, causal-masked)
+#   p   = exp(s - L_i)                                  (L_i is the forward's saved row logsumexp)
+#   dp  = dO_i . v_j                                    (the dP = dO @ V^T term, per query)
+#   ds  = p * (dp - D_i)                                (D_i from T7's launch_bwd_D -- CONSUMED)
+#   dV_j += p * dO_i                                    (P^T @ dO, accumulated over the group)
+#   dK_j += scale * ds * q_i                            (scale * dS^T @ q, grouped like dV)
+#
+# CHAINED == SINGLE, BIT-IDENTICALLY. Unlike the forward/dQ (whose outputs are DISJOINT across
+# query blocks, so their launcher concatenates), dK/dV for key j receive a contribution from
+# EVERY query row i >= j -- across all query blocks -- so the accumulator must be THREADED
+# across chained dispatches like the CE forward chains lse/tgt (full buffers + in-kernel
+# offsets, never a Python-side slice -- the CE kernel's 1.22 GB retained-copy lesson). The
+# owner (1) seeds dk/dv FROM `dk_in`/`dv_in` FIRST, then (2) accumulates this dispatch's range
+# with the query row as the OUTER loop (ascending) and the q-head as the INNER loop (ascending).
+# A range split into ascending contiguous [q_lo, q_hi) dispatches, each seeded from the prior's
+# fp32 output (fp32->fp32 store/reload is lossless), therefore reproduces the single [0, n)
+# dispatch's exact sequential `+=` order -- bit-identical, no atomics, deterministic run to run.
+#
+# GQA `kv_head = q_head // group_size` (contiguous grouping, T2-pinned): the owner's kv head
+# `kvh` owns the CONTIGUOUS q-head group [kvh*group_size, (kvh+1)*group_size), and the inner
+# loop walks exactly that group -- K/V are never expanded. Every key is an owner in EVERY
+# dispatch (grid.x == n): a key with no causally-allowed query in the range simply copies
+# `dk_in`->`dk_out` unchanged, carrying the chained accumulator forward.
+#
+# CAUSAL SKIP = the concrete per-query inequality `i >= key` (query row at or below the
+# diagonal) applied BEFORE a query contributes -- masked queries have p=0 in the reference, so
+# skipping them is exact. `flip_causal` is TEST-ONLY: it flips the inequality to the WRONG
+# triangle (`i <= key`) so a parity run against the causal oracle FAILS (the named-bug-site
+# perturbation, the dK/dV analogue of the dQ kernel's `flip_causal`). Never used by production.
+#
+# fp32 accumulators throughout regardless of the input template `T` (bf16 or fp32); q/k/v/dO
+# are read through `T` and upcast; L and D are fixed fp32 device buffers; dK/dV are written to
+# FIXED fp32 output buffers (`dk_out`/`dv_out`) -- the chained partial stays fp32 across the
+# whole launch, cast down to k/v dtype exactly once by the launcher after the last dispatch
+# (matching the CE d_hidden chain's single final cast, and the forward's fp32-L convention).
+_BWD_DKV_TEMPLATE = """
+    uint key = thread_position_in_grid.x;         // 0..n-1 (absolute key position == owner)
+    uint bkv = thread_position_in_grid.y;         // 0..(b*hkv)-1
+    uint q_lo = qoffs[0];
+    uint q_hi = qoffs[1];
+
+    uint hq = q_shape[1];
+    uint n = q_shape[2];
+    uint hkv = k_shape[1];
+    uint group_size = hq / hkv;
+    if (key >= n) return;                         // defensive (dispatchThreads clamps x)
+
+    uint b = bkv / hkv;
+    uint kvh = bkv % hkv;
+    uint h0 = kvh * group_size;                   // first q-head of this kv group (contiguous GQA)
+
+    float scale = scale_in[0];
+
+    // Owner's k/v row and its dK/dV accumulator slot -- all share the (B, Hkv, N, D) layout.
+    size_t kv_row = ((size_t)(b * hkv + kvh) * n + key) * HEAD_DIM;
+
+    float kreg[HEAD_DIM];
+    float vreg[HEAD_DIM];
+    float dk[HEAD_DIM];
+    float dv[HEAD_DIM];
+    for (uint dd = 0; dd < HEAD_DIM; ++dd) {
+        kreg[dd] = (float)k[kv_row + dd];
+        vreg[dd] = (float)v[kv_row + dd];
+        dk[dd] = dk_in[kv_row + dd];              // seed FROM the incoming chained partial FIRST
+        dv[dd] = dv_in[kv_row + dd];
+    }
+
+    // Query-row OUTER (ascending), q-head INNER (ascending): a range split reproduces the
+    // single-dispatch accumulation order exactly. Queries above the diagonal (i < key under
+    // causal) have p=0 in the reference, so skipping them is exact.
+    for (uint i = q_lo; i < q_hi; ++i) {
+        bool keep = (KEEP_CMP);
+        if (!keep) { continue; }
+        for (uint h = h0; h < h0 + group_size; ++h) {
+            size_t qh_row = ((size_t)(b * hq + h) * n + i) * HEAD_DIM;
+            size_t ld_idx = (size_t)(b * hq + h) * n + i;
+            float s = 0.0f;
+            for (uint dd = 0; dd < HEAD_DIM; ++dd) {
+                s += (float)q[qh_row + dd] * kreg[dd];
+            }
+            float p = metal::exp(s * scale - lse[ld_idx]);
+            float dp = 0.0f;
+            for (uint dd = 0; dd < HEAD_DIM; ++dd) {
+                dp += (float)d_o[qh_row + dd] * vreg[dd];
+            }
+            float sds = scale * p * (dp - d_arr[ld_idx]);
+            for (uint dd = 0; dd < HEAD_DIM; ++dd) {
+                dv[dd] += p * (float)d_o[qh_row + dd];
+                dk[dd] += sds * (float)q[qh_row + dd];
+            }
+        }
+    }
+
+    for (uint dd = 0; dd < HEAD_DIM; ++dd) {
+        dk_out[kv_row + dd] = dk[dd];
+        dv_out[kv_row + dd] = dv[dd];
+    }
+"""
+
+
+def build_bwd_dkv_source(head_dim: int, *, causal: bool, flip_causal: bool = False) -> str:
+    """MSL function body for the v1 one-owner-per-key chained dK/dV backward kernel.
+
+    `head_dim` in {64, 96, 128} is baked in as a compile-time constant (fixing the per-thread
+    `kreg`/`vreg`/`dk`/`dv` array sizes and the D-loop bounds). `causal=True` keeps only queries
+    `i >= key` (the causal skip); `causal=False` keeps every query. `flip_causal` is TEST-ONLY
+    -- it flips the causal-keep inequality to the WRONG triangle (`i <= key`) so a parity run
+    against the causal oracle FAILS (the named-bug-site perturbation, the dK/dV analogue of the
+    dQ kernel's `flip_causal`)."""
+    if head_dim not in _KERNEL_HEAD_DIMS:
+        raise ValueError(
+            f"head_dim must be one of {_KERNEL_HEAD_DIMS}, got {head_dim}"
+        )
+    if flip_causal and not causal:
+        raise ValueError("flip_causal is only meaningful with causal=True")
+    if not causal:
+        keep = "true"
+    elif flip_causal:
+        keep = "i <= key"
+    else:
+        keep = "i >= key"
+    return _BWD_DKV_TEMPLATE.replace("HEAD_DIM", str(head_dim)).replace("KEEP_CMP", keep)
