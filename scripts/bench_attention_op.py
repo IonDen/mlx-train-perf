@@ -15,13 +15,14 @@ arms, both measured at the SAME shape so the comparison is apples to apples:
            op is the one this project's flash arm stands in for).
 
 Each condition (one `(impl, n)` pair) measures TWO peaks with independent
-reset-peak/eval boundaries (worker discipline from `bench/worker.py`: warmup pays Metal
-JIT -- and, for `flash`, the construction-time rate/table calibration `attention/api.py`'s
-own module docstring requires -- OUTSIDE any timed/peak window):
+reset-peak/eval boundaries (worker discipline from `bench/worker.py`: warmup runs BOTH a
+forward and one full `value_and_grad` backward, so Metal JIT for every kernel -- incl.
+the uncalibrated D-preprocess, whose first dispatch is backward-only -- and, for `flash`,
+the construction-time rate/table calibration land OUTSIDE any timed/peak window):
 
   fwd_peak_gb    -- one forward-only call.
   fwdbwd_peak_gb -- `mx.value_and_grad` over `attn(...).sum()` w.r.t. (q, k, v); `wall_s`
-                    is this call's wall-clock.
+                    is the MEDIAN of `WALL_REPS` such calls (per-rep walls in `walls_s`).
 
 The O(N) PROOF is `fwdbwd_peak_gb`'s doubling ratio across `--seq-lens`: flash should show
 ~2x per doubling (O(N)-class), stock ~3.8x (the measured O(N^2) baseline, spec §8). That
@@ -53,6 +54,7 @@ import argparse
 import hashlib
 import json
 import math
+import statistics
 import subprocess
 import sys
 import time
@@ -80,6 +82,7 @@ DEFAULT_HEADS = 32
 DEFAULT_KV_HEADS = 8
 DTYPE = mx.bfloat16
 SEED = 0
+WALL_REPS = 3   # median-of-3 walls (bench_backward_ladder's convention); peaks span all reps
 
 _STDERR_TAIL_CHARS = 4000  # enough to see the failing assertion/traceback, not a full dump
 
@@ -203,8 +206,25 @@ def measure_condition(
     scale = 1.0 / math.sqrt(condition.head_dim)
     q, k, v = _build_qkv(condition, dtype=dtype, seed=seed)
 
+    def loss(q_: mx.array, k_: mx.array, v_: mx.array) -> mx.array:
+        return _attn_call(condition, q_, k_, v_, scale=scale).sum()
+
+    vag = mx.value_and_grad(loss, argnums=(0, 1, 2))
+
+    # Warm BOTH passes: the forward pays construction-time calibration + fwd-kernel JIT,
+    # and one unmeasured backward pays the backward-only JIT (launch_bwd_D has no
+    # calibration probe, so its first dispatch would otherwise land inside the measured
+    # fwd+bwd window -- T11 review finding).
     warm = _attn_call(condition, q, k, v, scale=scale)
     mx.eval(warm)
+    warm_val, warm_grads = vag(q, k, v)
+    mx.eval(warm_val, *warm_grads)
+    # Deliberately kept ALIVE through both measured windows: freeing them here races the
+    # allocator's deferred release against the `active_before` snapshots below and can
+    # read a stale-high baseline (measured: -13 MB "marginal peak" at N=256). Holding
+    # them puts their footprint in the baseline, which the subtraction removes; the
+    # synchronize() flushes the warmup's own transient releases for the same reason.
+    mx.synchronize()
     mx.clear_cache()
 
     active_before_fwd = mx.get_active_memory()
@@ -213,18 +233,17 @@ def measure_condition(
     mx.eval(o)
     fwd_peak_gb = (mx.get_peak_memory() - active_before_fwd) / 1024**3
 
-    def loss(q_: mx.array, k_: mx.array, v_: mx.array) -> mx.array:
-        return _attn_call(condition, q_, k_, v_, scale=scale).sum()
-
-    vag = mx.value_and_grad(loss, argnums=(0, 1, 2))
-
+    mx.synchronize()   # settle the fwd window's transient releases before the snapshot
     mx.clear_cache()
     active_before_bwd = mx.get_active_memory()
     mx.reset_peak_memory()
-    t0 = time.perf_counter()
-    val, grads = vag(q, k, v)
-    mx.eval(val, *grads)
-    wall_s = time.perf_counter() - t0
+    walls: list[float] = []
+    for _ in range(WALL_REPS):
+        t0 = time.perf_counter()
+        val, grads = vag(q, k, v)
+        mx.eval(val, *grads)
+        walls.append(time.perf_counter() - t0)
+    wall_s = statistics.median(walls)
     fwdbwd_peak_gb = (mx.get_peak_memory() - active_before_bwd) / 1024**3
 
     return {
@@ -233,6 +252,7 @@ def measure_condition(
         "fwd_peak_gb": round(fwd_peak_gb, 4),
         "fwdbwd_peak_gb": round(fwdbwd_peak_gb, 4),
         "wall_s": round(wall_s, 6),
+        "walls_s": [round(w, 6) for w in walls],
     }
 
 
