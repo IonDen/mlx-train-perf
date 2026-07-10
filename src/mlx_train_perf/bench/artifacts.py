@@ -26,6 +26,13 @@ from pathlib import Path
 from mlx_train_perf._compat import _installed_mlx_version
 from mlx_train_perf.errors import BenchInputError
 
+# T10 (0.2.0, spec §8 amendment): the attention-path CODE_SHA_DEPS entries and the
+# attention_impl/dkv_split_policy/attention_variant identity fields below are additive.
+# Existing condition kinds (loss_layer, train_step) never pass the new
+# condition_identity() kwargs, so their identity dict keeps EXACTLY the same keys as
+# before -- the new fields are omitted (not defaulted to `None`) when unset. No existing
+# artifact's shape changes, so SCHEMA_VERSION stays 1. T11's attention artifact is a NEW
+# `kind`, not a reshape of an existing one, which is the other reason a bump isn't due.
 SCHEMA_VERSION = 1
 
 _PACKAGE_ROOT = Path(__file__).resolve().parent.parent  # .../src/mlx_train_perf
@@ -45,10 +52,24 @@ CODE_SHA_DEPS: tuple[Path, ...] = tuple(
         "core/kernel/source.py",
         "core/guards.py",
         "adapters/mlx_lm.py",
+        # T10 (0.2.0): the attention-path files T11/T13's measured conditions depend on.
+        # `attention/wrapper.py` is deliberately NOT listed here -- it does not exist yet
+        # (T12's job); `_code_sha` does a tolerance-free `read_bytes()` on every dep, so a
+        # not-yet-existing path would raise FileNotFoundError in EVERY identity call.
+        "attention/reference.py",
+        "attention/api.py",
+        "attention/kernel/source.py",
+        "attention/kernel/launch.py",
+        "attention/kernel/dispatch.py",
     )
 )
 
-_RESERVED_PARAM_KEYS = ("kind", "session_id")
+_RESERVED_PARAM_KEYS = (
+    "kind", "session_id",
+    # T10 (0.2.0): reserved because they are supplied to `condition_identity` as
+    # dedicated keyword args (see below), not as free-form `params` entries.
+    "attention_impl", "dkv_split_policy", "attention_variant",
+)
 
 
 def _code_sha(deps: tuple[Path, ...]) -> str:
@@ -114,20 +135,40 @@ def run_identity(**kw: object) -> dict[str, object]:
 
 def condition_identity(
     *, kind: str, session_id: str, params: dict[str, object],
+    attention_impl: str | None = None,
+    dkv_split_policy: str | None = None,
+    attention_variant: str | None = None,
 ) -> dict[str, object]:
     """The single call site both `runner.run_conditions` and `worker.main` use to build
     one condition's identity. `kind`/`session_id` are supplied separately by the
     caller -- a `params` dict that happens to reuse either name would otherwise reach
     `run_identity(kind=kind, session_id=session_id, **params)` and fail with a raw
     `TypeError: got multiple values for keyword argument`; this raises a clean, named
-    error instead."""
+    error instead.
+
+    `attention_impl`/`dkv_split_policy`/`attention_variant` (T10, 0.2.0, spec §8
+    amendment) are the same kind of dedicated, reserved identity input as `kind`/
+    `session_id` -- an attention-measuring condition (T11/T13) passes them explicitly so
+    two conditions differing only in one of them get different identities; `params` may
+    not also set them (rejected below, same collision-avoidance reasoning as `kind`/
+    `session_id`). Each is OMITTED from the returned identity (not defaulted to `None`)
+    when the caller leaves it unset, so a non-attention condition kind's identity keeps
+    the exact same keys it had before this parameter existed."""
     for key in _RESERVED_PARAM_KEYS:
         if key in params:
             raise BenchInputError(
                 f"condition params must not use the reserved key {key!r} -- it is "
                 "supplied separately by the bench runner/worker"
             )
-    return run_identity(kind=kind, session_id=session_id, **params)
+    attention_fields: dict[str, object] = {
+        field_name: value for field_name, value in (
+            ("attention_impl", attention_impl),
+            ("dkv_split_policy", dkv_split_policy),
+            ("attention_variant", attention_variant),
+        )
+        if value is not None
+    }
+    return run_identity(kind=kind, session_id=session_id, **attention_fields, **params)
 
 
 def write_result(path: Path, identity: dict[str, object], status: str, **fields: object) -> None:
