@@ -10,8 +10,14 @@ from mlx_train_perf.attention.reference import (
     kv_head_for,
     math_attention,
 )
+from mlx_train_perf.attention.wrapper import (
+    FlashAttentionWrapper,
+    enable_flash_attention,
+)
 
 __all__ = [
+    "FlashAttentionWrapper",
+    "enable_flash_attention",
     "flash_attention",
     "flash_attention_reference",
     "kv_head_for",

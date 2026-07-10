@@ -52,15 +52,16 @@ CODE_SHA_DEPS: tuple[Path, ...] = tuple(
         "core/kernel/source.py",
         "core/guards.py",
         "adapters/mlx_lm.py",
-        # T10 (0.2.0): the attention-path files T11/T13's measured conditions depend on.
-        # `attention/wrapper.py` is deliberately NOT listed here -- it does not exist yet
-        # (T12's job); `_code_sha` does a tolerance-free `read_bytes()` on every dep, so a
-        # not-yet-existing path would raise FileNotFoundError in EVERY identity call.
+        # T10/T12 (0.2.0): the attention-path files T11/T13's measured conditions depend on.
+        # `attention/wrapper.py` (T12's `enable_flash_attention` integration surface) joins
+        # here now that it exists -- a train_step condition that enables flash attention runs
+        # through it, so a byte-change to it must invalidate a prior artifact.
         "attention/reference.py",
         "attention/api.py",
         "attention/kernel/source.py",
         "attention/kernel/launch.py",
         "attention/kernel/dispatch.py",
+        "attention/wrapper.py",
     )
 )
 
