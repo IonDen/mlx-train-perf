@@ -15,6 +15,7 @@ Metal kernel + `math_attention` autodiff at a tiny shape, gated behind
 `--run-benchmark`.
 """
 import json
+import statistics
 import subprocess
 import sys
 from pathlib import Path
@@ -280,5 +281,9 @@ def test_bench_attention_op_tiny_smoke_writes_ok_artifacts_for_both_impls(
         assert data["fwd_peak_gb"] >= 0
         assert data["fwdbwd_peak_gb"] >= 0
         assert data["wall_s"] > 0
+        # wall_s is the median of WALL_REPS per-rep walls (T11 review fix: backward
+        # JIT warmed outside the window, wall no longer single-shot)
+        assert len(data["walls_s"]) == bench_attention_op.WALL_REPS
+        assert data["wall_s"] == statistics.median(data["walls_s"])
     assert flash["impl"] == "flash"
     assert stock["impl"] == "stock"
