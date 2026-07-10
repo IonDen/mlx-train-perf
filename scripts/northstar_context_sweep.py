@@ -112,18 +112,20 @@ def build_probe(
     # (stock attention + stock loss) -- a free global flag would permit the nonsensical
     # ours-with-stock-attention combination. This edit changes `script_sha()`, which
     # `_recipe_session_id` folds in, so a stale attention-unaware sweep session is
-    # correctly never resumed under the new id.
+    # correctly never resumed under the new id. It rides the dedicated `Condition` field
+    # (out of `params`, where the identity's reserved-key guard would reject it), so the
+    # two arms' identities differ by it and neither resume-skips the other.
     params: dict[str, object] = {
         "model": model, "revision": revision, "seq_len": seq_len, "batch": batch,
         "steps": PROBE_STEPS, "lora_rank": lora_rank, "lora_layers": lora_layers,
         "impl": "auto", "stock": arm == "stock", "seed": seed,
         "compute_dtype": compute_dtype, "grad_checkpoint": grad_checkpoint,
-        "attention_impl": "flash" if arm == "ours" else "stock",
         "script_sha": script_sha(), "dataset_recipe": DATASET_RECIPE,
     }
     return Condition(
         name=probe_condition_name(model=model, seq_len=seq_len, arm=arm),
         kind="train_step", params=params,
+        attention_impl="flash" if arm == "ours" else "stock",
     )
 
 

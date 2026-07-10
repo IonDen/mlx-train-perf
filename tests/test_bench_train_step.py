@@ -16,6 +16,10 @@ from pathlib import Path
 
 import pytest
 
+from mlx_train_perf.bench import runner as bench_runner
+from mlx_train_perf.bench.artifacts import new_session_id
+from mlx_train_perf.bench.runner import run_conditions
+
 _SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts"
 sys.path.insert(0, str(_SCRIPTS_DIR))
 
@@ -93,8 +97,11 @@ def test_build_conditions_ours_and_stock_share_every_param_except_stock_and_impl
     assert ours.params["stock"] is False
     assert stock.params["stock"] is True
     for key in ("model", "revision", "seq_len", "batch", "steps", "lora_rank",
-                "lora_layers", "learning_rate", "seed", "script_sha", "attention_impl"):
+                "lora_layers", "learning_rate", "seed", "script_sha"):
         assert ours.params[key] == stock.params[key]
+    # attention is held constant across both arms -- now a dedicated `Condition` field
+    # (out of `params`), not a params entry.
+    assert ours.attention_impl == stock.attention_impl
 
 
 def test_build_conditions_threads_compute_dtype_into_both_arms() -> None:
@@ -140,16 +147,16 @@ def test_build_conditions_grad_checkpoint_defaults_to_false() -> None:
 
 
 def test_build_conditions_threads_attention_impl_into_both_arms() -> None:
-    """`--attention` reaches EVERY condition's params uniformly (both `ours` and
-    `stock`) -- this bench's `ours`/`stock` arms compare the loss layer at a held-
-    constant attention implementation, unlike the North-Star sweep, where attention
+    """`--attention` reaches EVERY condition's dedicated `attention_impl` field uniformly
+    (both `ours` and `stock`) -- this bench's `ours`/`stock` arms compare the loss layer at
+    a held-constant attention implementation, unlike the North-Star sweep, where attention
     IS the per-arm dimension (bench/worker.py's `attention_impl` knob)."""
     conditions = build_conditions(
         models=["m/a"], seq_lens=[1024], batch=1, steps=20, lora_rank=8, lora_layers=-1,
         learning_rate=1e-5, seed=0, revision=None, attention_impl="flash",
     )
     assert conditions
-    assert all(c.params["attention_impl"] == "flash" for c in conditions)
+    assert all(c.attention_impl == "flash" for c in conditions)
 
 
 def test_build_conditions_attention_impl_defaults_to_stock() -> None:
@@ -157,7 +164,62 @@ def test_build_conditions_attention_impl_defaults_to_stock() -> None:
         models=["m/a"], seq_lens=[1024], batch=1, steps=20, lora_rank=8, lora_layers=-1,
         learning_rate=1e-5, seed=0, revision=None,
     )
-    assert all(c.params["attention_impl"] == "stock" for c in conditions)
+    assert all(c.attention_impl == "stock" for c in conditions)
+
+
+def _crash_worker(_config_path: Path) -> subprocess.CompletedProcess[str]:
+    """A `_spawn_worker` stand-in that "crashes" -- so `run_conditions` takes its
+    error-envelope branch and writes the identity it built, never loading a real model."""
+    return subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="stub crash")
+
+
+def test_build_conditions_flow_reaches_run_conditions_without_reserved_key_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression (T13 step 1): the exact production path that crashed. `build_conditions`'
+    `attention_impl` must travel to `condition_identity` through `run_conditions`' DEDICATED
+    identity slot, NOT through `params` (where the reserved-key guard raises
+    `BenchInputError` before any worker spawns). Worker stubbed at the subprocess boundary;
+    the error-envelope path writes the identity `run_conditions` computed, so reading it
+    back proves the field reached the identity."""
+    monkeypatch.setattr(bench_runner, "_spawn_worker", _crash_worker)
+    conditions = build_conditions(
+        models=["m/a"], seq_lens=[1024], batch=1, steps=2, lora_rank=8, lora_layers=-1,
+        learning_rate=1e-5, seed=0, revision=None, attention_impl="flash",
+    )
+    paths = run_conditions(conditions, tmp_path, session_id=new_session_id())
+    assert paths
+    for p in paths:
+        assert json.loads(p.read_text())["identity"]["attention_impl"] == "flash"
+
+
+def test_build_conditions_stock_and_flash_invocations_get_different_identities(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two invocations of the bench differing ONLY in `--attention` (stock vs flash) must
+    produce different artifact identities -- otherwise a flash run would resume-skip a
+    stock artifact (same script_sha, same params) and silently report the wrong numbers."""
+    monkeypatch.setattr(bench_runner, "_spawn_worker", _crash_worker)
+    session_id = new_session_id()
+    stock_paths = run_conditions(
+        build_conditions(
+            models=["m/a"], seq_lens=[1024], batch=1, steps=2, lora_rank=8, lora_layers=-1,
+            learning_rate=1e-5, seed=0, revision=None, attention_impl="stock",
+        ),
+        tmp_path / "stock", session_id=session_id,
+    )
+    flash_paths = run_conditions(
+        build_conditions(
+            models=["m/a"], seq_lens=[1024], batch=1, steps=2, lora_rank=8, lora_layers=-1,
+            learning_rate=1e-5, seed=0, revision=None, attention_impl="flash",
+        ),
+        tmp_path / "flash", session_id=session_id,
+    )
+    id_stock = json.loads(stock_paths[0].read_text())["identity"]
+    id_flash = json.loads(flash_paths[0].read_text())["identity"]
+    assert id_stock["attention_impl"] == "stock"
+    assert id_flash["attention_impl"] == "flash"
+    assert id_stock != id_flash
 
 
 def test_build_conditions_all_share_the_same_script_sha() -> None:
