@@ -75,7 +75,11 @@ from mlx_train_perf.errors import AttentionInputError, LaunchBudgetError
 # 5-10s GPU watchdog the 1.0s figure assumed. The CE kernel's shipped ~0.5s-real dispatches
 # have never been killed (0.1.0 T13: zero watchdog events), so 0.5s projected (~0.25s real
 # behind the 2x SAFETY margin) sits in the proven-safe class. Raising this needs new
-# kill-threshold evidence.
+# kill-threshold evidence. A 2026-07-10 ground-truth probe (13 conditions,
+# _artifacts/attention_bwd_rungs/buffer_packing_probe/) found the kill SYSTEM-STATE-DEPENDENT:
+# real 1.0s single dispatches SURVIVED, but only on a PERMISSIVE (idle-display) day -- the kill
+# is display/UI-contention-driven, so this stays pinned to the WORST observed day and a
+# permissive-day survival never licenses raising it.
 MAX_DISPATCH_SECONDS = 0.5
 _CANARY_BUDGET_S = 0.1   # projected cost of the calibration's final full-working-set probe
 # 2.0, NOT 60 (T6 rung-0, second measurement): the OS kill is per COMMAND BUFFER /
@@ -85,7 +89,11 @@ _CANARY_BUDGET_S = 0.1   # projected cost of the calibration's final full-workin
 # buffers from inside a compiled/traced region. The CE kernel's ~2.2s evals have never
 # been killed, so ~2s is the proven-safe class for one eval's packed custom-kernel work.
 # Consequence: a flagship v0-scalar forward REFUSES honestly (its 8.7s total cannot ship);
-# MMA-class rates fit a full forward far inside this cap.
+# MMA-class rates fit a full forward far inside this cap. The same 2026-07-10 probe packed
+# 8.6-9.2s single-eval work that all SURVIVED on a permissive day -- but the kill is
+# system-state-dependent (a kill-active day still bounds one eval's packed custom-kernel work to
+# the ~2s class), so this too stays pinned to the worst observed day; a permissive-day probe
+# never licenses raising it.
 MAX_TOTAL_SECONDS = 2.0
 SAFETY_FACTOR = 0.5      # halve the measured rate (session drift + probe noise, 2x margin)
 _PROBE_N_FLOOR = 128     # ramp's minimum/starting probe key-count -- the original fixed
@@ -309,10 +317,11 @@ def _next_probe_n(
     SAFETY_FACTOR-halved rate, and `_calibrate_fwd`'s ramp uses this to size the NEXT probe
     one stage ahead of what it has actually measured.
 
-    `macs_per_row` is the per-query-row MAC cost model (default the forward's `2*D`; the
-    backward rate ramp passes the dK/dV `4*D` cost via `calibrated_bwd_rate`) -- the only
-    kernel-specific input, so the SAME ramp machinery sizes both the forward and the backward
-    probe (design point 4). When the caller's real `n` is already <= `_PROBE_N_FLOOR`, this
+    `macs_per_row` is the per-query-row MAC cost model (default the forward's `2*D`; the dQ rate
+    ramp passes `3*D` via `calibrated_bwd_dq_rate`, the dK/dV rate ramp `4*D` via
+    `calibrated_bwd_dkv_rate`) -- the only kernel-specific input, so the SAME ramp machinery sizes
+    the forward and both backward probes (design point 4). When the caller's real `n` is already
+    <= `_PROBE_N_FLOOR`, this
     returns `n` directly without a budget check -- that shape was already measured successfully
     as the ramp's OWN starting probe (`_start_probe_n` never exceeds the floor either), so
     re-deriving it here is redundant, not unsafe. Otherwise floors at `_PROBE_N_FLOOR` even if
@@ -380,11 +389,11 @@ def _calibrate_fwd(
     Skipped only when the ramp already measured the full n x n shape (harsher than any
     range dispatch). Returns the raw (un-halved) rate -- the caller applies SAFETY_FACTOR.
 
-    `macs_per_row` (default the forward's `2*D`) is the per-query-row MAC cost model; the
-    backward rate (`calibrated_bwd_rate`) reuses this exact ramp/canary machinery by passing
-    the dK/dV `4*D` cost (design point 4) -- so the ONLY kernel-specific input is this one
-    additive parameter. T6's KV-block tiling changes the cost model: re-validate both budgets
-    then."""
+    `macs_per_row` (default the forward's `2*D`) is the per-query-row MAC cost model; the two
+    per-kernel backward rates (`calibrated_bwd_dq_rate` at `3*D`, `calibrated_bwd_dkv_rate` at
+    `4*D`) reuse this exact ramp/canary machinery by passing their own cost (design point 4) -- so
+    the ONLY kernel-specific input is this one additive parameter. T6's KV-block tiling changes
+    the cost model: re-validate both budgets then."""
     np_ = start_n
     per_dispatch_s = 0.0
     for _stage in range(max_stages):
@@ -763,11 +772,6 @@ def launch_bwd_dq(
 
 _BWD_DKV_THREADGROUP = 32   # one thread per key; 32 (SIMD width) groups them for occupancy
 
-# key: (head_dim, dtype, causal, b, hq, n-bucket) -- the backward rate is a single MAC/s
-# throughput number sizing BOTH the dQ and dK/dV query-range splits (each launcher applies its
-# own per-row MAC cost), calibrated on the dK/dV kernel (the 4*D-per-pair heavier path).
-_BWD_RATE_CACHE: dict[tuple[int, str, bool, int, int, int], float] = {}
-
 
 def _bwd_dkv_macs_per_row(*, n: int, d: int, b: int, hq: int) -> int:
     """Conservative per-query-row MAC upper bound for dK/dV: each of the n keys costs an
@@ -945,35 +949,113 @@ def launch_bwd_dkv(
     return dk.astype(k.dtype), dv.astype(v.dtype)
 
 
-def calibrated_bwd_rate(
-    *, head_dim: int, dtype: mx.Dtype, b: int, hq: int, hkv: int, n: int, causal: bool,
-) -> float:
-    """Cached, safety-factored, N-aware MAC/s throughput for the chained dK/dV backward kernel,
-    used to size BOTH the dQ and dK/dV query-range splits at construction time (never inside the
-    vjp -- host-sync timing is compile-hostile). A single backward throughput number: each
-    launcher applies its own per-row MAC cost, and calibrating on the dK/dV kernel (the 4*D
-    heavier of the two) keeps the shared rate conservative for the dQ split.
+# ---------------------------------------------------------------------------------------
+# T9b Step 3 (graduation): PER-KERNEL calibrated backward rates. The Step-1 checkpoint
+# measured the two backward kernels' scalar throughputs 2.35x apart (dQ streams k/v per row
+# with no reuse; dK/dV reuses k/v registers across a GQA group's 4 q-heads), which measurably
+# FAILS the shared-rate safety condition throughput_dq >= 0.5*throughput_dkv -- so the earlier
+# single shared backward rate (which sized BOTH splits from the dK/dV kernel) is retired for
+# TWO probe-what-you-rate rates: each split is sized by its OWN kernel's measured throughput,
+# with no cross-kernel assumption at all. Each reuses the forward's ramp/canary machinery
+# (`_calibrate_fwd`) via its own per-row MAC cost model, builds and probes the SAME
+# (variant, d_slab) kernel the launcher will dispatch (the mma winner at the measured bucket),
+# and caches on (head_dim, dtype, causal, b, hq, n-bucket, variant, d_slab) -- the same key
+# shape as `_FWD_RATE_CACHE`. Same discipline as `calibrated_fwd_rate`: probe QKV/dO from a
+# LOCAL `mx.random.key(0)` (never `mx.random.seed`), never call inside a compiled region.
+# ---------------------------------------------------------------------------------------
 
-    Reuses the forward's ramp/canary machinery (`_calibrate_fwd`) via the dK/dV per-row cost
-    model (`_bwd_dkv_macs_per_row`) -- the design-point-4 macs-per-row parameterization. Same
-    discipline as `calibrated_fwd_rate`: probe QKV/dO are drawn from a LOCAL `mx.random.key(0)`
-    (never `mx.random.seed`, so calibration never mutates the caller's global RNG stream), the
-    rate is cached per occupancy regime, and it must never be called inside a compiled region."""
-    key = (head_dim, str(dtype), causal, b, hq, _n_bucket(n))
-    if key in _BWD_RATE_CACHE:
-        return _BWD_RATE_CACHE[key]
+# key: (head_dim, dtype, causal, b, hq, n-bucket, variant, d_slab) -- variant/d_slab-aware,
+# one cache per backward kernel (dQ / dK/dV are separate measurements at separate rates).
+_BWD_DQ_RATE_CACHE: dict[tuple[int, str, bool, int, int, int, str, int | None], float] = {}
+_BWD_DKV_RATE_CACHE: dict[tuple[int, str, bool, int, int, int, str, int | None], float] = {}
+
+
+def calibrated_bwd_dq_rate(
+    *, head_dim: int, dtype: mx.Dtype, b: int, hq: int, hkv: int, n: int, causal: bool,
+    tile: TileShape,
+) -> float:
+    """Cached, safety-factored, N-aware MAC/s throughput for the dQ backward kernel `tile`
+    actually names, used to size the dQ query-row split. Ramps the probe key-count toward the
+    caller's real `n` via `_calibrate_fwd` at the dQ `3*D` per-row cost (`_bwd_dq_macs_per_row`),
+    and PROBES WHAT IT RATES: `measure()` builds and dispatches the SAME (`tile.variant`,
+    `tile.d_slab`) dQ kernel the launcher runs, so an mma call never reads a scalar-measured rate.
+    Cached per (head_dim, dtype, causal, b, hq, n-bucket, variant, d_slab). Must never be called
+    inside a compiled region (host-sync timing)."""
+    key = (head_dim, str(dtype), causal, b, hq, _n_bucket(n), tile.variant, tile.d_slab)
+    if key in _BWD_DQ_RATE_CACHE:
+        return _BWD_DQ_RATE_CACHE[key]
 
     key_q, key_k, key_v, key_do = mx.random.split(mx.random.key(0), 4)
     scale = 1.0 / (head_dim ** 0.5)
-    kernel = _bwd_dkv_kernel(head_dim, causal, False, "scalar", None)
+    kernel = _bwd_dq_kernel(head_dim, causal, False, tile.variant, tile.d_slab)
+    scale_in = mx.array([scale], dtype=mx.float32)
+    probes: dict[tuple[int, int], tuple[mx.array, ...]] = {}
+
+    def measure(rows: int, keys: int) -> float:
+        # Times one dQ dispatch of query rows [keys-rows, keys) against a full `keys`-key working
+        # set -- the production tail range (high query indices scan the most keys under causal),
+        # mirroring calibrated_fwd_rate.measure. lse/D are zeros (this is a TIMING probe -- the
+        # kernel does identical FLOPs regardless of the residual values).
+        if (rows, keys) not in probes:
+            qp = mx.random.normal((b, hq, keys, head_dim), key=key_q).astype(dtype)
+            kp = mx.random.normal((b, hkv, keys, head_dim), key=key_k).astype(dtype)
+            vp = mx.random.normal((b, hkv, keys, head_dim), key=key_v).astype(dtype)
+            dop = mx.random.normal((b, hq, keys, head_dim), key=key_do).astype(dtype)
+            lsep = mx.zeros((b, hq, keys), dtype=mx.float32)
+            dp = mx.zeros((b, hq, keys), dtype=mx.float32)
+            mx.eval(qp, kp, vp, dop, lsep, dp)
+            probes[(rows, keys)] = (qp, kp, vp, dop, lsep, dp)
+            # Metal JIT + cold clocks/caches: this first dispatch is deliberately unmeasured.
+            wdq = _dispatch_bwd_dq_range(
+                kernel, qp, kp, vp, dop, lsep, dp, scale_in,
+                r0=keys - rows, r1=keys, variant=tile.variant,
+            )
+            mx.eval(wdq)
+        qp, kp, vp, dop, lsep, dp = probes[(rows, keys)]
+        t0 = time.perf_counter()
+        rdq = _dispatch_bwd_dq_range(
+            kernel, qp, kp, vp, dop, lsep, dp, scale_in,
+            r0=keys - rows, r1=keys, variant=tile.variant,
+        )
+        mx.eval(rdq)
+        return time.perf_counter() - t0
+
+    start_n = _start_probe_n(n)
+    raw_rate = _calibrate_fwd(
+        measure=measure, n=n, d=head_dim, b=b, hq=hq, start_n=start_n,
+        macs_per_row=_bwd_dq_macs_per_row,
+    )
+    rate = SAFETY_FACTOR * raw_rate
+    _BWD_DQ_RATE_CACHE[key] = rate
+    return rate
+
+
+def calibrated_bwd_dkv_rate(
+    *, head_dim: int, dtype: mx.Dtype, b: int, hq: int, hkv: int, n: int, causal: bool,
+    tile: TileShape,
+) -> float:
+    """Cached, safety-factored, N-aware MAC/s throughput for the chained dK/dV backward kernel
+    `tile` actually names, used to size the dK/dV query-range split. Ramps toward the caller's
+    real `n` via `_calibrate_fwd` at the dK/dV `4*D` per-row cost (`_bwd_dkv_macs_per_row`), and
+    PROBES WHAT IT RATES: `measure()` builds and dispatches the SAME (`tile.variant`,
+    `tile.d_slab`) dK/dV kernel the launcher runs. Cached per (head_dim, dtype, causal, b, hq,
+    n-bucket, variant, d_slab). Must never be called inside a compiled region (host-sync
+    timing)."""
+    key = (head_dim, str(dtype), causal, b, hq, _n_bucket(n), tile.variant, tile.d_slab)
+    if key in _BWD_DKV_RATE_CACHE:
+        return _BWD_DKV_RATE_CACHE[key]
+
+    key_q, key_k, key_v, key_do = mx.random.split(mx.random.key(0), 4)
+    scale = 1.0 / (head_dim ** 0.5)
+    kernel = _bwd_dkv_kernel(head_dim, causal, False, tile.variant, tile.d_slab)
     scale_in = mx.array([scale], dtype=mx.float32)
     probes: dict[tuple[int, int], tuple[mx.array, ...]] = {}
 
     def measure(rows: int, keys: int) -> float:
         # Times one dK/dV dispatch of query rows [keys-rows, keys) against a full `keys`-key
-        # working set -- the production tail range (high query indices scan the most keys under
-        # causal), mirroring calibrated_fwd_rate.measure. lse/D are zeros (this is a TIMING
-        # probe -- the kernel does identical FLOPs regardless of the residual values).
+        # working set -- the production tail range, mirroring calibrated_fwd_rate.measure. lse/D
+        # are zeros (a TIMING probe: the kernel does identical FLOPs regardless of the residual
+        # values); dk_in/dv_in seed the chained accumulator with zeros (single-dispatch probe).
         if (rows, keys) not in probes:
             qp = mx.random.normal((b, hq, keys, head_dim), key=key_q).astype(dtype)
             kp = mx.random.normal((b, hkv, keys, head_dim), key=key_k).astype(dtype)
@@ -985,18 +1067,17 @@ def calibrated_bwd_rate(
             dv0 = mx.zeros((b, hkv, keys, head_dim), dtype=mx.float32)
             mx.eval(qp, kp, vp, dop, lsep, dp, dk0, dv0)
             probes[(rows, keys)] = (qp, kp, vp, dop, lsep, dp, dk0, dv0)
-            # Metal JIT + cold clocks/caches: this first dispatch is deliberately unmeasured
-            # (mirrors calibrated_fwd_rate's per-shape warmup).
+            # Metal JIT + cold clocks/caches: this first dispatch is deliberately unmeasured.
             wdk, wdv = _dispatch_bwd_dkv_range(
                 kernel, qp, kp, vp, dop, lsep, dp, dk0, dv0, scale_in,
-                q_lo=keys - rows, q_hi=keys,
+                q_lo=keys - rows, q_hi=keys, variant=tile.variant,
             )
             mx.eval(wdk, wdv)
         qp, kp, vp, dop, lsep, dp, dk0, dv0 = probes[(rows, keys)]
         t0 = time.perf_counter()
         rdk, rdv = _dispatch_bwd_dkv_range(
             kernel, qp, kp, vp, dop, lsep, dp, dk0, dv0, scale_in,
-            q_lo=keys - rows, q_hi=keys,
+            q_lo=keys - rows, q_hi=keys, variant=tile.variant,
         )
         mx.eval(rdk, rdv)
         return time.perf_counter() - t0
@@ -1007,5 +1088,5 @@ def calibrated_bwd_rate(
         macs_per_row=_bwd_dkv_macs_per_row,
     )
     rate = SAFETY_FACTOR * raw_rate
-    _BWD_RATE_CACHE[key] = rate
+    _BWD_DKV_RATE_CACHE[key] = rate
     return rate

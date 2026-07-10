@@ -56,6 +56,23 @@ MEASURED: dict[int, dict[int, tuple[str, int, float]]] = {
 _UNMEASURED_HEAD_DIM_CHOICE: tuple[str, int | None] = ("mma", None)
 
 
+def _select_from_measured(
+    measured: dict[int, dict[int, tuple[str, int, float]]], n: int, head_dim: int
+) -> TileShape:
+    """Measured/provisional tile for ONE kernel's `measured` table, mirroring the forward's
+    nearest-log2-bucket + `[bucket, 2*bucket)` same-occupancy-regime window VERBATIM. The
+    head_dim gate is applied once by each public selector before calling this (so it never
+    double-raises), leaving this to the pure bucket/provisional arithmetic."""
+    buckets = measured.get(head_dim)
+    if not buckets:
+        variant, d_slab = _UNMEASURED_HEAD_DIM_CHOICE
+        return TileShape(variant=variant, d_slab=d_slab, provisional=True)
+    bucket = min(buckets, key=lambda b: (abs(math.log2(n) - math.log2(b)), b))  # tie -> lower
+    variant, d_slab, _rate = buckets[bucket]
+    provisional = not (bucket <= n < 2 * bucket)  # inside == same occupancy regime
+    return TileShape(variant=variant, d_slab=d_slab, provisional=provisional)
+
+
 def select_fwd_tile(n: int, head_dim: int) -> TileShape:
     """Measured/provisional forward tile+variant for shape (n, head_dim) -- see the module
     docstring for the ladder this encodes and the occupancy-window provisional rule (mirrors
@@ -69,11 +86,48 @@ def select_fwd_tile(n: int, head_dim: int) -> TileShape:
     """
     if head_dim not in _KERNEL_HEAD_DIMS:
         raise ValueError(f"head_dim must be one of {_KERNEL_HEAD_DIMS}, got {head_dim}")
-    buckets = MEASURED.get(head_dim)
-    if not buckets:
-        variant, d_slab = _UNMEASURED_HEAD_DIM_CHOICE
-        return TileShape(variant=variant, d_slab=d_slab, provisional=True)
-    bucket = min(buckets, key=lambda b: (abs(math.log2(n) - math.log2(b)), b))  # tie -> lower
-    variant, d_slab, _rate = buckets[bucket]
-    provisional = not (bucket <= n < 2 * bucket)  # inside == same occupancy regime
-    return TileShape(variant=variant, d_slab=d_slab, provisional=provisional)
+    return _select_from_measured(MEASURED, n, head_dim)
+
+
+# ---------------------------------------------------------------------------------------
+# T9b Step 3 (graduation) -- BACKWARD dispatch table. The two backward MMA kernels (dQ,
+# dK/dV) were each swept SEPARATELY at the flagship saturation shape (b=1, Hq=32, Hkv=8,
+# N=8192, D=128, bf16, causal) -- their own committed artifacts, their own achieved G MAC/s.
+# Both slab ladders were monotonic 16<32<64<128 (larger-slab-wins, the T6 forward pattern
+# reproduced twice more), and both winners are slab128 -- so the (variant, d_slab) SELECTION
+# coincides, but the RATE that sizes each kernel's query-range split is a distinct measured
+# number (2027.67 G dQ vs 1857.94 G dK/dV, a 1.09x gap at slab128; the scalar-body gap was
+# 2.35x, which is why the shared-rate design was retired). Two tables keep each kernel's
+# artifact provenance honest even where the winner coincides.
+# ---------------------------------------------------------------------------------------
+
+# head_dim -> {n-bucket -> (variant, d_slab, measured G MAC/s)}. Only head_dim=128 (the
+# flagship's own head dim) was run through either backward ladder.
+# Artifacts live under _artifacts/attention_bwd_rungs/ (named in the section comment above).
+DQ_MEASURED: dict[int, dict[int, tuple[str, int, float]]] = {
+    128: {8192: ("mma", 128, 2027.67)},  # rungB1_dq_mma_slab128.json
+}
+DKV_MEASURED: dict[int, dict[int, tuple[str, int, float]]] = {
+    128: {8192: ("mma", 128, 1857.94)},  # rungB2_dkv_mma_slab128.json
+}
+
+
+def select_bwd_tiles(n: int, head_dim: int) -> tuple[TileShape, TileShape]:
+    """`(dq_tile, dkv_tile)` -- the measured/provisional MMA tile+variant for the dQ and dK/dV
+    backward kernels at shape (n, head_dim). Each is selected from its OWN measured table via
+    the same nearest-log2-bucket + `[bucket, 2*bucket)` occupancy-window rule `select_fwd_tile`
+    uses (`_select_from_measured`), so an mma bucket off the one directly-measured saturation
+    shape is flagged `provisional` exactly like the forward. A pair (not a single shared tile)
+    because each kernel is its own measurement -- the winner happens to coincide at slab128, but
+    the RATE that sizes each split is calibrated per-kernel (see `calibrated_bwd_dq_rate` /
+    `calibrated_bwd_dkv_rate`), never shared.
+
+    Raises `ValueError` for a head_dim outside the kernel's supported set (the same gate as
+    `select_fwd_tile`), applied once here before either per-kernel selection.
+    """
+    if head_dim not in _KERNEL_HEAD_DIMS:
+        raise ValueError(f"head_dim must be one of {_KERNEL_HEAD_DIMS}, got {head_dim}")
+    return (
+        _select_from_measured(DQ_MEASURED, n, head_dim),
+        _select_from_measured(DKV_MEASURED, n, head_dim),
+    )

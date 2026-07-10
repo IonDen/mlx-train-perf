@@ -28,9 +28,14 @@ import pytest
 
 from mlx_train_perf.attention import api
 from mlx_train_perf.attention.api import flash_attention
+from mlx_train_perf.attention.kernel import launch as bwd_launch
+from mlx_train_perf.attention.kernel.dispatch import select_bwd_tiles
 from mlx_train_perf.attention.kernel.launch import (
+    TileShape,
     _bwd_dkv_macs_per_row,
     _bwd_dq_macs_per_row,
+    calibrated_bwd_dkv_rate,
+    calibrated_bwd_dq_rate,
     launch_bwd_D,
     launch_bwd_dkv,
     launch_bwd_dq,
@@ -1562,3 +1567,216 @@ def test_dkv_mma_causal_skip_perturbation_fails_parity() -> None:
         f"flipped causal-skip mma kernel matched the causal oracle (dK={d_dk:.3e}, dV={d_dv:.3e}) "
         "-- the parity grid cannot detect a causal off-by-one"
     )
+
+
+# =======================================================================================
+# T9b Step 3 (GRADUATION) -- wire the measured MMA backward into production: per-kernel
+# calibrated rates (probe-what-you-rate PER kernel, the shared-rate design retired because
+# the two throughputs differ measurably), a backward dispatch table, and the api vjp routing
+# the table-selected variants. The dispatch-table arithmetic is covered in
+# test_attention_kernel_dispatch.py; this section covers the RATE split and the api wiring.
+# =======================================================================================
+
+# ---------------------------------------------------------------------------------------
+# Per-kernel rate calibration (DEFAULT lane -- a fake `_bwd_dq_kernel`/`_bwd_dkv_kernel`
+# fabricates zero-cost output arrays instead of touching Metal, exactly as the forward's
+# test_calibrated_fwd_rate_probes_the_selected_variant_and_d_slab does).
+# ---------------------------------------------------------------------------------------
+
+
+def _fake_kernel(
+    *, inputs: list[mx.array], template: list[tuple[str, mx.Dtype]],  # noqa: ARG001
+    grid: tuple[int, int, int], threadgroup: tuple[int, int, int],  # noqa: ARG001
+    output_shapes: list[tuple[int, ...]], output_dtypes: list[mx.Dtype],
+) -> list[mx.array]:
+    """A Metal-free stand-in for a built kernel: returns zeros of the requested output shapes,
+    so the calibration ramp runs its dispatch/timing loop without a GPU (DEFAULT lane)."""
+    return [
+        mx.zeros(shape, dtype=dtype)
+        for shape, dtype in zip(output_shapes, output_dtypes, strict=True)
+    ]
+
+
+def test_calibrated_bwd_dq_rate_probes_the_selected_variant_and_d_slab(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Probe-what-you-rate for dQ: `calibrated_bwd_dq_rate`'s `measure()` must build the SAME
+    (variant, d_slab) dQ kernel the launcher will dispatch -- rating one variant while
+    dispatching another sizes the query-row split from the wrong rate. Spies on `_bwd_dq_kernel`
+    (the construction seam) with a Metal-free fake and asserts the recorded (variant, d_slab)
+    matches the `tile` passed in."""
+    monkeypatch.setattr(bwd_launch, "_BWD_DQ_RATE_CACHE", {})
+    calls: list[tuple[str, int | None]] = []
+
+    def fake_dq_kernel(
+        head_dim: int, causal: bool, flip_causal: bool, variant: str,  # noqa: ARG001
+        d_slab: int | None,
+    ) -> object:
+        calls.append((variant, d_slab))
+        return _fake_kernel
+
+    monkeypatch.setattr(bwd_launch, "_bwd_dq_kernel", fake_dq_kernel)
+    bwd_launch.calibrated_bwd_dq_rate(
+        head_dim=64, dtype=mx.float32, b=1, hq=4, hkv=4, n=256, causal=True,
+        tile=TileShape(variant="mma", d_slab=64),
+    )
+
+    assert calls == [("mma", 64)], (
+        f"dQ calibration built {calls}, but the caller selected variant='mma' d_slab=64"
+    )
+
+
+def test_calibrated_bwd_dkv_rate_probes_the_selected_variant_and_d_slab(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Probe-what-you-rate for dK/dV: `calibrated_bwd_dkv_rate`'s `measure()` must build the
+    SAME (variant, d_slab) dK/dV kernel the launcher will dispatch (mirrors the dQ test)."""
+    monkeypatch.setattr(bwd_launch, "_BWD_DKV_RATE_CACHE", {})
+    calls: list[tuple[str, int | None]] = []
+
+    def fake_dkv_kernel(
+        head_dim: int, causal: bool, flip_causal: bool, variant: str,  # noqa: ARG001
+        d_slab: int | None,
+    ) -> object:
+        calls.append((variant, d_slab))
+        return _fake_kernel
+
+    monkeypatch.setattr(bwd_launch, "_bwd_dkv_kernel", fake_dkv_kernel)
+    bwd_launch.calibrated_bwd_dkv_rate(
+        head_dim=64, dtype=mx.float32, b=1, hq=4, hkv=4, n=256, causal=True,
+        tile=TileShape(variant="mma", d_slab=64),
+    )
+
+    assert calls == [("mma", 64)], (
+        f"dK/dV calibration built {calls}, but the caller selected variant='mma' d_slab=64"
+    )
+
+
+def test_bwd_dq_rate_cache_key_separates_by_variant_and_d_slab(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The dQ rate cache key must include (variant, d_slab) (mirrors `_FWD_RATE_CACHE`): two mma
+    dQ calls at the same shape but different `d_slab` are DIFFERENT kernels (different rate) and
+    must never collapse onto one cache entry."""
+    monkeypatch.setattr(bwd_launch, "_BWD_DQ_RATE_CACHE", {})
+    monkeypatch.setattr(bwd_launch, "_bwd_dq_kernel", lambda *a, **k: _fake_kernel)  # noqa: ARG005
+
+    args = {
+        "head_dim": 64, "dtype": mx.float32, "b": 1, "hq": 4, "hkv": 4,
+        "n": 256, "causal": True,
+    }
+    bwd_launch.calibrated_bwd_dq_rate(**args, tile=TileShape(variant="mma", d_slab=64))
+    bwd_launch.calibrated_bwd_dq_rate(**args, tile=TileShape(variant="mma", d_slab=128))
+
+    keys = list(bwd_launch._BWD_DQ_RATE_CACHE)
+    assert len(keys) == 2                          # two distinct cache entries, not one collision
+    assert {k[-2:] for k in keys} == {("mma", 64), ("mma", 128)}   # keyed on (variant, d_slab)
+
+
+def test_bwd_dq_and_dkv_rates_use_independent_caches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The dQ and dK/dV rates are calibrated INDEPENDENTLY: each probes its own kernel and writes
+    its own cache, so the two never share a number (the retired shared-rate design's whole
+    failure mode). Discrimination: a value seeded into the dQ cache must NOT satisfy a dK/dV
+    call at the same shape, and each rate probes only its own kernel."""
+    monkeypatch.setattr(bwd_launch, "_BWD_DQ_RATE_CACHE", {})
+    monkeypatch.setattr(bwd_launch, "_BWD_DKV_RATE_CACHE", {})
+    dq_built: list[tuple[str, int | None]] = []
+    dkv_built: list[tuple[str, int | None]] = []
+
+    def fake_dq_kernel(
+        head_dim: int, causal: bool, flip_causal: bool, variant: str,  # noqa: ARG001
+        d_slab: int | None,
+    ) -> object:
+        dq_built.append((variant, d_slab))
+        return _fake_kernel
+
+    def fake_dkv_kernel(
+        head_dim: int, causal: bool, flip_causal: bool, variant: str,  # noqa: ARG001
+        d_slab: int | None,
+    ) -> object:
+        dkv_built.append((variant, d_slab))
+        return _fake_kernel
+
+    monkeypatch.setattr(bwd_launch, "_bwd_dq_kernel", fake_dq_kernel)
+    monkeypatch.setattr(bwd_launch, "_bwd_dkv_kernel", fake_dkv_kernel)
+    args = {
+        "head_dim": 64, "dtype": mx.float32, "b": 1, "hq": 4, "hkv": 4,
+        "n": 256, "causal": True,
+    }
+    tile = TileShape(variant="mma", d_slab=128)
+    dq_rate = calibrated_bwd_dq_rate(**args, tile=tile)
+    dkv_rate = calibrated_bwd_dkv_rate(**args, tile=tile)
+
+    assert dq_built == [("mma", 128)]              # dQ rate probed the dQ kernel only
+    assert dkv_built == [("mma", 128)]             # dK/dV rate probed the dK/dV kernel only
+    assert len(bwd_launch._BWD_DQ_RATE_CACHE) == 1  # separate caches, one entry each
+    assert len(bwd_launch._BWD_DKV_RATE_CACHE) == 1
+    assert dq_rate > 0.0
+    assert dkv_rate > 0.0
+
+
+# ---------------------------------------------------------------------------------------
+# api vjp wiring (PER-TEST @pytest.mark.metal). The kernel-backward vjp must route
+# launch_bwd_dq / launch_bwd_dkv with the variant/d_slab/rate the backward dispatch table
+# selects, calibrated ONCE at construction time (outside the traced region). Small shapes
+# only (n <= 512) -- the controller re-runs the flagship end-to-end after the commit.
+# ---------------------------------------------------------------------------------------
+
+
+@pytest.mark.metal
+def test_kernel_backward_routes_the_table_selected_variants(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T9b Step 3 wiring: `api.py`'s kernel vjp must call `select_bwd_tiles(n, head_dim)` and
+    route launch_bwd_dq / launch_bwd_dkv with the SELECTED (variant, d_slab), each with its own
+    construction-time calibrated rate closure-captured. Spies on both launchers to record the
+    variant/d_slab/rate the api passed, and checks them against the table's own selection for
+    this shape. Pre-fix the api passed neither variant nor d_slab (scalar default) and one
+    shared rate -- post-fix each must equal `select_bwd_tiles`'s own answer with a real rate."""
+    b, hq, hkv, n, d = 1, 4, 2, 24, 64
+    scale = 1.0 / math.sqrt(d)
+    q, k, v, _cot = _rand_qkv_do(b=b, hq=hq, hkv=hkv, n=n, d=d, dtype=mx.float32, seed=63)
+
+    seen_dq: list[tuple[str | None, int | None, float | None]] = []
+    seen_dkv: list[tuple[str | None, int | None, float | None]] = []
+    real_dq, real_dkv = api.launch_bwd_dq, api.launch_bwd_dkv
+
+    def spy_dq(*args: object, **kwargs: object) -> object:
+        seen_dq.append(
+            (kwargs.get("variant"), kwargs.get("d_slab"), kwargs.get("rate_macs_per_s"))  # type: ignore[arg-type]
+        )
+        return real_dq(*args, **kwargs)  # type: ignore[arg-type]
+
+    def spy_dkv(*args: object, **kwargs: object) -> object:
+        seen_dkv.append(
+            (kwargs.get("variant"), kwargs.get("d_slab"), kwargs.get("rate_macs_per_s"))  # type: ignore[arg-type]
+        )
+        return real_dkv(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(api, "launch_bwd_dq", spy_dq)
+    monkeypatch.setattr(api, "launch_bwd_dkv", spy_dkv)
+
+    def loss(q_: mx.array, k_: mx.array, v_: mx.array) -> mx.array:
+        return flash_attention(q_, k_, v_, scale=scale, causal=True, impl="kernel").sum()
+
+    mx.eval(*mx.grad(loss, argnums=(0, 1, 2))(q, k, v))
+
+    dq_tile, dkv_tile = select_bwd_tiles(n, d)
+    assert seen_dq, "launch_bwd_dq never fired -- the backward is not kernel-backed"
+    assert seen_dkv, "launch_bwd_dkv never fired -- the backward is not kernel-backed"
+    v_dq, s_dq, r_dq = seen_dq[0]
+    assert (v_dq, s_dq) == (dq_tile.variant, dq_tile.d_slab), (
+        f"dQ launched variant={v_dq} d_slab={s_dq}, table selected "
+        f"variant={dq_tile.variant} d_slab={dq_tile.d_slab}"
+    )
+    assert r_dq is not None, "dQ rate is None -- not the construction-time calibrated float"
+    assert r_dq > 0.0
+    v_dkv, s_dkv, r_dkv = seen_dkv[0]
+    assert (v_dkv, s_dkv) == (dkv_tile.variant, dkv_tile.d_slab), (
+        f"dK/dV launched variant={v_dkv} d_slab={s_dkv}, table selected "
+        f"variant={dkv_tile.variant} d_slab={dkv_tile.d_slab}"
+    )
+    assert r_dkv is not None, "dK/dV rate is None -- not the construction-time calibrated float"
+    assert r_dkv > 0.0

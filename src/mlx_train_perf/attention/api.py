@@ -22,10 +22,11 @@ from typing import Literal, cast
 import mlx.core as mx
 
 from mlx_train_perf._compat import check_mlx_verified
-from mlx_train_perf.attention.kernel.dispatch import select_fwd_tile
+from mlx_train_perf.attention.kernel.dispatch import select_bwd_tiles, select_fwd_tile
 from mlx_train_perf.attention.kernel.launch import (
     TileShape,
-    calibrated_bwd_rate,
+    calibrated_bwd_dkv_rate,
+    calibrated_bwd_dq_rate,
     calibrated_fwd_rate,
     launch_bwd_D,
     launch_bwd_dkv,
@@ -181,33 +182,42 @@ def flash_attention(
     convention. `impl='auto'`/`'kernel'` route the FORWARD through the T5 Metal kernel
     (O + L, query-range split) AND the BACKWARD through the fully kernel-backed vjp
     (T7 D + T8 dQ + T9 chained dK/dV) -- the (N, N) score matrix is never materialized on
-    either pass; the backward split rate is calibrated at construction and closure-captured.
+    either pass; the two per-kernel backward split rates are calibrated at construction and
+    closure-captured.
     `impl='reference'` is the oracle (never a production path): its backward materializes the
     full (N, N) score/probability matrices, so every caller must fence it to tiny N."""
     resolved = resolve_attention_impl(q, k, v, impl=impl, causal=causal)
 
     if resolved == "kernel":
-        # Select the tile/variant from the T6 measured-dispatch table (see
-        # attention/kernel/dispatch.py) OUTSIDE the custom_function -- a fixed TileShape()
-        # (always scalar) is no longer used on the kernel path. Calibrate BOTH the forward
-        # query-split rate and the backward dK/dV split rate OUTSIDE the custom_function
-        # (host-sync timing is compile-hostile) and close over them -- cached per occupancy
-        # regime, so a compiled caller re-probes only on the first trace. The backward rate is
-        # a single throughput number sizing both the dQ and dK/dV splits (see
-        # `calibrated_bwd_rate`), never measured inside the vjp.
+        # Select the forward tile AND the two backward tiles (dQ, dK/dV) from the measured
+        # dispatch tables (see attention/kernel/dispatch.py) OUTSIDE the custom_function -- a
+        # fixed TileShape() (always scalar) is no longer used on the kernel path. Calibrate the
+        # forward query-split rate and BOTH per-kernel backward split rates OUTSIDE the
+        # custom_function (host-sync timing is compile-hostile) and close over them -- cached per
+        # occupancy regime, so a compiled caller re-probes only on the first trace. The backward
+        # rates are split PER KERNEL (T9b Step 3): the dQ and dK/dV throughputs differ measurably
+        # (2.35x at scalar), so each split is sized by its own kernel's measured rate -- no
+        # cross-kernel assumption. Rates are never measured inside the vjp.
         tile = select_fwd_tile(q.shape[2], q.shape[-1])
         rate = calibrated_fwd_rate(
             head_dim=q.shape[-1], dtype=q.dtype, b=q.shape[0], hq=q.shape[1],
             hkv=k.shape[1], n=q.shape[2], causal=causal, tile=tile,
         )
-        bwd_rate: float | None = calibrated_bwd_rate(
+        dq_tile, dkv_tile = select_bwd_tiles(q.shape[2], q.shape[-1])
+        dq_rate: float | None = calibrated_bwd_dq_rate(
             head_dim=q.shape[-1], dtype=q.dtype, b=q.shape[0], hq=q.shape[1],
-            hkv=k.shape[1], n=q.shape[2], causal=causal,
+            hkv=k.shape[1], n=q.shape[2], causal=causal, tile=dq_tile,
+        )
+        dkv_rate: float | None = calibrated_bwd_dkv_rate(
+            head_dim=q.shape[-1], dtype=q.dtype, b=q.shape[0], hq=q.shape[1],
+            hkv=k.shape[1], n=q.shape[2], causal=causal, tile=dkv_tile,
         )
     else:
         tile = TileShape()
         rate = None
-        bwd_rate = None
+        dq_tile = dkv_tile = TileShape()
+        dq_rate = None
+        dkv_rate = None
 
     @mx.custom_function
     def _core(q_: mx.array, k_: mx.array, v_: mx.array) -> tuple[mx.array, mx.array]:
@@ -239,11 +249,11 @@ def flash_attention(
             d_arr = launch_bwd_D(d_o, o_)
             d_q = launch_bwd_dq(
                 q_, k_, v_, d_o, lse_, d_arr, scale=scale, causal=causal,
-                rate_macs_per_s=bwd_rate,
+                rate_macs_per_s=dq_rate, variant=dq_tile.variant, d_slab=dq_tile.d_slab,
             )
             d_k, d_v = launch_bwd_dkv(
                 q_, k_, v_, d_o, lse_, d_arr, scale=scale, causal=causal,
-                rate_macs_per_s=bwd_rate,
+                rate_macs_per_s=dkv_rate, variant=dkv_tile.variant, d_slab=dkv_tile.d_slab,
             )
             return d_q, d_k, d_v
         return _flash_attention_backward(q_, k_, v_, o_, lse_, d_o, scale=scale, causal=causal)
