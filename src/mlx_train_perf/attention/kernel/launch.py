@@ -60,6 +60,7 @@ import mlx.core as mx
 
 from mlx_train_perf.attention.kernel.source import (
     build_bwd_D_source,
+    build_bwd_dkv_mma_source,
     build_bwd_dkv_source,
     build_bwd_dq_mma_source,
     build_bwd_dq_source,
@@ -779,17 +780,28 @@ def _bwd_dkv_macs_per_row(*, n: int, d: int, b: int, hq: int) -> int:
 
 
 def plan_dkv_dispatches(
-    *, n: int, d: int, b: int, hq: int, rate: float,
+    *, n: int, d: int, b: int, hq: int, rate: float, block_align: int = 1,
 ) -> list[tuple[int, int]]:
     """Ascending contiguous query-range split `[(q_lo, q_hi), ...]` tiling `[0, n)` exactly for
     the chained dK/dV backward, sized from the calibrated backward `rate` via the shared budget
     helpers (`_rows_within_dispatch_budget` / `_check_launch_budget`) at the dK/dV `4*D` cost.
     Pure integer arithmetic -- no GPU, no allocation. Raises `LaunchBudgetError` (the 0.1.0
-    refusal contract) when even one minimal range (`rows == 1`) over-budgets the per-dispatch
-    bound OR the whole pass's total wall exceeds `MAX_TOTAL_SECONDS`, never returns an
-    over-budget range for the uncatchable GPU watchdog to hit."""
+    refusal contract) when even one minimal range over-budgets the per-dispatch bound OR the whole
+    pass's total wall exceeds `MAX_TOTAL_SECONDS`, never returns an over-budget range for the
+    uncatchable GPU watchdog to hit.
+
+    `block_align` (default 1 == the scalar body's per-key owner, BYTE-UNCHANGED behaviour) rounds
+    the per-dispatch row count DOWN to a multiple of `block_align`, floored at one block: the mma
+    body (which the T9b rung B2 launcher passes 32 for) owns a 32-KEY block per simdgroup and loops
+    the query range in 32-row query blocks, so a mid-block range split would merge different partial
+    products inside one hardware MMA and break chained==single bit-identity -- 32-alignment restores
+    the scalar accumulation-order argument at block granularity. The minimal unit becomes one query
+    block; refusal semantics are unchanged (the budget is checked at that floored size, so a rate
+    where even one 32-row block over-budgets still raises)."""
     per_row = _bwd_dkv_macs_per_row(n=n, d=d, b=b, hq=hq)
     rows_per = _rows_within_dispatch_budget(per_row=per_row, n=n, rate=rate)
+    if block_align > 1:
+        rows_per = min(n, max(block_align, (rows_per // block_align) * block_align))
     _check_launch_budget(per_row=per_row, n=n, rows=rows_per, rate=rate)
     return [(q_lo, min(q_lo + rows_per, n)) for q_lo in range(0, n, rows_per)]
 
@@ -807,20 +819,39 @@ def _validate_bwd_dkv_shapes(
 
 
 @functools.cache
-def _bwd_dkv_kernel(head_dim: int, causal: bool, flip_causal: bool) -> _MetalKernel:
-    """Build (and cache) the dK/dV kernel for a given (head_dim, causal, flip_causal).
-    `flip_causal` is TEST-ONLY (see `build_bwd_dkv_source`); it stays part of the cache key so
-    a perturbed and a correct kernel at the same (head_dim, causal) never collide."""
+def _bwd_dkv_kernel(
+    head_dim: int, causal: bool, flip_causal: bool, variant: str, d_slab: int | None
+) -> _MetalKernel:
+    """Build (and cache) the dK/dV kernel for a given (head_dim, causal, flip_causal, variant,
+    d_slab). `variant="scalar"` uses the v1 one-thread-per-key body (`d_slab` has no effect on its
+    source, but stays part of the cache key regardless -- a harmless redundant entry, never a
+    correctness issue, if a caller ever varies it for scalar); `"mma"` uses the T9b rung-B2
+    key-major register-resident D-slabbed body, whose source genuinely changes with `d_slab`
+    (`d_slab=None` builds with the source builder's own default `_BWD_DKV_MMA_D_SLAB`). Both
+    variants share the same (q,k,v,dO,lse,d_arr,dk_in,dv_in,qoffs,scale_in)->(dk_out,dv_out) chained
+    contract, so `_dispatch_bwd_dkv_range` swaps only the grid/threadgroup shape between them.
+    `flip_causal` is TEST-ONLY (see `build_bwd_dkv_source` / `build_bwd_dkv_mma_source`); it stays
+    part of the cache key so a perturbed/correct kernel at the same (head_dim, causal, variant)
+    never collide."""
+    if variant == "mma":
+        source = build_bwd_dkv_mma_source(
+            head_dim, causal=causal, flip_causal=flip_causal, d_slab=d_slab,
+        )
+    elif variant == "scalar":
+        source = build_bwd_dkv_source(head_dim, causal=causal, flip_causal=flip_causal)
+    else:
+        raise ValueError(f"unknown dK/dV kernel variant {variant!r}")
     kernel = mx.fast.metal_kernel(
         name=(
-            f"mtp_flash_bwd_dkv_d{head_dim}_"
+            f"mtp_flash_bwd_dkv_{variant}_d{head_dim}_"
             f"{'c' if causal else 'f'}{'x' if flip_causal else ''}"
+            + (f"_s{d_slab}" if variant == "mma" else "")
         ),
         input_names=[
             "q", "k", "v", "d_o", "lse", "d_arr", "dk_in", "dv_in", "qoffs", "scale_in",
         ],
         output_names=["dk_out", "dv_out"],
-        source=build_bwd_dkv_source(head_dim, causal=causal, flip_causal=flip_causal),
+        source=source,
     )
     return cast(_MetalKernel, kernel)
 
@@ -828,21 +859,33 @@ def _bwd_dkv_kernel(head_dim: int, causal: bool, flip_causal: bool) -> _MetalKer
 def _dispatch_bwd_dkv_range(
     kernel: _MetalKernel, q: mx.array, k: mx.array, v: mx.array, d_o: mx.array,
     lse: mx.array, d_arr: mx.array, dk_in: mx.array, dv_in: mx.array, scale_in: mx.array,
-    *, q_lo: int, q_hi: int,
+    *, q_lo: int, q_hi: int, variant: str = "scalar",
 ) -> tuple[mx.array, mx.array]:
     """One dK/dV dispatch accumulating query rows [q_lo, q_hi) into the chained fp32 partials.
-    One thread per key (grid.x == n, ALL keys are owners in every dispatch -- a key with no
-    causally-allowed query in the range copies its `dk_in`->`dk_out` slot unchanged, carrying
-    the accumulator forward). Full q/k/v/dO/L/D + `dk_in`/`dv_in` buffers + an in-kernel `qoffs`
-    range offset (never a Python-side slice); returns the fresh fp32 `dk_out`/`dv_out`."""
+    Full q/k/v/dO/L/D + `dk_in`/`dv_in` buffers + an in-kernel `qoffs` range offset (never a
+    Python-side slice); returns the fresh fp32 `dk_out`/`dv_out`.
+
+    The two variants differ ONLY in the launch shape (same output shapes/dtypes + full chained
+    contract, so the accumulator threading in `launch_bwd_dkv` is variant-agnostic): `"scalar"`
+    runs one thread per key (grid.x == n; ALL keys are owners, a key with no causally-allowed query
+    in the range copies its `dk_in`->`dk_out` slot unchanged), while `"mma"` runs one 32-lane
+    simdgroup per 32-KEY block (grid.x == ceil(n/32)*32, threadgroup.x == 32; each simdgroup seeds
+    its key block from `dk_in`/`dv_in` and stores it, carrying the chained accumulator forward)."""
     b, _hq, n, d = q.shape
     hkv = k.shape[1]
     qoffs = mx.array([q_lo, q_hi], dtype=mx.uint32)
+    if variant == "mma":
+        num_key_blocks = (n + 31) // 32              # one 32-key block per simdgroup
+        grid = (num_key_blocks * 32, b * hkv, 1)
+        threadgroup = (32, 1, 1)
+    else:
+        grid = (n, b * hkv, 1)
+        threadgroup = (min(_BWD_DKV_THREADGROUP, n), 1, 1)
     dk_out, dv_out = kernel(
         inputs=[q, k, v, d_o, lse, d_arr, dk_in, dv_in, qoffs, scale_in],
         template=[("T", q.dtype)],
-        grid=(n, b * hkv, 1),
-        threadgroup=(min(_BWD_DKV_THREADGROUP, n), 1, 1),
+        grid=grid,
+        threadgroup=threadgroup,
         output_shapes=[(b, hkv, n, d), (b, hkv, n, d)],
         output_dtypes=[mx.float32, mx.float32],
     )
@@ -853,6 +896,7 @@ def launch_bwd_dkv(
     q: mx.array, k: mx.array, v: mx.array, d_o: mx.array,
     lse: mx.array, d_arr: mx.array, *,
     scale: float, causal: bool, rate_macs_per_s: float | None = None,
+    variant: str = "scalar", d_slab: int | None = None,
     _flip_causal: bool = False,
 ) -> tuple[mx.array, mx.array]:
     """dK/dV backward -> (dK, dV), with k/v's shape/dtype. Consumes the forward's saved L
@@ -860,12 +904,22 @@ def launch_bwd_dkv(
     accumulates `dV_j += P*dO`, `dK_j += scale*P*(dP - D)*q` in CHAINED fp32 partials over the
     causally-allowed queries, grouped over each kv head's contiguous q-head group.
 
+    `variant` picks the kernel body: `"scalar"` (default -- the v1 one-thread-per-key body,
+    unchanged behaviour for every existing caller) or `"mma"` (the T9b rung-B2 key-major 4x4
+    simdgroup-matrix body with register-resident D-slabbed accumulators). `d_slab` overrides the
+    mma body's slab width (`None` = the source builder's own default; ignored by the scalar body).
+    The mma variant is a CORRECTNESS + small-shape rung: it is not wired into api.py or the
+    calibrated-rate path (graduation + the saturation d_slab sweep are a later rung).
+
     `rate_macs_per_s`: when None, a single dispatch over all query rows with no budget check
     (safe only at small N -- the tiny-shape/test path); when given, the launcher sizes the
     ascending query-range split via `plan_dkv_dispatches` and refuses (`LaunchBudgetError`) if
     even one minimal range or the total over-budgets. The fp32 accumulators are chained across
     dispatches (seeded from the prior's output), so a range split is bit-identical to a single
-    dispatch, and cast to k/v dtype exactly once after the last dispatch.
+    dispatch, and cast to k/v dtype exactly once after the last dispatch. The mma variant sizes its
+    split with a 32-row query-BLOCK alignment (`plan_dkv_dispatches(block_align=32)`) so a split
+    never bisects a query block (a mid-block split would merge different partial products inside one
+    hardware MMA and break the chained bit-identity).
 
     `_flip_causal` is TEST-ONLY (wrong-triangle causal-skip perturbation -- see source.py)."""
     _validate_bwd_dkv_shapes(q, k, v, d_o, lse, d_arr)
@@ -874,15 +928,19 @@ def launch_bwd_dkv(
     if rate_macs_per_s is None:
         ranges = [(0, n)]
     else:
-        ranges = plan_dkv_dispatches(n=n, d=d, b=b, hq=hq, rate=rate_macs_per_s)
+        block_align = 32 if variant == "mma" else 1
+        ranges = plan_dkv_dispatches(
+            n=n, d=d, b=b, hq=hq, rate=rate_macs_per_s, block_align=block_align,
+        )
 
-    kernel = _bwd_dkv_kernel(d, causal, _flip_causal)
+    kernel = _bwd_dkv_kernel(d, causal, _flip_causal, variant, d_slab)
     scale_in = mx.array([scale], dtype=mx.float32)
     dk = mx.zeros((b, hkv, n, d), dtype=mx.float32)
     dv = mx.zeros((b, hkv, n, d), dtype=mx.float32)
     for q_lo, q_hi in ranges:
         dk, dv = _dispatch_bwd_dkv_range(
             kernel, q, k, v, d_o, lse, d_arr, dk, dv, scale_in, q_lo=q_lo, q_hi=q_hi,
+            variant=variant,
         )
     return dk.astype(k.dtype), dv.astype(v.dtype)
 
@@ -907,7 +965,7 @@ def calibrated_bwd_rate(
 
     key_q, key_k, key_v, key_do = mx.random.split(mx.random.key(0), 4)
     scale = 1.0 / (head_dim ** 0.5)
-    kernel = _bwd_dkv_kernel(head_dim, causal, False)
+    kernel = _bwd_dkv_kernel(head_dim, causal, False, "scalar", None)
     scale_in = mx.array([scale], dtype=mx.float32)
     probes: dict[tuple[int, int], tuple[mx.array, ...]] = {}
 
