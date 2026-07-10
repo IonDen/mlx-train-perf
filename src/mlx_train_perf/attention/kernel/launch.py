@@ -61,6 +61,7 @@ import mlx.core as mx
 from mlx_train_perf.attention.kernel.source import (
     build_bwd_D_source,
     build_bwd_dkv_source,
+    build_bwd_dq_mma_source,
     build_bwd_dq_source,
     build_fwd_mma_source,
     build_fwd_source,
@@ -628,18 +629,36 @@ def _validate_bwd_residual_dtypes(lse: mx.array, d_arr: mx.array) -> None:
 
 
 @functools.cache
-def _bwd_dq_kernel(head_dim: int, causal: bool, flip_causal: bool) -> _MetalKernel:
-    """Build (and cache) the dQ kernel for a given (head_dim, causal, flip_causal).
-    `flip_causal` is TEST-ONLY (see `build_bwd_dq_source`); it stays part of the cache key so
-    a perturbed and a correct kernel at the same (head_dim, causal) never collide."""
+def _bwd_dq_kernel(
+    head_dim: int, causal: bool, flip_causal: bool, variant: str, d_slab: int | None
+) -> _MetalKernel:
+    """Build (and cache) the dQ kernel for a given (head_dim, causal, flip_causal, variant,
+    d_slab). `variant="scalar"` uses the v1 one-thread-per-query-row body (`d_slab` has no
+    effect on its source, but stays part of the cache key regardless -- a harmless redundant
+    entry, never a correctness issue, if a caller ever varies it for scalar); `"mma"` uses the
+    T9b rung-B1 register-resident D-slabbed body, whose source genuinely changes with `d_slab`
+    (`d_slab=None` builds with the source builder's own default `_BWD_DQ_MMA_D_SLAB`). Both
+    variants share the same (q,k,v,dO,lse,d_arr,qoffs,scale_in)->(dq_out) contract, so
+    `_dispatch_bwd_dq_range` swaps only the grid/threadgroup shape between them. `flip_causal`
+    is TEST-ONLY (see `build_bwd_dq_source` / `build_bwd_dq_mma_source`); it stays part of the
+    cache key so a perturbed and a correct kernel at the same (head_dim, causal) never collide."""
+    if variant == "mma":
+        source = build_bwd_dq_mma_source(
+            head_dim, causal=causal, flip_causal=flip_causal, d_slab=d_slab,
+        )
+    elif variant == "scalar":
+        source = build_bwd_dq_source(head_dim, causal=causal, flip_causal=flip_causal)
+    else:
+        raise ValueError(f"unknown dQ kernel variant {variant!r}")
     kernel = mx.fast.metal_kernel(
         name=(
-            f"mtp_flash_bwd_dq_d{head_dim}_"
+            f"mtp_flash_bwd_dq_{variant}_d{head_dim}_"
             f"{'c' if causal else 'f'}{'x' if flip_causal else ''}"
+            + (f"_s{d_slab}" if variant == "mma" else "")
         ),
         input_names=["q", "k", "v", "d_o", "lse", "d_arr", "qoffs", "scale_in"],
         output_names=["dq_out"],
-        source=build_bwd_dq_source(head_dim, causal=causal, flip_causal=flip_causal),
+        source=source,
     )
     return cast(_MetalKernel, kernel)
 
@@ -647,18 +666,32 @@ def _bwd_dq_kernel(head_dim: int, causal: bool, flip_causal: bool) -> _MetalKern
 def _dispatch_bwd_dq_range(
     kernel: _MetalKernel, q: mx.array, k: mx.array, v: mx.array, d_o: mx.array,
     lse: mx.array, d_arr: mx.array, scale_in: mx.array, *, r0: int, r1: int,
+    variant: str = "scalar",
 ) -> mx.array:
-    """One dQ dispatch covering query rows [r0, r1) of the full problem -- one thread per
-    query row (grid.x == rows), writing this range's own tile-local (b, hq, rows, d) dQ chunk.
-    Full q/k/v/dO/L/D buffers + an in-kernel `qoffs` row offset (never a Python-side slice)."""
+    """One dQ dispatch covering query rows [r0, r1) of the full problem, writing this range's
+    own tile-local (b, hq, rows, d) dQ chunk. Full q/k/v/dO/L/D buffers + an in-kernel `qoffs`
+    row offset (never a Python-side slice).
+
+    The two variants differ ONLY in the launch shape (same output shapes/dtypes + full qoffs
+    contract, so the reassembly in `launch_bwd_dq` is variant-agnostic, mirroring the forward's
+    `_dispatch_range`): `"scalar"` runs one thread per query row (grid.x == rows), while `"mma"`
+    runs one 32-lane simdgroup per 32-row query block (grid.x == ceil(rows/32)*32,
+    threadgroup.x == 32)."""
     b, hq, _, d = q.shape
     rows_this = r1 - r0
     qoffs = mx.array([r0, r1], dtype=mx.uint32)
+    if variant == "mma":
+        num_blocks = (rows_this + 31) // 32              # one 32-row query block per simdgroup
+        grid = (num_blocks * 32, b * hq, 1)
+        threadgroup = (32, 1, 1)
+    else:
+        grid = (rows_this, b * hq, 1)
+        threadgroup = (min(_BWD_DQ_THREADGROUP, rows_this), 1, 1)
     (dq_c,) = kernel(
         inputs=[q, k, v, d_o, lse, d_arr, qoffs, scale_in],
         template=[("T", q.dtype)],
-        grid=(rows_this, b * hq, 1),
-        threadgroup=(min(_BWD_DQ_THREADGROUP, rows_this), 1, 1),
+        grid=grid,
+        threadgroup=threadgroup,
         output_shapes=[(b, hq, rows_this, d)],
         output_dtypes=[q.dtype],
     )
@@ -669,17 +702,26 @@ def launch_bwd_dq(
     q: mx.array, k: mx.array, v: mx.array, d_o: mx.array,
     lse: mx.array, d_arr: mx.array, *,
     scale: float, causal: bool, rate_macs_per_s: float | None = None,
+    variant: str = "scalar", d_slab: int | None = None,
     _flip_causal: bool = False,
 ) -> mx.array:
     """dQ backward -> the query gradient, with q's shape/dtype. Consumes the forward's saved
     L (`lse`, fp32 (B, Hq, N)) and T7's D (`d_arr`, fp32 (B, Hq, N)); recomputes S/P from
     q/k and accumulates `dQ_i += scale*P*(dP - D)*k` in fp32 per causally-allowed key.
 
+    `variant` picks the kernel body: `"scalar"` (default -- the v1 one-thread-per-query-row
+    body, unchanged behaviour for every existing caller) or `"mma"` (the T9b rung-B1 4x4
+    simdgroup-matrix body with a register-resident D-slabbed accumulator). `d_slab` overrides
+    the mma body's slab width (`None` = the source builder's own default; ignored by the scalar
+    body). The mma variant is a CORRECTNESS + small-shape rung: it is not wired into api.py or
+    the calibrated-rate path (graduation + the saturation d_slab sweep are a later rung).
+
     `rate_macs_per_s`: when None, a single dispatch over all rows with no budget check (safe
     only at small N -- the tiny-shape/test path); when given, the launcher sizes the query-row
     split from it and refuses (`LaunchBudgetError`) if even one minimal range or the total
     over-budgets. dQ rows are disjoint across query blocks, so the reassembly (a plain
-    `mx.concatenate` over the row axis) needs no accumulator chaining.
+    `mx.concatenate` over the row axis) needs no accumulator chaining, and this holds for the
+    mma variant too (each 32-row query block's dQ depends only on its own absolute rows).
 
     `_flip_causal` is TEST-ONLY (wrong-triangle causal-skip perturbation -- see source.py)."""
     _validate_bwd_dq_shapes(q, k, v, d_o, lse, d_arr)
@@ -691,14 +733,14 @@ def launch_bwd_dq(
         rows_per = _rows_within_dispatch_budget(per_row=per_row, n=n, rate=rate_macs_per_s)
         _check_launch_budget(per_row=per_row, n=n, rows=rows_per, rate=rate_macs_per_s)
 
-    kernel = _bwd_dq_kernel(d, causal, _flip_causal)
+    kernel = _bwd_dq_kernel(d, causal, _flip_causal, variant, d_slab)
     scale_in = mx.array([scale], dtype=mx.float32)
     dq_chunks: list[mx.array] = []
     for r0 in range(0, n, rows_per):
         r1 = min(r0 + rows_per, n)
         dq_chunks.append(
             _dispatch_bwd_dq_range(
-                kernel, q, k, v, d_o, lse, d_arr, scale_in, r0=r0, r1=r1,
+                kernel, q, k, v, d_o, lse, d_arr, scale_in, r0=r0, r1=r1, variant=variant,
             )
         )
     return mx.concatenate(dq_chunks, axis=2)

@@ -662,6 +662,336 @@ def build_bwd_dq_source(head_dim: int, *, causal: bool, flip_causal: bool = Fals
 
 
 # ---------------------------------------------------------------------------------------
+# Backward: dQ kernel MMA rung B1 (T9b) -- the 4x4 simdgroup-matrix (register-resident,
+# D-slabbed) THROUGHPUT restructure of the v1 scalar one-owner-per-query-row dQ body above.
+# Same correctness contract as `build_bwd_dq_source` (dQ matches the api.py autodiff oracle;
+# the scalar body is the correctness oracle) with the accumulation restructured to the proven
+# FORWARD rung-2 MMA machinery (`_FWD_MMA_TEMPLATE`): ONE 32-lane simdgroup per 32-row query
+# block, KV tiled in 32-key blocks, register-resident fp32 dQ accumulator D-slabbed exactly
+# like the forward's O accumulator. The v1 scalar kernel measured 35.2 G MAC/s at the flagship
+# canary (projected ~11.7s dQ pass vs the 2.0s per-eval budget -> production REFUSES at
+# flagship); this is the dQ analogue of the 31.6 -> 1462.7 G forward restructure (T6 rungs
+# 1-2b). The controller owns the saturation d_slab sweep + graduation (a later rung); THIS rung
+# is CORRECTNESS + small-shape parity, and the mma variant is NOT wired into the API path.
+#
+# Tile geometry (inherited verbatim from `_FWD_MMA_TEMPLATE`'s QK^T half):
+# - ONE THREADGROUP == ONE simdgroup (32 lanes) owns ONE query block of Bq=32 rows == 4
+#   row-tiles of 8 (RT=4); the KV axis is tiled in Bk=32-key blocks == 4 col-tiles of 8. The
+#   steel lane->(fm, fn) fragment mapping, the d-chunk QK^T GEMM, and the causal block-skip
+#   (`kv_limit`) + in-tile predication (`KEEP_CMP`, the flip-test perturbation point) are the
+#   forward's, unchanged. Head dims {64,96,128} are all %8==0, so the d-loops need no tail chunk.
+#
+# THE dQ-SPECIFIC MATH (mirrors the scalar `_BWD_DQ_TEMPLATE` + api.py's `_flash_attention_
+# backward` dQ path EXACTLY, per KV block, per D-slab):
+#   S   = Q_block @ K_block^T            (GEMM-A #1, unscaled dot in fp32 simdgroup state)
+#   P   = exp(scale*S - L_row)           (SAVED L per row -- NO online-softmax rowmax, so P is
+#                                         ELEMENTWISE-independent: no simd_shuffle reduction, no
+#                                         alpha rescale, unlike the forward's online softmax)
+#   dP  = dO_block @ V_block^T           (GEMM-A #2, the dP = dO@V^T term, a second QK^T-shaped MMA)
+#   dS  = scale * P * (dP - D_row)       (D_row from T7's launch_bwd_D -- CONSUMED, not recomputed)
+#   dQ_block += dS @ K_slab              (GEMM-B, the key contraction -- dS as the MMA left operand
+#                                         exactly as forward P@V feeds P; K in place of V)
+# P and dP are masked to 0 for tail (kk >= kb1) and causal-excluded (`KEEP_CMP`) keys BEFORE the
+# GEMM-B, so a masked key's dS is exactly 0 and contributes nothing to dQ (the reference's p=0).
+# dQ has NO softmax normalization (unlike the forward's O, which divides by the row's l) -- the
+# accumulated dS@K IS the gradient. L and D are read as FIXED fp32 device buffers (never
+# templated -- the residuals that seed the backward stay fp32, the forward's L convention).
+#
+# D-SLABBING (the register-resident-accumulator knob the controller sweeps): the dQ accumulator
+# `C_dq[4][D_SLAB/8]` fp32 simdgroup tiles are held register-resident across the KV loop for ONE
+# slab of D columns at a time, with the D-slab as the OUTER loop and the KV loop INNER -- so S,
+# P, and dP are RECOMPUTED per slab (re-reading Q/K/V/dO), exactly as the forward recomputes its
+# QK^T + softmax per O-slab. Bounding C_dq is what forces the recompute (the persistent
+# accumulator is the register bottleneck; the transient S/dP tiles are freed each KV block). The
+# default `_BWD_DQ_MMA_D_SLAB = 32` is the register-SAFE fallback (divides all supported head
+# dims); the forward's rung-2b measurement showed the register-arithmetic spill heuristic
+# OVER-predicts simdgroup-accumulator cost at saturation (full-D single-pass won there), so the
+# dQ winner is a MEASURED sweep, not a predicted one -- never assume 32 is the optimum.
+#
+# The MMA reduction order (fp32 simdgroup reassociation + per-slab recompute) differs from the
+# scalar body's sequential per-key `+=`, so the mma variant's parity worsts are measured and
+# pinned SEPARATELY from the scalar pins -- never by widening a scalar pin. Per-row independence
+# is preserved (a row's dQ depends only on its own absolute position and the keys), so the
+# query-range split stays bit-identical to a single dispatch.
+#
+# `HEAD_DIM` bakes the head dim into the D-slab loop bound and the QK^T/dO@V^T d-loops; `D_SLAB`
+# / `D_SLAB_TILES` bake the slab width + its col-tile count (D_SLAB/8) into the C_dq tile array;
+# `KEEP_CMP` is the per-key causal keep predicate; `KV_LIMIT` is the KV-block loop bound. Sentinel
+# `str.replace` (never an f-string -- the MSL body is full of C++ braces), `D_SLAB_TILES` before
+# `D_SLAB` (longer token first, shared-prefix safe) -- the `build_fwd_mma_source` convention.
+
+# Default D-slab width -- the register-SAFE fallback (32 divides all supported head dims
+# 64/96/128), NOT a measured optimum; the controller sweeps {16,32,64,128} at saturation.
+_BWD_DQ_MMA_D_SLAB = 32
+
+_BWD_DQ_MMA_TEMPLATE = """
+    uint lane = thread_position_in_threadgroup.x;   // 0..31 == simd lane
+    uint block = threadgroup_position_in_grid.x;    // query-block index within this dispatch
+    uint bh = thread_position_in_grid.y;            // 0..(b*hq)-1
+
+    uint r0 = qoffs[0];
+    uint r1 = qoffs[1];
+    uint rows_this = r1 - r0;
+
+    uint hq = q_shape[1];
+    uint n = q_shape[2];
+    uint hkv = k_shape[1];
+    uint group_size = hq / hkv;
+    uint b = bh / hq;
+    uint h = bh % hq;
+    uint kvh = h / group_size;
+
+    float scale = scale_in[0];
+    size_t qh_base = (size_t)bh * n * HEAD_DIM;                 // bh == b*hq + h (q AND dO layout)
+    size_t kv_base = (size_t)(b * hkv + kvh) * n * HEAD_DIM;
+    size_t ld_base = (size_t)bh * n;                           // lse/d_arr are (B, Hq, N)
+
+    uint fm = 4 * ((lane >> 4) & 1) + 2 * ((lane >> 2) & 1) + ((lane >> 1) & 1);
+    uint fn = 4 * ((lane >> 3) & 1) + 2 * (lane & 1);
+
+    uint block_base = block * 32;                              // tile-local row of block start
+
+    // Q and dO row pointers for the 4 row-tiles (within-block rows fm, fm+8, fm+16, fm+24), plus
+    // the per-row SAVED L and D -- all clamped to n-1 so an over-hang row (dispatched past n)
+    // reads valid memory and is simply never stored. dO shares q's (B,Hq,N,D) layout (qh_base).
+    const device T* qh[4];
+    const device T* doh[4];
+    float l_row[4];
+    float d_row[4];
+    #pragma clang loop unroll(full)
+    for (uint rt = 0; rt < 4; ++rt) {
+        uint qrow = metal::min(r0 + block_base + fm + 8 * rt, n - 1);
+        qh[rt] = q + qh_base + (size_t)qrow * HEAD_DIM;
+        doh[rt] = d_o + qh_base + (size_t)qrow * HEAD_DIM;
+        l_row[rt] = lse[ld_base + qrow];
+        d_row[rt] = d_arr[ld_base + qrow];
+    }
+
+    uint kv_limit = KV_LIMIT;
+
+    // D-slab OUTER loop: C_dq[4][D_SLAB/8] is held register-resident across the KV loop for ONE
+    // slab of D columns at a time; S/P/dP are recomputed per slab (re-reading Q/K/V/dO) -- the
+    // register-bounding structure mirroring the forward's O-path (see the block comment).
+    #pragma clang loop unroll(full)
+    for (uint slab0 = 0; slab0 < HEAD_DIM; slab0 += D_SLAB) {
+        metal::simdgroup_float8x8 C_dq[4][D_SLAB_TILES];
+        #pragma clang loop unroll(full)
+        for (uint rt = 0; rt < 4; ++rt) {
+            #pragma clang loop unroll(full)
+            for (uint dt = 0; dt < D_SLAB_TILES; ++dt) {
+                C_dq[rt][dt] = metal::make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+            }
+        }
+
+        for (uint kb0 = 0; kb0 < kv_limit; kb0 += 32) {
+            uint kb1 = metal::min(kb0 + 32u, n);
+            uint kl = kb1 - 1;                                    // clamp target for tail keys
+            const device T* kp0[4];
+            const device T* kp1[4];
+            const device T* vp0[4];
+            const device T* vp1[4];
+            #pragma clang loop unroll(full)
+            for (uint ct = 0; ct < 4; ++ct) {
+                uint c0 = metal::min(kb0 + 8 * ct + fn, kl);
+                uint c1 = metal::min(kb0 + 8 * ct + fn + 1, kl);
+                kp0[ct] = k + kv_base + (size_t)c0 * HEAD_DIM;
+                kp1[ct] = k + kv_base + (size_t)c1 * HEAD_DIM;
+                vp0[ct] = v + kv_base + (size_t)c0 * HEAD_DIM;
+                vp1[ct] = v + kv_base + (size_t)c1 * HEAD_DIM;
+            }
+
+            // GEMM-A #1: S_block = Q_block @ K_block^T in fp32 simdgroup state (the CE inner GEMM,
+            // the forward's QK^T verbatim -- unscaled dot; scale is folded into P below).
+            metal::simdgroup_float8x8 C_s[4][4];
+            #pragma clang loop unroll(full)
+            for (uint rt = 0; rt < 4; ++rt) {
+                #pragma clang loop unroll(full)
+                for (uint ct = 0; ct < 4; ++ct) {
+                    C_s[rt][ct] = metal::make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+                }
+            }
+            for (uint d0 = 0; d0 < HEAD_DIM; d0 += 8) {
+                metal::simdgroup_float8x8 A[4];
+                metal::simdgroup_float8x8 B[4];
+                #pragma clang loop unroll(full)
+                for (uint rt = 0; rt < 4; ++rt) {
+                    A[rt].thread_elements()[0] = (float)qh[rt][d0 + fn];
+                    A[rt].thread_elements()[1] = (float)qh[rt][d0 + fn + 1];
+                }
+                #pragma clang loop unroll(full)
+                for (uint ct = 0; ct < 4; ++ct) {
+                    B[ct].thread_elements()[0] = (float)kp0[ct][d0 + fm];
+                    B[ct].thread_elements()[1] = (float)kp1[ct][d0 + fm];
+                }
+                #pragma clang loop unroll(full)
+                for (uint rt = 0; rt < 4; ++rt) {
+                    #pragma clang loop unroll(full)
+                    for (uint ct = 0; ct < 4; ++ct) {
+                        metal::simdgroup_multiply_accumulate(
+                            C_s[rt][ct], A[rt], B[ct], C_s[rt][ct]);
+                    }
+                }
+            }
+
+            // P-formation IN PLACE (into C_s): p = exp(scale*s - L_row), masked to 0 for tail /
+            // causal-excluded keys. dQ uses the SAVED L directly -- NO online-softmax rowmax, so
+            // each element is independent (no simd_shuffle cross-key reduction).
+            #pragma clang loop unroll(full)
+            for (uint rt = 0; rt < 4; ++rt) {
+                uint row = r0 + block_base + 8 * rt + fm;         // absolute query row (causal)
+                #pragma clang loop unroll(full)
+                for (uint ct = 0; ct < 4; ++ct) {
+                    uint kk = kb0 + 8 * ct + fn;
+                    float p0 = ((kk < kb1) && (KEEP_CMP))
+                        ? metal::exp(scale * C_s[rt][ct].thread_elements()[0] - l_row[rt]) : 0.0f;
+                    kk = kb0 + 8 * ct + fn + 1;
+                    float p1 = ((kk < kb1) && (KEEP_CMP))
+                        ? metal::exp(scale * C_s[rt][ct].thread_elements()[1] - l_row[rt]) : 0.0f;
+                    C_s[rt][ct].thread_elements()[0] = p0;
+                    C_s[rt][ct].thread_elements()[1] = p1;
+                }
+            }
+
+            // GEMM-A #2: dP_block = dO_block @ V_block^T (same QK^T-shaped MMA, dO for Q, V for K).
+            metal::simdgroup_float8x8 C_dp[4][4];
+            #pragma clang loop unroll(full)
+            for (uint rt = 0; rt < 4; ++rt) {
+                #pragma clang loop unroll(full)
+                for (uint ct = 0; ct < 4; ++ct) {
+                    C_dp[rt][ct] = metal::make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+                }
+            }
+            for (uint d0 = 0; d0 < HEAD_DIM; d0 += 8) {
+                metal::simdgroup_float8x8 A[4];
+                metal::simdgroup_float8x8 B[4];
+                #pragma clang loop unroll(full)
+                for (uint rt = 0; rt < 4; ++rt) {
+                    A[rt].thread_elements()[0] = (float)doh[rt][d0 + fn];
+                    A[rt].thread_elements()[1] = (float)doh[rt][d0 + fn + 1];
+                }
+                #pragma clang loop unroll(full)
+                for (uint ct = 0; ct < 4; ++ct) {
+                    B[ct].thread_elements()[0] = (float)vp0[ct][d0 + fm];
+                    B[ct].thread_elements()[1] = (float)vp1[ct][d0 + fm];
+                }
+                #pragma clang loop unroll(full)
+                for (uint rt = 0; rt < 4; ++rt) {
+                    #pragma clang loop unroll(full)
+                    for (uint ct = 0; ct < 4; ++ct) {
+                        metal::simdgroup_multiply_accumulate(
+                            C_dp[rt][ct], A[rt], B[ct], C_dp[rt][ct]);
+                    }
+                }
+            }
+
+            // dS-formation IN PLACE (into C_s): ds = scale * p * (dp - D_row). C_s holds P,
+            // C_dp holds dP; after this C_s holds dS and C_dp is free. Masked keys already have
+            // p == 0, so their dS is exactly 0 (they contribute nothing to the GEMM-B below).
+            #pragma clang loop unroll(full)
+            for (uint rt = 0; rt < 4; ++rt) {
+                #pragma clang loop unroll(full)
+                for (uint ct = 0; ct < 4; ++ct) {
+                    C_s[rt][ct].thread_elements()[0] =
+                        scale * C_s[rt][ct].thread_elements()[0]
+                        * (C_dp[rt][ct].thread_elements()[0] - d_row[rt]);
+                    C_s[rt][ct].thread_elements()[1] =
+                        scale * C_s[rt][ct].thread_elements()[1]
+                        * (C_dp[rt][ct].thread_elements()[1] - d_row[rt]);
+                }
+            }
+
+            // GEMM-B: C_dq += dS @ K_slab (contraction over the 32 keys). C_s holds dS in
+            // (query-row fm, key fn) layout -- fed DIRECTLY as the MMA left operand (the proven
+            // forward P@V structure with K in place of V). K_slab's fragment maps key fm -> K row,
+            // D-col fn; Kt depends only on (ct, dt), loaded once per (dt, ct) and reused across rt.
+            #pragma clang loop unroll(full)
+            for (uint dt = 0; dt < D_SLAB_TILES; ++dt) {
+                #pragma clang loop unroll(full)
+                for (uint ct = 0; ct < 4; ++ct) {
+                    metal::simdgroup_float8x8 Kt;
+                    const device T* kr =
+                        k + kv_base + (size_t)metal::min(kb0 + 8 * ct + fm, kl) * HEAD_DIM;
+                    Kt.thread_elements()[0] = (float)kr[slab0 + 8 * dt + fn];
+                    Kt.thread_elements()[1] = (float)kr[slab0 + 8 * dt + fn + 1];
+                    #pragma clang loop unroll(full)
+                    for (uint rt = 0; rt < 4; ++rt) {
+                        metal::simdgroup_multiply_accumulate(
+                            C_dq[rt][dt], C_s[rt][ct], Kt, C_dq[rt][dt]);
+                    }
+                }
+            }
+        }
+        // Store this slab's D columns. The guard skips over-hang rows; each lane owns disjoint
+        // (row, D-col) output elements. dQ has NO softmax normalization (unlike the forward's O).
+        #pragma clang loop unroll(full)
+        for (uint rt = 0; rt < 4; ++rt) {
+            uint local_row = block_base + 8 * rt + fm;           // dispatch-local output row
+            if (local_row < rows_this) {
+                size_t dq_base = ((size_t)bh * rows_this + local_row) * HEAD_DIM;
+                #pragma clang loop unroll(full)
+                for (uint dt = 0; dt < D_SLAB_TILES; ++dt) {
+                    dq_out[dq_base + slab0 + 8 * dt + fn] =
+                        (T)(C_dq[rt][dt].thread_elements()[0]);
+                    dq_out[dq_base + slab0 + 8 * dt + fn + 1] =
+                        (T)(C_dq[rt][dt].thread_elements()[1]);
+                }
+            }
+        }
+    }
+"""
+
+
+def build_bwd_dq_mma_source(
+    head_dim: int, *, causal: bool, flip_causal: bool = False, d_slab: int | None = None,
+) -> str:
+    """MSL function body for the 4x4 simdgroup-matrix (MMA) dQ backward kernel -- the
+    throughput restructure of the v1 scalar one-owner-per-row dQ body.
+
+    Same correctness contract as `build_bwd_dq_source` (dQ matches the api.py autodiff oracle;
+    the scalar body is the correctness oracle) with the accumulation restructured to the proven
+    forward rung-2 MMA machinery (see the block comment above `_BWD_DQ_MMA_TEMPLATE`): one
+    32-lane simdgroup per 32-row query block, KV tiled in 32-key blocks, S=Q@K^T + dP=dO@V^T
+    MMAs, dS=scale*P*(dP-D) with P=exp(scale*S-L) from the saved L, and dQ+=dS@K_slab into a
+    register-resident D-slabbed fp32 accumulator.
+
+    `head_dim` in {64, 96, 128} is baked in as a compile-time constant. `causal=True` walks KV
+    blocks only up to each query block's diagonal and masks the diagonal block per key with
+    `kk <= row`; `causal=False` scans every KV block and keeps every key. `flip_causal` is
+    TEST-ONLY -- it flips the causal-skip predicate to the wrong triangle (`kk >= row`) so a
+    parity run against the causal oracle FAILS (the named-bug-site perturbation). `d_slab` (a
+    positive multiple of 8 dividing `head_dim`) overrides the register-safe `_BWD_DQ_MMA_D_SLAB`
+    default (32) -- the controller sweeps {16,32,64,128} at saturation; this rung's launcher
+    uses the default and the mma variant is not wired into the API path."""
+    if head_dim not in _KERNEL_HEAD_DIMS:
+        raise ValueError(
+            f"head_dim must be one of {_KERNEL_HEAD_DIMS}, got {head_dim}"
+        )
+    if flip_causal and not causal:
+        raise ValueError("flip_causal is only meaningful with causal=True")
+    slab = _BWD_DQ_MMA_D_SLAB if d_slab is None else d_slab
+    if slab <= 0 or slab % 8 != 0 or head_dim % slab != 0:
+        raise ValueError(
+            f"d_slab must be a positive multiple of 8 dividing head_dim={head_dim}, got {slab}"
+        )
+    if not causal:
+        keep = "true"
+        kv_limit = "n"
+    elif flip_causal:
+        keep = "kk >= row"
+        kv_limit = "metal::min(n, r0 + block_base + 32u)"
+    else:
+        keep = "kk <= row"
+        kv_limit = "metal::min(n, r0 + block_base + 32u)"
+    return (
+        _BWD_DQ_MMA_TEMPLATE.replace("HEAD_DIM", str(head_dim))
+        .replace("D_SLAB_TILES", str(slab // 8))
+        .replace("D_SLAB", str(slab))
+        .replace("KV_LIMIT", kv_limit)
+        .replace("KEEP_CMP", keep)
+    )
+
+
+# ---------------------------------------------------------------------------------------
 # Backward: dK/dV split-partials kernel v1 (ONE OWNER PER (batch, kv_head, key)) -- T9, spec
 # Section 4.2.4. One program owns dK[j] and dV[j] for a single key j; each DISPATCH covers a
 # bounded query-block range [q_lo, q_hi) and the owner accumulates that range's contribution
