@@ -107,11 +107,18 @@ def build_probe(
     # dominate and both arms OOM together long before the loss layer matters. The sweep
     # MEASURES both arms' ceilings; it does not presume ours is higher (measured
     # 2026-07-08: the O(N^2) attention backward binds both arms, ceilings tied ~8.5k).
+    # `attention_impl` is FORCED per arm, not a free flag (architect ruling): `ours`
+    # measures the whole product story (flash attention + kernel loss) against `stock`
+    # (stock attention + stock loss) -- a free global flag would permit the nonsensical
+    # ours-with-stock-attention combination. This edit changes `script_sha()`, which
+    # `_recipe_session_id` folds in, so a stale attention-unaware sweep session is
+    # correctly never resumed under the new id.
     params: dict[str, object] = {
         "model": model, "revision": revision, "seq_len": seq_len, "batch": batch,
         "steps": PROBE_STEPS, "lora_rank": lora_rank, "lora_layers": lora_layers,
         "impl": "auto", "stock": arm == "stock", "seed": seed,
         "compute_dtype": compute_dtype, "grad_checkpoint": grad_checkpoint,
+        "attention_impl": "flash" if arm == "ours" else "stock",
         "script_sha": script_sha(), "dataset_recipe": DATASET_RECIPE,
     }
     return Condition(

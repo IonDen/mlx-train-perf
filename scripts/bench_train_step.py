@@ -91,6 +91,7 @@ def build_conditions(
     impl: str = "auto",
     compute_dtype: str | None = None,
     grad_checkpoint: bool = False,
+    attention_impl: str = "stock",
 ) -> list[Condition]:
     sha = script_sha()
     conditions: list[Condition] = []
@@ -103,7 +104,7 @@ def build_conditions(
                     "lora_layers": lora_layers, "impl": impl, "stock": stock,
                     "learning_rate": learning_rate, "seed": seed,
                     "compute_dtype": compute_dtype, "grad_checkpoint": grad_checkpoint,
-                    "script_sha": sha,
+                    "attention_impl": attention_impl, "script_sha": sha,
                 }
                 conditions.append(Condition(
                     name=condition_name(model=model, seq_len=seq_len, arm=arm),
@@ -207,6 +208,12 @@ def main(argv: list[str] | None = None) -> int:
                     help="enable gradient checkpointing (recompute activations) on BOTH "
                         "arms -- the realistic long-context QLoRA setup, where ours' "
                         "flat loss-layer memory is visible against a small trunk footprint")
+    ap.add_argument("--attention", choices=["stock", "flash"], default="stock",
+                    help="attention implementation applied to BOTH arms (default: "
+                        "stock) -- this bench's ours/stock arms compare the loss layer "
+                        "at a held-constant attention implementation; 'flash' routes "
+                        "every decoder layer through T12's enable_flash_attention on "
+                        "both arms equally")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--revision", default=None, help="applied to every --model")
     ap.add_argument("--out", default=None, help="output directory (default: this "
@@ -226,19 +233,24 @@ def main(argv: list[str] | None = None) -> int:
         # exercises `ours` end to end through the compiled trainer via the chunked path
         # (the kernel path's compile-compatibility is locked by tests/test_loss_compile.py).
         # No cast: chunked accepts fp16, so the smoke stays on the fp16 checkpoint as-is.
-        impl, compute_dtype, grad_checkpoint = "chunked", None, False
+        # Attention stays stock too -- --attention is ignored for --smoke (same as
+        # --impl/--compute-dtype/--grad-checkpoint above), keeping the smoke's real-
+        # model GPU footprint to what its end-to-end-verification purpose needs.
+        impl, compute_dtype, grad_checkpoint, attention_impl = "chunked", None, False, "stock"
     else:
         if not args.model or not args.seq_len:
             raise SystemExit("--model and --seq-len are required unless --smoke is set")
         models, seq_lens, steps = args.model, args.seq_len, args.steps
         out_dir = Path(args.out) if args.out else RESULTS
         impl, compute_dtype, grad_checkpoint = args.impl, args.compute_dtype, args.grad_checkpoint
+        attention_impl = args.attention
 
     conditions = build_conditions(
         models=models, seq_lens=seq_lens, batch=args.batch, steps=steps,
         lora_rank=args.lora_rank, lora_layers=args.lora_layers,
         learning_rate=args.learning_rate, seed=args.seed, revision=args.revision,
         impl=impl, compute_dtype=compute_dtype, grad_checkpoint=grad_checkpoint,
+        attention_impl=attention_impl,
     )
     if args.condition:
         matches = [c for c in conditions if c.name == args.condition]
