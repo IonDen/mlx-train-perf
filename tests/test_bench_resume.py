@@ -102,6 +102,40 @@ def test_code_sha_changes_when_a_dep_file_changes_and_flips_freshness(
     assert not result_is_fresh(p, ident_after)
 
 
+_ATTENTION_CODE_SHA_DEPS: tuple[str, ...] = (
+    "attention/reference.py",
+    "attention/api.py",
+    "attention/kernel/source.py",
+    "attention/kernel/launch.py",
+    "attention/kernel/dispatch.py",
+)
+
+
+@pytest.mark.parametrize("rel_path", _ATTENTION_CODE_SHA_DEPS, ids=_ATTENTION_CODE_SHA_DEPS)
+def test_editing_attention_source_changes_code_sha(
+    rel_path: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each attention-path file a measured attention condition depends on must be
+    declared in `CODE_SHA_DEPS` (T10, spec amendment §8/§10.13 -- MUST land before T11's
+    attention artifact exists). Proven two ways: (1) the real, on-disk file is actually a
+    member of the production `CODE_SHA_DEPS` tuple -- this is what fails BEFORE the dep
+    list is extended, with the readable reason "must be declared in CODE_SHA_DEPS"; (2)
+    editing its bytes flips `code_sha`, through the SAME mechanism
+    `test_code_sha_changes_when_a_dep_file_changes_and_flips_freshness` proves generically
+    -- isolated to a tmp copy so this test never mutates the real source tree."""
+    real_path = artifacts._PACKAGE_ROOT / rel_path
+    assert real_path in artifacts.CODE_SHA_DEPS, f"{rel_path} must be declared in CODE_SHA_DEPS"
+
+    dep = tmp_path / real_path.name
+    dep.write_bytes(real_path.read_bytes())
+    monkeypatch.setattr(artifacts, "CODE_SHA_DEPS", (dep,))
+
+    ident_before = run_identity(model="m", session_id="s1")
+    dep.write_bytes(dep.read_bytes() + b"\n# perturb\n")
+    ident_after = run_identity(model="m", session_id="s1")
+    assert ident_after["code_sha"] != ident_before["code_sha"]
+
+
 def test_condition_identity_rejects_reserved_param_key_kind() -> None:
     with pytest.raises(BenchInputError, match="kind"):
         condition_identity(kind="loss_layer", session_id="s1", params={"kind": "oops"})
@@ -110,6 +144,72 @@ def test_condition_identity_rejects_reserved_param_key_kind() -> None:
 def test_condition_identity_rejects_reserved_param_key_session_id() -> None:
     with pytest.raises(BenchInputError, match="session_id"):
         condition_identity(kind="loss_layer", session_id="s1", params={"session_id": "oops"})
+
+
+def test_condition_identity_differs_by_attention_impl() -> None:
+    """`attention_impl` is a dedicated identity input (T10, spec §8 amendment) -- two
+    conditions differing only in it get different identities, and a condition that never
+    supplies it (every loss_layer/train_step condition today) gets an identity dict with
+    the SAME keys as before this change -- omitted, not defaulted to `None` -- so
+    SCHEMA_VERSION does not need to bump for existing condition kinds."""
+    ident_flash = condition_identity(
+        kind="attention_op", session_id="s1", params={}, attention_impl="flash",
+    )
+    ident_stock = condition_identity(
+        kind="attention_op", session_id="s1", params={}, attention_impl="stock",
+    )
+    assert ident_flash["attention_impl"] == "flash"
+    assert ident_flash != ident_stock
+
+    ident_unset = condition_identity(kind="loss_layer", session_id="s1", params={"impl": "kernel"})
+    assert "attention_impl" not in ident_unset
+
+
+def test_condition_identity_differs_by_dkv_split_policy() -> None:
+    ident_none = condition_identity(
+        kind="attention_op", session_id="s1", params={}, dkv_split_policy="none",
+    )
+    ident_chunked = condition_identity(
+        kind="attention_op", session_id="s1", params={}, dkv_split_policy="chunked",
+    )
+    assert ident_none["dkv_split_policy"] == "none"
+    assert ident_none != ident_chunked
+
+    ident_unset = condition_identity(kind="loss_layer", session_id="s1", params={"impl": "kernel"})
+    assert "dkv_split_policy" not in ident_unset
+
+
+def test_condition_identity_differs_by_attention_variant() -> None:
+    ident_a = condition_identity(
+        kind="attention_op", session_id="s1", params={}, attention_variant="mma_slab128",
+    )
+    ident_b = condition_identity(
+        kind="attention_op", session_id="s1", params={}, attention_variant="mma_slab256",
+    )
+    assert ident_a["attention_variant"] == "mma_slab128"
+    assert ident_a != ident_b
+
+    ident_unset = condition_identity(kind="loss_layer", session_id="s1", params={"impl": "kernel"})
+    assert "attention_variant" not in ident_unset
+
+
+def test_condition_identity_rejects_reserved_param_key_attention_impl() -> None:
+    with pytest.raises(BenchInputError, match="attention_impl"):
+        condition_identity(kind="attention_op", session_id="s1", params={"attention_impl": "oops"})
+
+
+def test_condition_identity_rejects_reserved_param_key_dkv_split_policy() -> None:
+    with pytest.raises(BenchInputError, match="dkv_split_policy"):
+        condition_identity(
+            kind="attention_op", session_id="s1", params={"dkv_split_policy": "oops"},
+        )
+
+
+def test_condition_identity_rejects_reserved_param_key_attention_variant() -> None:
+    with pytest.raises(BenchInputError, match="attention_variant"):
+        condition_identity(
+            kind="attention_op", session_id="s1", params={"attention_variant": "oops"},
+        )
 
 
 def test_run_identity_rejects_param_colliding_with_internal_field() -> None:
