@@ -23,11 +23,16 @@ import pytest
 
 pytest.importorskip("mlx_lm")
 
+import mlx_lm.tuner.utils as lora_utils
 from mlx_lm.models import llama
 
 from mlx_train_perf.bench import worker
 from mlx_train_perf.core.guards import clamped_caps, install_guardrails
-from mlx_train_perf.errors import MissingDependencyError, WiredCapRegressionError
+from mlx_train_perf.errors import (
+    MissingDependencyError,
+    MlxTrainPerfError,
+    WiredCapRegressionError,
+)
 
 
 def _tiny_llama() -> llama.Model:
@@ -167,6 +172,144 @@ def test_run_train_step_ours_with_grad_checkpoint_still_reports_fields(
     params = {**_BASE_PARAMS, "grad_checkpoint": True}
     fields = worker.run_train_step(params)
     assert len(fields["loss_all"]) == 2  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# attention_impl threading (T13 step 1): "stock" (default) leaves the model's
+# self_attn untouched; "flash" must call `enable_flash_attention` with THIS run's
+# training shape (seq_len/batch), AFTER the compute-dtype cast is materialized and
+# BEFORE freeze/LoRA injection -- LoRA target discovery walks `named_modules()` by
+# path, so the wrapper must already be in the tree when LoRA lands inside it
+# (`FlashAttentionWrapper`'s own docstring, reason 1). `enable_flash_attention` is
+# stubbed in every test below: the tiny llama fixture's head_dim (16) is outside the
+# kernel's supported set ({64, 96, 128}), and exercising the REAL wrapper/kernel here
+# would add a GPU dispatch the default pytest lane does not otherwise pay for --
+# `attention/wrapper.py` and `attention/api.py` have their own dedicated test
+# coverage for the real wrapping/kernel behavior.
+# ---------------------------------------------------------------------------
+
+
+def test_run_train_step_default_attention_impl_is_stock_and_skips_enable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_load(monkeypatch)
+    install_guardrails()
+    called = {"n": 0}
+
+    def spy_enable(*_a: Any, **_kw: Any) -> None:
+        called["n"] += 1
+
+    monkeypatch.setattr(worker, "enable_flash_attention", spy_enable)
+
+    fields = worker.run_train_step(dict(_BASE_PARAMS))  # no attention_impl key
+
+    assert called["n"] == 0
+    assert len(fields["loss_all"]) == 2  # type: ignore[arg-type]
+
+
+def test_run_train_step_explicit_stock_attention_impl_skips_enable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_load(monkeypatch)
+    install_guardrails()
+    called = {"n": 0}
+
+    def spy_enable(*_a: Any, **_kw: Any) -> None:
+        called["n"] += 1
+
+    monkeypatch.setattr(worker, "enable_flash_attention", spy_enable)
+
+    worker.run_train_step({**_BASE_PARAMS, "attention_impl": "stock"})
+
+    assert called["n"] == 0
+
+
+def test_run_train_step_flash_attention_impl_enables_before_lora_injection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The load-bearing ordering contract: `enable_flash_attention` fires with THIS
+    run's seq_len/batch hints, before `model.freeze()`/`linear_to_lora_layers`."""
+    model = _tiny_llama()
+    monkeypatch.setattr(worker, "_load_model", lambda _m, _r: (model, object()))
+    install_guardrails()
+
+    calls: list[str] = []
+    enable_args: dict[str, object] = {}
+
+    def spy_enable(m: Any, **kw: Any) -> None:
+        calls.append("enable_flash_attention")
+        enable_args["model"] = m
+        enable_args["seq_len"] = kw.get("seq_len")
+        enable_args["batch_size"] = kw.get("batch_size")
+
+    monkeypatch.setattr(worker, "enable_flash_attention", spy_enable)
+
+    real_freeze = model.freeze
+
+    def spy_freeze(*a: Any, **kw: Any) -> Any:
+        calls.append("freeze")
+        return real_freeze(*a, **kw)
+
+    monkeypatch.setattr(model, "freeze", spy_freeze)
+
+    real_lora = lora_utils.linear_to_lora_layers
+
+    def spy_lora(*a: Any, **kw: Any) -> Any:
+        calls.append("linear_to_lora_layers")
+        return real_lora(*a, **kw)
+
+    monkeypatch.setattr(lora_utils, "linear_to_lora_layers", spy_lora)
+
+    fields = worker.run_train_step({**_BASE_PARAMS, "attention_impl": "flash"})
+
+    assert calls == ["enable_flash_attention", "freeze", "linear_to_lora_layers"]
+    assert enable_args["model"] is model
+    assert enable_args["seq_len"] == _BASE_PARAMS["seq_len"]
+    assert enable_args["batch_size"] == _BASE_PARAMS["batch"]
+    assert len(fields["loss_all"]) == 2  # type: ignore[arg-type]
+
+
+def test_run_train_step_evaluates_parameters_before_enabling_flash_attention(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """gotcha 14: `enable_flash_attention`'s prewarm runs a REAL calibration forward
+    with its own `mx.eval` -- the compute_dtype cast above must already be
+    materialized before that happens, not implicitly forced as a side effect of the
+    calibration's own eval (which would land the one-time cast cost inside whatever
+    the calibration itself measures/attributes)."""
+    model = _tiny_llama()
+    monkeypatch.setattr(worker, "_load_model", lambda _m, _r: (model, object()))
+    install_guardrails()
+
+    calls: list[str] = []
+    real_eval = worker.mx.eval
+
+    def spy_eval(*args: Any) -> None:
+        calls.append("eval")
+        real_eval(*args)
+
+    def spy_enable(*_a: Any, **_kw: Any) -> None:
+        calls.append("enable_flash_attention")
+
+    monkeypatch.setattr(worker.mx, "eval", spy_eval)
+    monkeypatch.setattr(worker, "enable_flash_attention", spy_enable)
+
+    worker.run_train_step({
+        **_BASE_PARAMS, "attention_impl": "flash", "compute_dtype": "bfloat16",
+    })
+
+    assert "eval" in calls
+    assert "enable_flash_attention" in calls
+    assert calls.index("eval") < calls.index("enable_flash_attention")
+
+
+def test_run_train_step_rejects_unknown_attention_impl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_load(monkeypatch)
+    install_guardrails()
+    with pytest.raises(MlxTrainPerfError, match="attention_impl"):
+        worker.run_train_step({**_BASE_PARAMS, "attention_impl": "bogus"})
 
 
 def test_require_mlx_lm_raises_missing_dependency_error_when_absent(

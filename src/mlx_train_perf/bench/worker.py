@@ -36,6 +36,7 @@ from typing import Any, Literal, cast
 import mlx.core as mx
 
 from mlx_train_perf.adapters.mlx_lm import make_loss_fn
+from mlx_train_perf.attention.wrapper import enable_flash_attention
 from mlx_train_perf.bench.artifacts import condition_identity, write_result
 from mlx_train_perf.core.guards import clamped_caps, install_guardrails, wired_cap_holds
 from mlx_train_perf.core.loss import DenseHead, HeadRef, QuantizedHead, linear_cross_entropy
@@ -45,6 +46,8 @@ from mlx_train_perf.errors import (
     MlxTrainPerfError,
     WiredCapRegressionError,
 )
+
+_ATTENTION_IMPLS = ("stock", "flash")
 
 _DTYPES: dict[str, mx.Dtype] = {
     "float32": mx.float32, "bfloat16": mx.bfloat16, "float16": mx.float16,
@@ -302,7 +305,11 @@ def run_train_step(params: dict[str, object]) -> dict[str, object]:
     default 1e-5), `seed` (int, default 0), `grad_checkpoint` (bool, default False),
     `compute_dtype` (str | None, default None -- when set, e.g. "bfloat16", the loaded
     model's floating params are cast to it before training; the kernel `impl` needs
-    this on 4-bit models that otherwise compute in fp16).
+    this on 4-bit models that otherwise compute in fp16), `attention_impl` ("stock"
+    default | "flash" -- "flash" routes every decoder layer's attention through T12's
+    `enable_flash_attention`, hinted with THIS run's `seq_len`/`batch` so a compiled
+    `train()` traces with warm kernel rate caches; an unknown value raises
+    `MlxTrainPerfError`).
     """
     _require_mlx_lm()
     import mlx.optimizers as optim  # noqa: PLC0415
@@ -322,6 +329,12 @@ def run_train_step(params: dict[str, object]) -> dict[str, object]:
     seed = int(cast(int, params.get("seed", 0)))
     grad_checkpoint = bool(params.get("grad_checkpoint", False))
     compute_dtype = cast("str | None", params.get("compute_dtype"))
+    attention_impl = str(params.get("attention_impl", "stock"))
+    if attention_impl not in _ATTENTION_IMPLS:
+        raise MlxTrainPerfError(
+            f"unknown attention_impl {attention_impl!r}; expected one of "
+            f"{_ATTENTION_IMPLS}"
+        )
 
     model, _tokenizer = _load_model(model_id, revision)
     if compute_dtype is not None:
@@ -337,6 +350,19 @@ def run_train_step(params: dict[str, object]) -> dict[str, object]:
         # loss layer. `set_dtype` is a pure `astype` (draws no RNG), so the seed->LoRA-
         # init determinism below is undisturbed.
         model.set_dtype(_resolve_dtype(compute_dtype))
+    if attention_impl == "flash":
+        # `enable_flash_attention` runs its OWN real calibration forward + `mx.eval`
+        # (T12's `_prewarm_rate_caches`, hinted with THIS run's seq_len/batch so a
+        # compiled `train()` below traces with warm kernel rate caches -- no in-trace
+        # host-sync). The compute_dtype cast above must already be MATERIALIZED
+        # (gotcha 14) before that calibration runs, rather than get forced as an
+        # incidental side effect of the calibration's own eval. It also MUST run
+        # before `model.freeze()`/`linear_to_lora_layers` below: LoRA target
+        # discovery walks `named_modules()` by path (`self_attn.q_proj`), so the
+        # wrapper has to already be in the tree at injection time for LoRA to land
+        # inside it (`FlashAttentionWrapper`'s own docstring, reason 1).
+        mx.eval(model.parameters())
+        enable_flash_attention(model, seq_len=seq_len, batch_size=batch)
     mx.random.seed(seed)  # BEFORE freeze/LoRA-injection: their random init draws next
     model.freeze()
     linear_to_lora_layers(

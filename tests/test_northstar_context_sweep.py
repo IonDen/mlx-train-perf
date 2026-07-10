@@ -20,6 +20,7 @@ import pytest
 _SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts"
 sys.path.insert(0, str(_SCRIPTS_DIR))
 
+import northstar_context_sweep  # noqa: E402 -- follows the sys.path insert
 from northstar_context_sweep import (  # noqa: E402 -- follows the sys.path insert
     DEFAULT_GRANULARITY,
     DEFAULT_START_SEQ_LEN,
@@ -248,6 +249,36 @@ def test_recipe_session_id_differs_for_a_different_grad_checkpoint() -> None:
 
 def test_default_grad_checkpoint_is_true() -> None:
     assert build_parser().parse_args([]).grad_checkpoint is True
+
+
+def test_build_probe_forces_flash_attention_for_ours_and_stock_for_stock() -> None:
+    """Attention is a PER-ARM dimension here (architect ruling), not a free flag:
+    `ours` measures the whole product story (flash attention + kernel loss) against
+    `stock` (stock attention + stock loss). A free global attention flag would permit
+    the nonsensical ours-with-stock-attention combination."""
+    ours = build_probe(model=_RECIPE["model"], revision=None, batch=1, lora_rank=8,
+                       lora_layers=-1, seed=0, arm="ours", seq_len=2048)
+    stock = build_probe(model=_RECIPE["model"], revision=None, batch=1, lora_rank=8,
+                        lora_layers=-1, seed=0, arm="stock", seq_len=2048)
+    assert ours.params["attention_impl"] == "flash"
+    assert stock.params["attention_impl"] == "stock"
+
+
+def test_recipe_session_id_changes_when_script_sha_changes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`_recipe_session_id` folds in `script_sha()` (the whole script's own bytes),
+    NOT a dedicated `attention_impl` kwarg -- attention is forced per arm inside
+    `build_probe` itself (see the test above), so editing `build_probe` to add that
+    forcing logic changes `script_sha()` and therefore the session id automatically: a
+    stale, attention-unaware 0.1.0 sweep is correctly never resumed under the new id.
+    Mirrors the compute_dtype/grad_checkpoint sensitivity tests above, whose
+    sensitivity is via an explicit kwarg; this dimension's is via the script's own
+    source."""
+    before = _recipe_session_id(**_RECIPE)
+    monkeypatch.setattr(northstar_context_sweep, "script_sha", lambda: "0" * 16)
+    after = northstar_context_sweep._recipe_session_id(**_RECIPE)
+    assert before != after
 
 
 def test_build_probe_rejects_an_unknown_arm() -> None:

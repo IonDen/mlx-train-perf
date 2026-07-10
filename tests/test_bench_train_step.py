@@ -93,7 +93,7 @@ def test_build_conditions_ours_and_stock_share_every_param_except_stock_and_impl
     assert ours.params["stock"] is False
     assert stock.params["stock"] is True
     for key in ("model", "revision", "seq_len", "batch", "steps", "lora_rank",
-                "lora_layers", "learning_rate", "seed", "script_sha"):
+                "lora_layers", "learning_rate", "seed", "script_sha", "attention_impl"):
         assert ours.params[key] == stock.params[key]
 
 
@@ -137,6 +137,27 @@ def test_build_conditions_grad_checkpoint_defaults_to_false() -> None:
         learning_rate=1e-5, seed=0, revision=None,
     )
     assert all(c.params["grad_checkpoint"] is False for c in conditions)
+
+
+def test_build_conditions_threads_attention_impl_into_both_arms() -> None:
+    """`--attention` reaches EVERY condition's params uniformly (both `ours` and
+    `stock`) -- this bench's `ours`/`stock` arms compare the loss layer at a held-
+    constant attention implementation, unlike the North-Star sweep, where attention
+    IS the per-arm dimension (bench/worker.py's `attention_impl` knob)."""
+    conditions = build_conditions(
+        models=["m/a"], seq_lens=[1024], batch=1, steps=20, lora_rank=8, lora_layers=-1,
+        learning_rate=1e-5, seed=0, revision=None, attention_impl="flash",
+    )
+    assert conditions
+    assert all(c.params["attention_impl"] == "flash" for c in conditions)
+
+
+def test_build_conditions_attention_impl_defaults_to_stock() -> None:
+    conditions = build_conditions(
+        models=["m/a"], seq_lens=[1024], batch=1, steps=20, lora_rank=8, lora_layers=-1,
+        learning_rate=1e-5, seed=0, revision=None,
+    )
+    assert all(c.params["attention_impl"] == "stock" for c in conditions)
 
 
 def test_build_conditions_all_share_the_same_script_sha() -> None:
@@ -261,6 +282,7 @@ def test_help_runs_without_touching_a_model() -> None:
     assert proc.returncode == 0
     assert "--smoke" in proc.stdout
     assert "--model" in proc.stdout
+    assert "--attention" in proc.stdout
 
 
 def test_main_requires_model_and_seq_len_unless_smoke() -> None:
