@@ -27,6 +27,7 @@ from mlx.utils import tree_flatten
 pytest.importorskip("mlx_lm")
 
 from mlx_lm.models import llama, qwen3
+from mlx_lm.models.base import create_attention_mask
 from mlx_lm.tuner.lora import LoRALinear
 from mlx_lm.tuner.trainer import default_loss
 from mlx_lm.tuner.utils import linear_to_lora_layers
@@ -319,6 +320,13 @@ def test_mlx_lm_attention_shape_drift_pin() -> None:
     for attn_cls in (llama.Attention, qwen3.Attention):
         params = list(inspect.signature(attn_cls.__call__).parameters)
         assert params == ["self", "x", "mask", "cache"], (attn_cls, params)
+
+    # The mask sentinels the wrapper's call-time guard maps (T12 review carry-forward):
+    # the training path (N>1, no cache) hands the wrapper the STRING "causal"; N==1
+    # returns None. If a future mlx-lm changes either, the wrapper would fail at
+    # TRAINING time (AttentionInputError) -- this pin fails the drift lane instead.
+    assert create_attention_mask(mx.zeros((1, 4, 8)), None) == "causal"
+    assert create_attention_mask(mx.zeros((1, 1, 8)), None) is None
 
 
 # ---------------------------------------------------------------------------
