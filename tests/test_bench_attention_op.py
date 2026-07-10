@@ -1,0 +1,284 @@
+"""Pure-logic + gated-smoke tests for `scripts/bench_attention_op.py` (Task 11, spec
+§8/§10.6 -- the single-op O(N) memory-scaling proof).
+
+`scripts/` has no `__init__.py` (matches `bench_backward_ladder.py`'s existing
+convention), so the module is loaded by path rather than via a package import.
+
+Everything below the smoke test is GPU-free: `build_conditions` (pure grid math),
+`compute_doubling_ratios` (pure ratio math over SYNTHETIC artifact dicts -- the flash
+~2x / stock ~3.8x assertions belong HERE, never against a real GPU measurement in a
+committed test; the real numbers are T13's campaign), and `run_grid`'s resume-by-skip
+orchestration (subprocess spawning stubbed out, same pattern
+`test_bench_resume.py::test_run_conditions_skips_fresh_without_spawning_a_subprocess`
+uses for `bench.runner.run_conditions`). Only the final smoke test actually drives the
+Metal kernel + `math_attention` autodiff at a tiny shape, gated behind
+`--run-benchmark`.
+"""
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+_SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts"
+sys.path.insert(0, str(_SCRIPTS_DIR))
+
+import bench_attention_op  # noqa: E402 -- import must follow the sys.path insert
+from bench_attention_op import (  # noqa: E402
+    AttnCondition,
+    build_conditions,
+    compute_doubling_ratios,
+    main,
+    run_grid,
+    script_sha,
+)
+
+from mlx_train_perf.bench.artifacts import (  # noqa: E402
+    condition_identity,
+    new_session_id,
+    write_result,
+)
+
+# ---------------------------------------------------------------------------
+# build_conditions: pure grid (impl x seq_lens) construction
+# ---------------------------------------------------------------------------
+
+
+def test_build_conditions_grid_times_impl() -> None:
+    conditions = build_conditions(
+        impls=("flash", "stock"), seq_lens=(2048, 4096),
+        head_dim=128, heads=32, kv_heads=8,
+    )
+    assert len(conditions) == 4
+    pairs = {(c.impl, c.n) for c in conditions}
+    assert pairs == {("flash", 2048), ("flash", 4096), ("stock", 2048), ("stock", 4096)}
+
+
+def test_build_conditions_carries_shape_fields() -> None:
+    conditions = build_conditions(
+        impls=("flash",), seq_lens=(2048,), head_dim=64, heads=4, kv_heads=2,
+    )
+    assert conditions == [
+        AttnCondition(name="flash_n2048", impl="flash", n=2048, head_dim=64, heads=4, kv_heads=2)
+    ]
+
+
+def test_build_conditions_names_are_unique() -> None:
+    conditions = build_conditions(
+        impls=("flash", "stock"), seq_lens=(2048, 4096, 8192),
+        head_dim=128, heads=32, kv_heads=8,
+    )
+    names = [c.name for c in conditions]
+    assert len(names) == len(set(names))
+
+
+def test_build_conditions_single_impl_single_seqlen_is_one_condition() -> None:
+    conditions = build_conditions(
+        impls=("flash",), seq_lens=(256,), head_dim=128, heads=32, kv_heads=8,
+    )
+    assert len(conditions) == 1
+    assert conditions[0].name == "flash_n256"
+
+
+# ---------------------------------------------------------------------------
+# compute_doubling_ratios: pure ratio math over SYNTHETIC artifact dicts -- the
+# flash ~2x (O(N)-class) / stock ~3.8x (spec §8's measured O(N^2) baseline) assertions
+# live HERE, not against any real GPU measurement.
+# ---------------------------------------------------------------------------
+
+
+def _entry(*, impl: str, n: int, fwdbwd_peak_gb: float) -> dict[str, object]:
+    return {
+        "impl": impl, "n": n, "fwd_peak_gb": fwdbwd_peak_gb / 2,
+        "fwdbwd_peak_gb": fwdbwd_peak_gb,
+    }
+
+
+def test_compute_doubling_ratios_flash_is_approximately_2x() -> None:
+    entries = [
+        _entry(impl="flash", n=2048, fwdbwd_peak_gb=1.0),
+        _entry(impl="flash", n=4096, fwdbwd_peak_gb=2.0),
+        _entry(impl="flash", n=8192, fwdbwd_peak_gb=4.0),
+    ]
+    ratios = compute_doubling_ratios(entries)
+    assert ratios["flash"]["2048->4096"] == pytest.approx(2.0)
+    assert ratios["flash"]["4096->8192"] == pytest.approx(2.0)
+
+
+def test_compute_doubling_ratios_stock_is_approximately_3_8x() -> None:
+    entries = [
+        _entry(impl="stock", n=2048, fwdbwd_peak_gb=1.0),
+        _entry(impl="stock", n=4096, fwdbwd_peak_gb=3.8),
+        _entry(impl="stock", n=8192, fwdbwd_peak_gb=14.44),
+    ]
+    ratios = compute_doubling_ratios(entries)
+    assert ratios["stock"]["2048->4096"] == pytest.approx(3.8)
+    assert ratios["stock"]["4096->8192"] == pytest.approx(3.8, rel=1e-6)
+
+
+def test_compute_doubling_ratios_only_pairs_exact_doublings() -> None:
+    # 4096 -> 16384 is NOT an exact doubling (missing the 8192 midpoint) -- must not
+    # be reported as a ratio pair.
+    entries = [
+        _entry(impl="flash", n=2048, fwdbwd_peak_gb=1.0),
+        _entry(impl="flash", n=4096, fwdbwd_peak_gb=2.0),
+        _entry(impl="flash", n=16384, fwdbwd_peak_gb=8.0),
+    ]
+    ratios = compute_doubling_ratios(entries)
+    assert ratios["flash"] == {"2048->4096": pytest.approx(2.0)}
+
+
+def test_compute_doubling_ratios_ignores_non_ok_shaped_entries() -> None:
+    entries = [
+        {"impl": "flash", "n": 2048},  # missing fwdbwd_peak_gb
+        {"n": 4096, "fwdbwd_peak_gb": 2.0},  # missing impl
+        {"impl": "flash", "n": "bogus", "fwdbwd_peak_gb": 2.0},  # n not an int
+    ]
+    assert compute_doubling_ratios(entries) == {}
+
+
+def test_compute_doubling_ratios_keeps_impls_independent() -> None:
+    entries = [
+        _entry(impl="flash", n=2048, fwdbwd_peak_gb=1.0),
+        _entry(impl="flash", n=4096, fwdbwd_peak_gb=2.0),
+        _entry(impl="stock", n=2048, fwdbwd_peak_gb=1.0),
+        _entry(impl="stock", n=4096, fwdbwd_peak_gb=3.8),
+    ]
+    ratios = compute_doubling_ratios(entries)
+    assert set(ratios) == {"flash", "stock"}
+    assert ratios["flash"]["2048->4096"] != ratios["stock"]["2048->4096"]
+
+
+# ---------------------------------------------------------------------------
+# script_sha: identity-provenance helper (same convention as
+# bench_backward_ladder.py's own script_sha -- CODE_SHA_DEPS excludes ad hoc bench
+# scripts, so this is what invalidates a stale artifact when THIS script's own
+# measurement logic changes).
+# ---------------------------------------------------------------------------
+
+
+def test_script_sha_is_a_stable_short_hex_digest() -> None:
+    a = script_sha()
+    b = script_sha()
+    assert a == b
+    assert len(a) == 16
+    assert all(c in "0123456789abcdef" for c in a)
+
+
+# ---------------------------------------------------------------------------
+# run_grid: resume-by-skip orchestration (subprocess spawning stubbed, matching
+# test_bench_resume.py's `runner.run_conditions` coverage pattern).
+# ---------------------------------------------------------------------------
+
+
+def _condition() -> AttnCondition:
+    return AttnCondition(name="flash_n256", impl="flash", n=256, head_dim=64, heads=4, kv_heads=2)
+
+
+def test_run_grid_skips_fresh_without_spawning_a_subprocess(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_id = new_session_id()
+    condition = _condition()
+    out_path = tmp_path / f"{condition.name}.json"
+    ident = condition_identity(
+        kind="attention_op", session_id=session_id,
+        params=bench_attention_op._params_for(condition),
+        attention_impl=condition.impl,
+    )
+    write_result(out_path, ident, "ok", impl="flash", n=256, fwd_peak_gb=0.01,
+                fwdbwd_peak_gb=0.02, wall_s=0.001)
+
+    def _must_not_spawn(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("subprocess.run must not be called for a fresh artifact")
+
+    monkeypatch.setattr(bench_attention_op, "_spawn_condition", _must_not_spawn)
+    paths = run_grid([condition], out_dir=tmp_path, session_id=session_id)
+    assert paths == [out_path]
+    assert json.loads(out_path.read_text())["wall_s"] == 0.001  # untouched
+
+
+def test_run_grid_spawns_for_a_stale_condition(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_id = new_session_id()
+    condition = _condition()
+    calls: list[AttnCondition] = []
+
+    def _fake_spawn(
+        c: AttnCondition, *, out_dir: Path, session_id: str,
+    ) -> subprocess.CompletedProcess[str]:
+        calls.append(c)
+        ident = condition_identity(
+            kind="attention_op", session_id=session_id,
+            params=bench_attention_op._params_for(c), attention_impl=c.impl,
+        )
+        write_result(out_dir / f"{c.name}.json", ident, "ok", impl=c.impl, n=c.n,
+                    fwd_peak_gb=0.01, fwdbwd_peak_gb=0.02, wall_s=0.001)
+        return subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(bench_attention_op, "_spawn_condition", _fake_spawn)
+    paths = run_grid([condition], out_dir=tmp_path, session_id=session_id)
+    assert calls == [condition]
+    assert json.loads(paths[0].read_text())["status"] == "ok"
+
+
+def test_run_grid_records_error_envelope_on_subprocess_crash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    condition = _condition()
+
+    def _fake_crash(
+        _c: AttnCondition, *, out_dir: Path, session_id: str,  # noqa: ARG001
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="boom")
+
+    monkeypatch.setattr(bench_attention_op, "_spawn_condition", _fake_crash)
+    paths = run_grid([condition], out_dir=tmp_path, session_id=new_session_id())
+    data = json.loads(paths[0].read_text())
+    assert data["status"] == "error"
+    assert data["error_type"] == "WorkerCrashed"
+    assert "boom" in data["error_msg"]
+
+
+def test_run_grid_records_error_when_subprocess_exits_zero_without_artifact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    condition = _condition()
+
+    def _fake_silent(
+        _c: AttnCondition, *, out_dir: Path, session_id: str,  # noqa: ARG001
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(bench_attention_op, "_spawn_condition", _fake_silent)
+    paths = run_grid([condition], out_dir=tmp_path, session_id=new_session_id())
+    data = json.loads(paths[0].read_text())
+    assert data["status"] == "error"
+    assert data["error_type"] == "WorkerExitedWithoutArtifact"
+
+
+# ---------------------------------------------------------------------------
+# --run-benchmark-gated tiny smoke: real subprocesses, real Metal kernel + autodiff,
+# N=256 -- never a flagship dispatch (binding constraint: T13 owns real runs).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.benchmark
+def test_bench_attention_op_tiny_smoke_writes_ok_artifacts_for_both_impls(
+    tmp_path: Path,
+) -> None:
+    rc = main(["--seq-lens", "256", "--out-dir", str(tmp_path)])
+    assert rc == 0
+
+    flash = json.loads((tmp_path / "flash_n256.json").read_text())
+    stock = json.loads((tmp_path / "stock_n256.json").read_text())
+    for data in (flash, stock):
+        assert data["status"] == "ok"
+        assert data["n"] == 256
+        assert data["fwd_peak_gb"] >= 0
+        assert data["fwdbwd_peak_gb"] >= 0
+        assert data["wall_s"] > 0
+    assert flash["impl"] == "flash"
+    assert stock["impl"] == "stock"
