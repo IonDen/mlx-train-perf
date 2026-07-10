@@ -108,6 +108,7 @@ _ATTENTION_CODE_SHA_DEPS: tuple[str, ...] = (
     "attention/kernel/source.py",
     "attention/kernel/launch.py",
     "attention/kernel/dispatch.py",
+    "attention/wrapper.py",
 )
 
 
