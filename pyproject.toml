@@ -49,7 +49,21 @@ include = [
     "/CHANGELOG.md",
     "/ROADMAP.md",
     "/LICENSE",
+    # The community contribution kit's submission how-to (backlog 0015).
+    "/community-benchmarks/README.md",
 ]
+
+[tool.hatch.build.targets.wheel.force-include]
+# The contribution kit (`mlx_train_perf.contribute`) shells out to these two committed
+# bench scripts as subprocesses (the attention single-op and the context probe have their
+# own script-level orchestration, unlike the worker-backed loss_layer/train_step kinds it
+# drives via bench.runner). A fresh `pip install` has no repo `scripts/` dir, so ship
+# exactly these two INSIDE the package as `_bench_scripts/`; `contribute._bench_scripts_dir`
+# resolves them there first, with a dev-checkout fallback to the repo `scripts/`. The kit
+# always passes an explicit --out-dir/--out, so their default `_artifacts/` write path
+# (which would land in site-packages) is never used.
+"scripts/bench_attention_op.py" = "mlx_train_perf/_bench_scripts/bench_attention_op.py"
+"scripts/northstar_context_sweep.py" = "mlx_train_perf/_bench_scripts/northstar_context_sweep.py"
 
 [dependency-groups]
 dev = [

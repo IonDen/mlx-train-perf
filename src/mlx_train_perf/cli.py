@@ -1,10 +1,13 @@
-"""Command-line interface: `plan` (RAM-fit check) and `bench` (loss-layer harness).
+"""Command-line interface: `plan` (RAM-fit check), `bench` (loss-layer harness), and
+`contribute` (community benchmark contribution kit).
 
-Two subcommands only. `plan` renders a `FitReport` for a given model config + training
-shape (exit 0 fits, 1 does not fit, 2 tool error). `bench` drives the subprocess-per-
-condition bench runner over the `loss_layer` suite (exit 0 all conditions ok, 1 any
-condition not ok, 2 tool error). Argument parsing and rendering are kept in small pure
-functions; `main` and the `_cmd_*` handlers are thin glue around them.
+`plan` renders a `FitReport` for a given model config + training shape (exit 0 fits, 1
+does not fit, 2 tool error). `bench` drives the subprocess-per-condition bench runner over
+the `loss_layer` suite (exit 0 all conditions ok, 1 any condition not ok, 2 tool error).
+`contribute` runs the committed benches on the current machine and writes one
+provenance-complete community artifact (exit 0 written, 1 refused -- red memory /
+too-crowded / not confirmed, 2 tool error). Argument parsing and rendering are kept in
+small pure functions; `main` and the `_cmd_*` handlers are thin glue around them.
 """
 import argparse
 import json
@@ -16,6 +19,12 @@ from typing import cast
 
 from mlx_train_perf.bench.artifacts import new_session_id
 from mlx_train_perf.bench.runner import Condition, report, run_conditions
+from mlx_train_perf.contribute import (
+    detect_machine,
+    format_eta,
+    run_contribution,
+    shapes_for_ram,
+)
 from mlx_train_perf.errors import BenchInputError, MlxTrainPerfError, PlanInputError
 from mlx_train_perf.plan.estimate import FitReport, ModelShape, TrainConfig, plan_fit
 
@@ -190,6 +199,54 @@ def _cmd_bench(args: argparse.Namespace) -> int:
     return _bench_exit_code(statuses)
 
 
+# --- contribute: pure helpers ----------------------------------------------------------
+
+
+_TIERS = ("quick", "full")
+
+
+def _contribution_confirmed(
+    *, yes: bool, isatty: bool, prompt: Callable[[str], str],
+) -> bool:
+    """Pure confirmation decision: `--yes` always proceeds; otherwise an interactive
+    terminal is prompted (a `y`/`yes` proceeds); a non-interactive run without `--yes`
+    refuses (heavy GPU work must never start unattended without an explicit go-ahead)."""
+    if yes:
+        return True
+    if not isatty:
+        return False
+    return prompt("Proceed? [y/N] ").strip().lower() in ("y", "yes")
+
+
+def _cmd_contribute(args: argparse.Namespace) -> int:
+    machine = detect_machine()
+    grid = shapes_for_ram(machine.ram_gib)
+    # The ETA + machine summary print BEFORE any heavy work or the confirmation prompt.
+    print(
+        f"machine: {machine.chip}, {machine.ram_gib} GB RAM, macOS {machine.macos}, "
+        f"mlx {machine.mlx_version}"
+    )
+    print(f"shape grid: {grid.ram_class_gib} GB machine class")
+    print(f"estimated time: {format_eta(args.tier)}")
+    confirmed = _contribution_confirmed(
+        yes=args.yes, isatty=sys.stdin.isatty(), prompt=input,
+    )
+    result = run_contribution(
+        tier=args.tier, out_dir=Path(args.out), confirm=confirmed, machine=machine,
+    )
+    if result.refused:
+        print(f"refused: {result.refusal}", file=sys.stderr)
+        return 1
+    for warning in result.warnings:
+        print(f"warning: {warning}", file=sys.stderr)
+    print(f"wrote {result.artifact_path}")
+    print("\n--- suggested PR title ---")
+    print(result.pr_title)
+    print("\n--- suggested PR body ---")
+    print(result.pr_body)
+    return 0
+
+
 # --- argument parser -------------------------------------------------------------------
 
 
@@ -239,6 +296,31 @@ def _add_bench_parser(subparsers: "argparse._SubParsersAction[argparse.ArgumentP
     bench.set_defaults(func=_cmd_bench)
 
 
+def _add_contribute_parser(
+    subparsers: "argparse._SubParsersAction[argparse.ArgumentParser]",
+) -> None:
+    contribute = subparsers.add_parser(
+        "contribute",
+        help="measure the committed benches on this machine and write a community artifact",
+        description="Run the committed benchmarks on THIS machine and write one "
+                    "provenance-complete community-benchmarks/<chip>-<ram>gb-<date>.json "
+                    "plus a pre-filled PR title/body. Prints an honest up-front time "
+                    "estimate and (unless --yes) asks for confirmation before starting. "
+                    "Exit 1 covers a refusal (red memory / too-crowded machine / not "
+                    "confirmed); exit 2 is a tool error.",
+    )
+    contribute.add_argument("--tier", choices=_TIERS, default="quick",
+                             help="quick (~10-15 min: loss-layer + single-op attention) "
+                                  "or full (~1-2 h: + train-step + a context probe)")
+    contribute.add_argument("--out", default="community-benchmarks",
+                             help="output directory for the community artifact "
+                                  "(default: community-benchmarks)")
+    contribute.add_argument("--yes", action="store_true",
+                             help="skip the interactive confirmation (required for a "
+                                  "non-interactive run)")
+    contribute.set_defaults(func=_cmd_contribute)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="mlx-train-perf",
@@ -247,6 +329,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
     _add_plan_parser(subparsers)
     _add_bench_parser(subparsers)
+    _add_contribute_parser(subparsers)
     return parser
 
 
