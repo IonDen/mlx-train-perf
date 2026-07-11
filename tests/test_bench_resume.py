@@ -8,6 +8,7 @@ at a tiny synthetic shape with `impl="naive"`/`"chunked"` -- fast, no Metal JIT,
 import json
 import subprocess
 import sys
+from collections.abc import Callable
 from importlib.metadata import PackageNotFoundError
 from pathlib import Path
 
@@ -16,13 +17,17 @@ import pytest
 from mlx_train_perf.bench import artifacts, runner, worker
 from mlx_train_perf.bench.artifacts import (
     condition_identity,
+    make_watchdog_on_breach,
     new_session_id,
     result_is_fresh,
     run_identity,
     write_result,
 )
 from mlx_train_perf.bench.runner import Condition, report, run_conditions
+from mlx_train_perf.core.guards import DEFAULT_WALL_BUDGET_S
 from mlx_train_perf.errors import BenchInputError, LaunchBudgetError, MlxTrainPerfError
+
+_GIB = 1024**3
 
 # --- Task 14 brief's mandated Step 1 tests (verbatim) -----------------------------
 
@@ -596,3 +601,228 @@ def test_run_conditions_without_attention_impl_omits_it_from_identity(
     paths = run_conditions([cond], tmp_path, session_id=new_session_id())
     identity = json.loads(paths[0].read_text())["identity"]
     assert "attention_impl" not in identity
+
+
+# --- active-memory watchdog: honest-abort artifact + runner-respect + config seam -----
+
+
+def test_make_watchdog_on_breach_writes_aborted_memory_artifact_then_exits(
+    tmp_path: Path,
+) -> None:
+    """A memory breach writes THIS condition's artifact with an honest
+    `aborted_memory_ceiling` status + the observed numbers, via the SAME `write_result`
+    identity path the worker's ok/refused write uses, then hard-exits (70). `exit_fn` is
+    injected so the test asserts the write + code WITHOUT terminating the runner."""
+    out = tmp_path / "r.json"
+    ident = run_identity(model="m", session_id="s1")
+    exits: list[int] = []
+    on_breach = make_watchdog_on_breach(
+        out, ident, 28 * _GIB, exit_fn=exits.append,
+    )
+    on_breach(
+        "memory_ceiling",
+        {"active_bytes": 32 * _GIB, "elapsed_s": 12.5, "wall_budget_s": 3600.0},
+    )
+    data = json.loads(out.read_text())
+    assert data["status"] == "aborted_memory_ceiling"
+    assert data["identity"] == ident
+    assert data["observed_active_gb"] == 32.0
+    assert data["ceiling_gb"] == 28.0
+    assert data["elapsed_s"] == 12.5
+    assert exits == [70]
+
+
+def test_make_watchdog_on_breach_maps_wall_reason_to_aborted_wall_budget_status(
+    tmp_path: Path,
+) -> None:
+    out = tmp_path / "r.json"
+    ident = run_identity(model="m", session_id="s1")
+    exits: list[int] = []
+    on_breach = make_watchdog_on_breach(out, ident, 28 * _GIB, exit_fn=exits.append)
+    on_breach(
+        "wall_budget",
+        {"active_bytes": 1 << 20, "elapsed_s": 4000.0, "wall_budget_s": 3600.0},
+    )
+    data = json.loads(out.read_text())
+    assert data["status"] == "aborted_wall_budget"
+    assert exits == [70]
+
+
+def _spawn_breach_worker(config_path: Path) -> subprocess.CompletedProcess[str]:
+    """A `_spawn_worker` stand-in that mimics the watchdog's `os._exit(70)` breach path:
+    it writes an honest `aborted_memory_ceiling` artifact to the config's `out`, then
+    reports a NONZERO exit -- exactly the "worker wrote its own record then hard-exited"
+    shape the runner must respect rather than clobber with a generic crash envelope."""
+    cfg = json.loads(config_path.read_text())
+    out = Path(cfg["out"])
+    ident = condition_identity(
+        kind=cfg["kind"], session_id=cfg["session_id"], params=cfg["params"],
+        attention_impl=cfg.get("attention_impl"),
+    )
+    write_result(out, ident, "aborted_memory_ceiling", observed_active_gb=32.4, ceiling_gb=28.0)
+    return subprocess.CompletedProcess(args=[], returncode=70, stdout="", stderr="paging storm")
+
+
+def test_run_conditions_respects_a_breach_artifact_on_nonzero_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The runner-respect contract: a worker that wrote its OWN honest artifact before
+    exiting nonzero (the watchdog `os._exit(70)` path) must have that record surfaced,
+    NOT overwritten by the generic `WorkerCrashed` envelope. Because the runner unlinks a
+    stale artifact BEFORE spawning, an artifact present after a nonzero exit is
+    unambiguously this worker's own write."""
+    monkeypatch.setattr(runner, "_spawn_worker", _spawn_breach_worker)
+    cond = _tiny_loss_layer("breached")
+    paths = run_conditions([cond], tmp_path, session_id=new_session_id())
+    data = json.loads(paths[0].read_text())
+    assert data["status"] == "aborted_memory_ceiling"
+    assert data["observed_active_gb"] == 32.4
+    assert data.get("error_type") != "WorkerCrashed"
+
+
+def test_run_conditions_still_records_crash_envelope_when_worker_wrote_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The other side of the respect rule: a nonzero exit that left NO artifact (an
+    ordinary crash before any write) still gets the generic error envelope."""
+    monkeypatch.setattr(runner, "_spawn_worker", _crash_worker)
+    cond = _tiny_loss_layer("plain_crash")
+    paths = run_conditions([cond], tmp_path, session_id=new_session_id())
+    data = json.loads(paths[0].read_text())
+    assert data["status"] == "error"
+    assert data["error_type"] == "WorkerCrashed"
+
+
+def _capture_config_spawn(
+    captured: dict[str, object],
+) -> Callable[[Path], subprocess.CompletedProcess[str]]:
+    def _spawn(config_path: Path) -> subprocess.CompletedProcess[str]:
+        cfg = json.loads(config_path.read_text())
+        captured.update(cfg)
+        out = Path(cfg["out"])
+        ident = condition_identity(
+            kind=cfg["kind"], session_id=cfg["session_id"], params=cfg["params"],
+            attention_impl=cfg.get("attention_impl"),
+        )
+        write_result(out, ident, "ok", wall_s=0.01, g_mac_per_s=1.0)
+        return subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+
+    return _spawn
+
+
+def test_run_conditions_threads_wall_budget_s_into_the_worker_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`wall_budget_s` rides the SAME top-level config seam `attention_impl` does (commit
+    7e611f0), NOT inside `params` -- so the worker reads one authoritative value. Unlike
+    `attention_impl`, it is deliberately NOT an identity field: a safety limit is not a
+    measurement dimension, so two runs differing only in their budget must share an
+    identity."""
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(runner, "_spawn_worker", _capture_config_spawn(captured))
+    cond = Condition(
+        name="c", kind="loss_layer", params={"n": 8, "d": 4, "v": 16}, wall_budget_s=123.0,
+    )
+    paths = run_conditions([cond], tmp_path, session_id="s1")
+    assert captured["wall_budget_s"] == 123.0
+    # NOT an identity field -- must not leak into the artifact identity.
+    assert "wall_budget_s" not in json.loads(paths[0].read_text())["identity"]
+
+
+def test_run_conditions_wall_budget_s_is_none_when_unset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mirror of the `attention_impl` seam: the config always carries the key, `None`
+    when the `Condition` did not set it (worker maps `None` -> the module default)."""
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(runner, "_spawn_worker", _capture_config_spawn(captured))
+    cond = _tiny_loss_layer("no_budget")
+    run_conditions([cond], tmp_path, session_id="s1")
+    assert "wall_budget_s" in captured
+    assert captured["wall_budget_s"] is None
+
+
+class _FakeWatchdogHandle:
+    def __init__(self) -> None:
+        self.stopped = False
+
+    def stop(self) -> None:
+        self.stopped = True
+
+    def is_alive(self) -> bool:  # pragma: no cover -- interface parity, unused here
+        return not self.stopped
+
+
+def test_worker_main_installs_watchdog_and_threads_resolved_wall_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`worker.main` installs the watchdog (right after `install_guardrails`) with a
+    ceiling derived from the device's physical memory, threads the config's explicit
+    `wall_budget_s` through, and STOPS it on the normal completion path."""
+    captured: dict[str, object] = {}
+    handle = _FakeWatchdogHandle()
+
+    def _fake_install(
+        *, ceiling_bytes: int, wall_budget_s: float | None, on_breach: object,  # noqa: ARG001
+    ) -> _FakeWatchdogHandle:
+        captured["ceiling_bytes"] = ceiling_bytes
+        captured["wall_budget_s"] = wall_budget_s
+        return handle
+
+    monkeypatch.setattr(worker, "install_memory_watchdog", _fake_install)
+    out = tmp_path / "r.json"
+    cfg = tmp_path / "config.json"
+    cfg.write_text(json.dumps({
+        "kind": "loss_layer",
+        "params": {"n": 8, "d": 4, "v": 16, "dtype": "float32", "impl": "naive", "reps": 1},
+        "session_id": "s1", "wall_budget_s": 222.0, "out": str(out),
+    }))
+    rc = worker.main(["--config", str(cfg)])
+    assert rc == 0
+    assert captured["wall_budget_s"] == 222.0
+    assert isinstance(captured["ceiling_bytes"], int)
+    assert captured["ceiling_bytes"] > 0
+    assert handle.stopped is True
+
+
+def test_worker_main_watchdog_defaults_wall_budget_when_config_omits_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def _fake_install(
+        *, ceiling_bytes: int, wall_budget_s: float | None, on_breach: object,  # noqa: ARG001
+    ) -> _FakeWatchdogHandle:
+        captured["wall_budget_s"] = wall_budget_s
+        return _FakeWatchdogHandle()
+
+    monkeypatch.setattr(worker, "install_memory_watchdog", _fake_install)
+    out = tmp_path / "r.json"
+    cfg = tmp_path / "config.json"
+    cfg.write_text(json.dumps({
+        "kind": "loss_layer",
+        "params": {"n": 8, "d": 4, "v": 16, "dtype": "float32", "impl": "naive", "reps": 1},
+        "session_id": "s1", "out": str(out),
+    }))
+    worker.main(["--config", str(cfg)])
+    assert captured["wall_budget_s"] == DEFAULT_WALL_BUDGET_S
+
+
+def test_worker_main_stops_watchdog_even_when_the_condition_crashes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The watchdog must be stopped on EVERY exit path -- including an uncaught crash
+    (unsupported kind) -- so an in-process caller never leaks a sampling thread."""
+    handle = _FakeWatchdogHandle()
+    monkeypatch.setattr(
+        worker, "install_memory_watchdog",
+        lambda *, ceiling_bytes, wall_budget_s, on_breach: handle,  # noqa: ARG005
+    )
+    out = tmp_path / "r.json"
+    cfg = tmp_path / "config.json"
+    cfg.write_text(json.dumps({
+        "kind": "not_a_real_kind", "params": {}, "session_id": "s1", "out": str(out),
+    }))
+    with pytest.raises(MlxTrainPerfError):
+        worker.main(["--config", str(cfg)])
+    assert handle.stopped is True

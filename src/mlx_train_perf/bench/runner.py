@@ -35,6 +35,14 @@ class Condition:
     # 0.1.0-era train_step config) -- `condition_identity` then OMITS it, keeping those
     # identities byte-identical to before this field existed.
     attention_impl: str | None = None
+    # Wall-clock budget (seconds) the worker's memory/wall watchdog fails this condition
+    # against. Rides the SAME top-level config seam as `attention_impl` -- carried out of
+    # `params`, threaded into the worker config below -- but, unlike `attention_impl`, it
+    # is deliberately NOT an identity input: a safety limit is not a measurement
+    # dimension, so it is never passed to `condition_identity` (two runs differing only in
+    # their budget must share an identity). `None` -> the worker applies its module
+    # default (`core.guards.DEFAULT_WALL_BUDGET_S`).
+    wall_budget_s: float | None = None
 
 
 def _spawn_worker(config_path: Path) -> subprocess.CompletedProcess[str]:
@@ -67,7 +75,12 @@ def run_conditions(
 
         config = {
             "kind": condition.kind, "params": condition.params, "session_id": session_id,
-            "attention_impl": condition.attention_impl, "out": str(out_path),
+            "attention_impl": condition.attention_impl,
+            # Top-level (never inside `params`), always present (`None` when unset) -- the
+            # worker reads it with `.get`. NOT part of `ident` above: a wall budget is a
+            # safety limit, not a measurement dimension.
+            "wall_budget_s": condition.wall_budget_s,
+            "out": str(out_path),
         }
         # The config lives in the SYSTEM temp dir, deliberately never inside `out_dir` --
         # an interrupted run must not leave a stray `.json` there for a later glob over
@@ -77,17 +90,21 @@ def run_conditions(
             config_path = Path(f.name)
         try:
             proc = _spawn_worker(config_path)
-            if proc.returncode != 0:
-                # The worker itself wrote nothing (it crashed before/without reaching its
-                # own `write_result`) -- this IS the sweep-level failure envelope, keyed
-                # by the SAME identity the worker would have used, so a later resume run
-                # (after the underlying bug is fixed) still sees it as stale and retries.
+            if proc.returncode != 0 and not out_path.exists():
+                # A nonzero exit that left NO artifact: the worker crashed before/without
+                # reaching any `write_result`. THIS is the sweep-level failure envelope,
+                # keyed by the SAME identity the worker would have used, so a later resume
+                # run (after the underlying bug is fixed) still sees it as stale and
+                # retries. If the artifact DOES exist, the worker wrote its own honest
+                # record before hard-exiting -- the memory/wall watchdog's `os._exit(70)`
+                # breach path (status `aborted_*`) -- and the pre-spawn `unlink` above
+                # guarantees it is THIS worker's write, so it is respected, not clobbered.
                 stderr_tail = (proc.stderr or proc.stdout or "")[-_STDERR_TAIL_CHARS:]
                 write_result(
                     out_path, ident, "error", error_type="WorkerCrashed",
                     error_msg=stderr_tail, returncode=proc.returncode,
                 )
-            elif not out_path.exists():
+            elif proc.returncode == 0 and not out_path.exists():
                 # A clean exit that wrote nothing is still a sweep-level failure (e.g. a
                 # worker that swallowed its own crash) -- recorded the same way, so a
                 # later resume still sees this condition as stale and retries it.

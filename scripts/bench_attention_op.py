@@ -69,11 +69,17 @@ from mlx_train_perf.attention.api import flash_attention
 from mlx_train_perf.attention.reference import math_attention
 from mlx_train_perf.bench.artifacts import (
     condition_identity,
+    make_watchdog_on_breach,
     new_session_id,
     result_is_fresh,
     write_result,
 )
-from mlx_train_perf.core.guards import install_guardrails
+from mlx_train_perf.core.guards import (
+    DEFAULT_WALL_BUDGET_S,
+    install_guardrails,
+    install_memory_watchdog,
+    memory_ceiling_bytes,
+)
 from mlx_train_perf.errors import LaunchBudgetError
 
 DEFAULT_SEQ_LENS: tuple[int, ...] = (2048, 4096, 8192)
@@ -260,16 +266,30 @@ def _run_single_condition(condition: AttnCondition, *, out_dir: Path, session_id
     """Measures exactly ONE condition and writes its artifact unconditionally (no
     freshness check here -- the orchestrator, `run_grid`, already unlinks a stale
     artifact before spawning, matching `bench.runner.run_conditions`'s convention). A
-    `LaunchBudgetError` refusal IS a recorded result, not a crash."""
+    `LaunchBudgetError` refusal IS a recorded result, not a crash.
+
+    Installs the SAME active-memory + wall-budget watchdog `bench/worker.py` does (this
+    script measured the 32.4 GB paging condition): a pageable over-allocation past the
+    active-memory ceiling -- which the wired cap does not bound -- is failed fast, writing
+    an honest `aborted_*` artifact then `os._exit(70)`, before the paging storm reaches
+    the IOGPU panic. Stopped on every normal exit path (the `finally`)."""
     out_path = _out_path(out_dir, condition)
     ident = _identity_for(condition, session_id=session_id)
+    ceiling_bytes = memory_ceiling_bytes(int(mx.device_info()["memory_size"]))
+    watchdog = install_memory_watchdog(
+        ceiling_bytes=ceiling_bytes, wall_budget_s=DEFAULT_WALL_BUDGET_S,
+        on_breach=make_watchdog_on_breach(out_path, ident, ceiling_bytes),
+    )
     try:
-        fields = measure_condition(condition)
-    except LaunchBudgetError as exc:
-        write_result(out_path, ident, "refused", error=str(exc))
+        try:
+            fields = measure_condition(condition)
+        except LaunchBudgetError as exc:
+            write_result(out_path, ident, "refused", error=str(exc))
+            return out_path
+        write_result(out_path, ident, "ok", **fields)
         return out_path
-    write_result(out_path, ident, "ok", **fields)
-    return out_path
+    finally:
+        watchdog.stop()
 
 
 def _spawn_condition(
