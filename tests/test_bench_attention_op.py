@@ -40,6 +40,7 @@ from mlx_train_perf.bench.artifacts import (  # noqa: E402
     new_session_id,
     write_result,
 )
+from mlx_train_perf.core.guards import DEFAULT_WALL_BUDGET_S  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # build_conditions: pure grid (impl x seq_lens) construction
@@ -264,6 +265,51 @@ def test_run_grid_records_error_when_subprocess_exits_zero_without_artifact(
 # --run-benchmark-gated tiny smoke: real subprocesses, real Metal kernel + autodiff,
 # N=256 -- never a flagship dispatch (binding constraint: T13 owns real runs).
 # ---------------------------------------------------------------------------
+
+
+class _FakeWatchdogHandle:
+    def __init__(self) -> None:
+        self.stopped = False
+
+    def stop(self) -> None:
+        self.stopped = True
+
+
+def test_run_single_condition_installs_and_stops_the_memory_watchdog(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The attention bench's per-condition child installs the SAME active-memory
+    watchdog the loss/train worker does (this script measured the 32.4 GB paging
+    condition), with a physical-memory-derived ceiling, and stops it on completion.
+    `measure_condition` is stubbed so no real GPU allocation happens."""
+    condition = _condition()
+    captured: dict[str, object] = {}
+    handle = _FakeWatchdogHandle()
+
+    def _fake_install(
+        *, ceiling_bytes: int, wall_budget_s: float | None, on_breach: object,  # noqa: ARG001
+    ) -> _FakeWatchdogHandle:
+        captured["ceiling_bytes"] = ceiling_bytes
+        captured["wall_budget_s"] = wall_budget_s
+        return handle
+
+    def _fake_measure(c: AttnCondition) -> dict[str, object]:
+        return {
+            "impl": c.impl, "n": c.n, "fwd_peak_gb": 0.0, "fwdbwd_peak_gb": 0.0,
+            "wall_s": 0.001, "walls_s": [0.001],
+        }
+
+    monkeypatch.setattr(bench_attention_op, "install_memory_watchdog", _fake_install)
+    monkeypatch.setattr(bench_attention_op, "measure_condition", _fake_measure)
+
+    out_path = bench_attention_op._run_single_condition(
+        condition, out_dir=tmp_path, session_id="s1",
+    )
+    assert isinstance(captured["ceiling_bytes"], int)
+    assert captured["ceiling_bytes"] > 0
+    assert captured["wall_budget_s"] == DEFAULT_WALL_BUDGET_S
+    assert handle.stopped is True
+    assert json.loads(out_path.read_text())["status"] == "ok"
 
 
 @pytest.mark.benchmark

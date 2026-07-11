@@ -37,8 +37,19 @@ import mlx.core as mx
 
 from mlx_train_perf.adapters.mlx_lm import make_loss_fn
 from mlx_train_perf.attention.wrapper import enable_flash_attention
-from mlx_train_perf.bench.artifacts import condition_identity, write_result
-from mlx_train_perf.core.guards import clamped_caps, install_guardrails, wired_cap_holds
+from mlx_train_perf.bench.artifacts import (
+    condition_identity,
+    make_watchdog_on_breach,
+    write_result,
+)
+from mlx_train_perf.core.guards import (
+    DEFAULT_WALL_BUDGET_S,
+    clamped_caps,
+    install_guardrails,
+    install_memory_watchdog,
+    memory_ceiling_bytes,
+    wired_cap_holds,
+)
 from mlx_train_perf.core.loss import DenseHead, HeadRef, QuantizedHead, linear_cross_entropy
 from mlx_train_perf.errors import (
     LaunchBudgetError,
@@ -453,6 +464,12 @@ def main(argv: list[str] | None = None) -> int:
     # BOTH the identity (so this worker rebuilds the SAME identity the runner did) and
     # `run_train_step`, the one authoritative execution source.
     attention_impl = cast("str | None", config.get("attention_impl"))
+    # Top-level config field (mirrors the `attention_impl` seam), never inside `params`.
+    # Unset (`None`) resolves to the module default. A wall budget is a SAFETY limit, not a
+    # measurement dimension, so it is deliberately NOT threaded into `condition_identity`.
+    wall_budget_s = cast("float | None", config.get("wall_budget_s"))
+    if wall_budget_s is None:
+        wall_budget_s = DEFAULT_WALL_BUDGET_S
     out = Path(cast(str, config["out"]))
 
     install_guardrails()  # FIRST -- before any allocation this condition makes
@@ -460,33 +477,52 @@ def main(argv: list[str] | None = None) -> int:
     ident = condition_identity(
         kind=kind, session_id=session_id, params=params, attention_impl=attention_impl,
     )
+    # The active-memory + wall-budget watchdog, installed right after the wired cap:
+    # `install_guardrails`'s WIRED cap does NOT bound a PAGEABLE over-allocation, and mlx
+    # 0.32.0's `set_memory_limit` is advisory (it pages rather than raising until RAM+swap
+    # is exhausted -- see the guards module docstring). That pageable class is what paged
+    # for ~3 h into the IOGPUMemory.cpp:550 kernel panic on 2026-07-10. This daemon
+    # watchdog fails a runaway condition FAST -- `make_watchdog_on_breach` writes an honest
+    # `aborted_*` artifact via the SAME `ident` this worker's ok/refused write uses, then
+    # `os._exit(70)`. Stopped on every NORMAL exit path (the `finally`).
+    ceiling_bytes = memory_ceiling_bytes(int(mx.device_info()["memory_size"]))
+    watchdog = install_memory_watchdog(
+        ceiling_bytes=ceiling_bytes, wall_budget_s=wall_budget_s,
+        on_breach=make_watchdog_on_breach(out, ident, ceiling_bytes),
+    )
     try:
-        if kind == "loss_layer":
-            fields = run_loss_layer(params)
-        elif kind == "train_step":
-            fields = run_train_step(params, attention_impl=attention_impl)
-        else:
-            # Deliberately uncaught: an unsupported kind is a program error (a bad
-            # Condition was constructed), not a recorded run outcome -- it crashes this
-            # worker process with a nonzero exit, and `runner.run_conditions` records
-            # the failure envelope on the CALLER's side instead of this worker writing
-            # anything. Referencing the bare `run_loss_layer`/`run_train_step` names
-            # above (not a dict bound at import time) also keeps this dispatch
-            # monkeypatch-friendly for tests.
-            raise MlxTrainPerfError(
-                f"unsupported bench condition kind {kind!r}; expected 'loss_layer' or "
-                "'train_step'"
-            )
-    except LaunchBudgetError as exc:
-        # A guard refusal IS a result: the calibrated rate cannot serve this shape
-        # within the watchdog budget -- record it, don't crash the sweep. A
-        # WiredCapRegressionError is a DIFFERENT, more serious failure (a condition
-        # that measured under an uncapped run) and is deliberately NOT caught here --
-        # it propagates the same way an unsupported kind does.
-        write_result(out, ident, "refused", error=str(exc))
+        try:
+            if kind == "loss_layer":
+                fields = run_loss_layer(params)
+            elif kind == "train_step":
+                fields = run_train_step(params, attention_impl=attention_impl)
+            else:
+                # Deliberately uncaught: an unsupported kind is a program error (a bad
+                # Condition was constructed), not a recorded run outcome -- it crashes this
+                # worker process with a nonzero exit, and `runner.run_conditions` records
+                # the failure envelope on the CALLER's side instead of this worker writing
+                # anything. Referencing the bare `run_loss_layer`/`run_train_step` names
+                # above (not a dict bound at import time) also keeps this dispatch
+                # monkeypatch-friendly for tests.
+                raise MlxTrainPerfError(
+                    f"unsupported bench condition kind {kind!r}; expected 'loss_layer' or "
+                    "'train_step'"
+                )
+        except LaunchBudgetError as exc:
+            # A guard refusal IS a result: the calibrated rate cannot serve this shape
+            # within the kernel launch budget -- record it, don't crash the sweep. A
+            # WiredCapRegressionError is a DIFFERENT, more serious failure (a condition
+            # that measured under an uncapped run) and is deliberately NOT caught here --
+            # it propagates the same way an unsupported kind does.
+            write_result(out, ident, "refused", error=str(exc))
+            return 0
+        write_result(out, ident, "ok", **fields)
         return 0
-    write_result(out, ident, "ok", **fields)
-    return 0
+    finally:
+        # Normal completion / refusal / uncaught crash all stop the sampler thread so an
+        # in-process caller never leaks it. A breach never reaches here -- `on_breach`
+        # already hard-exited the process.
+        watchdog.stop()
 
 
 if __name__ == "__main__":

@@ -18,10 +18,14 @@ informational provenance, not as the staleness signal.
 """
 import hashlib
 import json
+import os
 import platform
+import sys
 import uuid
+from collections.abc import Callable
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
+from typing import cast
 
 from mlx_train_perf._compat import _installed_mlx_version
 from mlx_train_perf.errors import BenchInputError
@@ -180,6 +184,45 @@ def write_result(path: Path, identity: dict[str, object], status: str, **fields:
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps({"identity": identity, "status": status, **fields}, indent=2))
     tmp.rename(path)
+
+
+def make_watchdog_on_breach(
+    out: Path,
+    identity: dict[str, object],
+    ceiling_bytes: int,
+    *,
+    exit_fn: Callable[[int], object] = os._exit,
+    exit_code: int = 70,
+) -> Callable[[str, dict[str, object]], None]:
+    """Build the `on_breach` callback `core.guards.install_memory_watchdog` fires when a
+    bench condition breaches the active-memory ceiling or the wall budget. It records the
+    breach AS A RESULT -- writing THIS condition's artifact with an honest
+    `aborted_<reason>` status (`aborted_memory_ceiling` / `aborted_wall_budget`) plus the
+    observed numbers, via the SAME `write_result` identity path the worker's own
+    ok/refused write uses -- flushes stdio, then HARD-exits the process (`os._exit`, no
+    cleanup: a GPU paging storm cannot be cleanly unwound, and a normal `raise`/`sys.exit`
+    from a daemon thread would not stop the main thread that is mid-allocation).
+
+    The written artifact is the durable record of the breach; because its status is not
+    `"ok"`, `result_is_fresh` treats it as stale, so a later resume run retries the
+    condition (e.g. under a tighter budget). `exit_fn`/`exit_code` are injectable so a
+    test can assert the write and the exit code without terminating the test runner."""
+
+    def on_breach(reason: str, details: dict[str, object]) -> None:
+        active_bytes = int(cast(int, details.get("active_bytes", 0)))
+        elapsed_s = float(cast(float, details.get("elapsed_s", 0.0)))
+        write_result(
+            out, identity, f"aborted_{reason}",
+            observed_active_gb=round(active_bytes / 1024**3, 4),
+            ceiling_gb=round(ceiling_bytes / 1024**3, 4),
+            elapsed_s=round(elapsed_s, 3),
+            wall_budget_s=details.get("wall_budget_s"),
+        )
+        sys.stdout.flush()
+        sys.stderr.flush()
+        exit_fn(exit_code)
+
+    return on_breach
 
 
 def result_is_fresh(path: Path, identity: dict[str, object]) -> bool:
