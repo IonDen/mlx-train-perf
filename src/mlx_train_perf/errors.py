@@ -49,6 +49,12 @@ class WiredCapRegressionError(MlxTrainPerfError):
     failed result, not a silent pass."""
 
 
+class MemoryBudgetError(MlxTrainPerfError):
+    """Measured available memory at watchdog-install time leaves an effective ceiling
+    below the safe-start floor (memory_size // 4): the machine is too crowded to start
+    this run safely. Raised per-rank at install time -- no silent degradation."""
+
+
 class UnsupportedAttentionError(MlxTrainPerfError):
     """Attention impl/config combination the requested impl cannot serve (no silent
     fallback) -- e.g. an unsupported dtype, head_dim, or causal=False for impl='kernel'."""

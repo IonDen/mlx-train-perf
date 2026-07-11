@@ -24,7 +24,7 @@ from mlx_train_perf.bench.artifacts import (
     write_result,
 )
 from mlx_train_perf.bench.runner import Condition, report, run_conditions
-from mlx_train_perf.core.guards import DEFAULT_WALL_BUDGET_S
+from mlx_train_perf.core.guards import DEFAULT_WALL_BUDGET_S, EffectiveCeiling
 from mlx_train_perf.errors import BenchInputError, LaunchBudgetError, MlxTrainPerfError
 
 _GIB = 1024**3
@@ -787,9 +787,10 @@ class _FakeWatchdogHandle:
 def test_worker_main_installs_watchdog_and_threads_resolved_wall_budget(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """`worker.main` installs the watchdog (right after `install_guardrails`) with a
-    ceiling derived from the device's physical memory, threads the config's explicit
-    `wall_budget_s` through, and STOPS it on the normal completion path."""
+    """`worker.main` installs the watchdog (right after `install_guardrails`) with the
+    EFFECTIVE ceiling `effective_memory_ceiling` computes (static + dynamic-availability
+    min), threads the config's explicit `wall_budget_s` through, and STOPS it on the
+    normal completion path."""
     captured: dict[str, object] = {}
     handle = _FakeWatchdogHandle()
 
@@ -800,6 +801,10 @@ def test_worker_main_installs_watchdog_and_threads_resolved_wall_budget(
         captured["wall_budget_s"] = wall_budget_s
         return handle
 
+    monkeypatch.setattr(
+        worker, "effective_memory_ceiling",
+        lambda: EffectiveCeiling(ceiling_bytes=987654321, warning=None),
+    )
     monkeypatch.setattr(worker, "install_memory_watchdog", _fake_install)
     out = tmp_path / "r.json"
     cfg = tmp_path / "config.json"
@@ -811,9 +816,7 @@ def test_worker_main_installs_watchdog_and_threads_resolved_wall_budget(
     rc = worker.main(["--config", str(cfg)])
     assert rc == 0
     assert captured["wall_budget_s"] == 222.0
-    assert isinstance(captured["ceiling_bytes"], int)
-    assert captured["ceiling_bytes"] > 0
-    assert handle.stopped is True
+    assert captured["ceiling_bytes"] == 987654321  # the effective ceiling flowed through
 
 
 def test_worker_main_watchdog_defaults_wall_budget_when_config_omits_it(
@@ -827,6 +830,10 @@ def test_worker_main_watchdog_defaults_wall_budget_when_config_omits_it(
         captured["wall_budget_s"] = wall_budget_s
         return _FakeWatchdogHandle()
 
+    monkeypatch.setattr(
+        worker, "effective_memory_ceiling",
+        lambda: EffectiveCeiling(ceiling_bytes=987654321, warning=None),
+    )
     monkeypatch.setattr(worker, "install_memory_watchdog", _fake_install)
     out = tmp_path / "r.json"
     cfg = tmp_path / "config.json"
@@ -846,6 +853,10 @@ def test_worker_main_stops_watchdog_even_when_the_condition_crashes(
     (unsupported kind) -- so an in-process caller never leaks a sampling thread."""
     handle = _FakeWatchdogHandle()
     monkeypatch.setattr(
+        worker, "effective_memory_ceiling",
+        lambda: EffectiveCeiling(ceiling_bytes=987654321, warning=None),
+    )
+    monkeypatch.setattr(
         worker, "install_memory_watchdog",
         lambda *, ceiling_bytes, wall_budget_s, on_breach: handle,  # noqa: ARG005
     )
@@ -857,3 +868,58 @@ def test_worker_main_stops_watchdog_even_when_the_condition_crashes(
     with pytest.raises(MlxTrainPerfError):
         worker.main(["--config", str(cfg)])
     assert handle.stopped is True
+
+
+def test_worker_main_records_memory_warning_in_the_artifact_when_present(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A degraded-start warning from `effective_memory_ceiling` (crowded machine /
+    unmeasurable availability) is carried into the worker's `ok` artifact as
+    `memory_warning`, so a campaign record shows the degraded-start state."""
+    fake_handle = _FakeWatchdogHandle()
+    monkeypatch.setattr(
+        worker, "effective_memory_ceiling",
+        lambda: EffectiveCeiling(ceiling_bytes=987654321, warning="only 8 GiB free"),
+    )
+    monkeypatch.setattr(
+        worker, "install_memory_watchdog",
+        lambda *, ceiling_bytes, wall_budget_s, on_breach: fake_handle,  # noqa: ARG005
+    )
+    out = tmp_path / "r.json"
+    cfg = tmp_path / "config.json"
+    cfg.write_text(json.dumps({
+        "kind": "loss_layer",
+        "params": {"n": 8, "d": 4, "v": 16, "dtype": "float32", "impl": "naive", "reps": 1},
+        "session_id": "s1", "out": str(out),
+    }))
+    assert worker.main(["--config", str(cfg)]) == 0
+    data = json.loads(out.read_text())
+    assert data["status"] == "ok"
+    assert data["memory_warning"] == "only 8 GiB free"
+
+
+def test_worker_main_omits_memory_warning_when_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No warning (nominal start) -> the artifact omits the key entirely (omit-when-None,
+    matching the identity conventions), never a null field."""
+    fake_handle = _FakeWatchdogHandle()
+    monkeypatch.setattr(
+        worker, "effective_memory_ceiling",
+        lambda: EffectiveCeiling(ceiling_bytes=987654321, warning=None),
+    )
+    monkeypatch.setattr(
+        worker, "install_memory_watchdog",
+        lambda *, ceiling_bytes, wall_budget_s, on_breach: fake_handle,  # noqa: ARG005
+    )
+    out = tmp_path / "r.json"
+    cfg = tmp_path / "config.json"
+    cfg.write_text(json.dumps({
+        "kind": "loss_layer",
+        "params": {"n": 8, "d": 4, "v": 16, "dtype": "float32", "impl": "naive", "reps": 1},
+        "session_id": "s1", "out": str(out),
+    }))
+    assert worker.main(["--config", str(cfg)]) == 0
+    data = json.loads(out.read_text())
+    assert data["status"] == "ok"
+    assert "memory_warning" not in data

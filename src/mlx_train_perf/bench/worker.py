@@ -45,9 +45,9 @@ from mlx_train_perf.bench.artifacts import (
 from mlx_train_perf.core.guards import (
     DEFAULT_WALL_BUDGET_S,
     clamped_caps,
+    effective_memory_ceiling,
     install_guardrails,
     install_memory_watchdog,
-    memory_ceiling_bytes,
     wired_cap_holds,
 )
 from mlx_train_perf.core.loss import DenseHead, HeadRef, QuantizedHead, linear_cross_entropy
@@ -485,7 +485,17 @@ def main(argv: list[str] | None = None) -> int:
     # watchdog fails a runaway condition FAST -- `make_watchdog_on_breach` writes an honest
     # `aborted_*` artifact via the SAME `ident` this worker's ok/refused write uses, then
     # `os._exit(70)`. Stopped on every NORMAL exit path (the `finally`).
-    ceiling_bytes = memory_ceiling_bytes(int(mx.device_info()["memory_size"]))
+    #
+    # `effective_memory_ceiling` combines the STATIC device-relative rule with the DYNAMIC
+    # measured-availability at start (rank-local `vm_stat`) -- it may REFUSE (typed
+    # `MemoryBudgetError`) if this node is too crowded to start safely, and surfaces a
+    # degraded-start `memory_warning` we log + record in the artifact.
+    ceiling = effective_memory_ceiling()
+    ceiling_bytes = ceiling.ceiling_bytes
+    # Omit-when-None (identity convention): a nominal start carries no `memory_warning`.
+    warning_field: dict[str, object] = (
+        {"memory_warning": ceiling.warning} if ceiling.warning is not None else {}
+    )
     watchdog = install_memory_watchdog(
         ceiling_bytes=ceiling_bytes, wall_budget_s=wall_budget_s,
         on_breach=make_watchdog_on_breach(out, ident, ceiling_bytes),
@@ -514,9 +524,9 @@ def main(argv: list[str] | None = None) -> int:
             # WiredCapRegressionError is a DIFFERENT, more serious failure (a condition
             # that measured under an uncapped run) and is deliberately NOT caught here --
             # it propagates the same way an unsupported kind does.
-            write_result(out, ident, "refused", error=str(exc))
+            write_result(out, ident, "refused", error=str(exc), **warning_field)
             return 0
-        write_result(out, ident, "ok", **fields)
+        write_result(out, ident, "ok", **fields, **warning_field)
         return 0
     finally:
         # Normal completion / refusal / uncaught crash all stop the sampler thread so an
