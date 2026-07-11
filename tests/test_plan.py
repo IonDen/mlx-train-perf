@@ -479,3 +479,213 @@ def test_fit_memory_coeffs_rejects_non_kernel_impl() -> None:
     points = [FitPoint(shape=shape, cfg=cfg, marginal_peak_bytes=float(i)) for i in (1, 2, 3)]
     with pytest.raises(PlanInputError, match="kernel"):
         fit_memory_coeffs(points, calib=calib)
+
+
+# ---------------------------------------------------------------------------
+# Task 14: the flash-attention branch. `TrainConfig.attention` selects between the
+# stock O(N^2) attention-backward term (a_quad*batch*heads*seq^2, unchanged) and the
+# flash O(N) term (analytic O/L saved state + a_flash*batch*heads*seq). Driver form
+# settled from the T13 single-op scaling: growth is linear in N (single-op 2048->4096
+# == exactly 2.0x); the 4096->8192 super-linearity is the confirmed budget-bounded
+# dispatch-split additive, not a growth-law change, so the planner models a pure linear
+# term and leans on overhead_frac for the over-predict-safe cushion.
+# ---------------------------------------------------------------------------
+
+
+def test_attention_defaults_to_stock_and_uses_the_quadratic_term() -> None:
+    """A TrainConfig built without an explicit `attention` keeps the 0.1.0 behavior:
+    the stock O(N^2) attention term (a_quad*batch*heads*seq^2)."""
+    s = _shape()
+    calib = load_calibration()
+    cfg = TrainConfig(batch=1, seq_len=512, dtype="bfloat16", lora_rank=8, lora_layers=2,
+                      grad_checkpoint=True, impl="kernel")
+    assert cfg.attention == "stock"
+    _, comp = estimate_peak(s, cfg, calib)
+    assert comp["attention"] == int(
+        calib.attn_bytes_per_head_token2 * (1 * 4 * 512 * 512))
+
+
+def test_flash_attention_changes_only_the_attention_component() -> None:
+    """`attention="flash"` replaces the O(N^2) term with the O(N) flash term and changes
+    NOTHING else (mirror `test_grad_checkpoint_changes_only_the_linear_activation_term`).
+    At long context (seq=8192, the flagship) the O(N) flash term is far below the O(N^2)
+    stock term -- the whole point of the branch. (At SHORT context the two are comparable,
+    or flash is even slightly larger: its fitted linear coefficient captures the real
+    backward transient, and the quadratic term has not yet dominated -- an honest property,
+    not a regression.)"""
+    s = _shape()
+    calib = load_calibration()
+    stock = TrainConfig(batch=1, seq_len=8192, dtype="bfloat16", lora_rank=8, lora_layers=2,
+                        grad_checkpoint=True, impl="kernel", attention="stock")
+    flash = TrainConfig(batch=1, seq_len=8192, dtype="bfloat16", lora_rank=8, lora_layers=2,
+                        grad_checkpoint=True, impl="kernel", attention="flash")
+    _, comp_stock = estimate_peak(s, stock, calib)
+    _, comp_flash = estimate_peak(s, flash, calib)
+    for key in ("weights", "base", "lora", "optimizer", "activations", "loss"):
+        assert comp_flash[key] == comp_stock[key]
+    assert comp_flash["attention"] < comp_stock["attention"]
+
+
+def test_flash_attention_component_hand_computed() -> None:
+    """Exact-value pin (0.1.0 pin style): the flash attention component is the analytic
+    O/L saved state (O = batch*seq*hidden*dtype_bytes, bf16=2; L = batch*heads*seq*4 fp32)
+    plus a_flash*batch*heads*seq. Drivers are powers of two from `_shape()` (batch=1,
+    seq=512, hidden=64, heads=4) so the products are float-exact; a_flash comes from the
+    committed calibration."""
+    s = _shape()
+    calib = load_calibration()
+    cfg = TrainConfig(batch=1, seq_len=512, dtype="bfloat16", lora_rank=8, lora_layers=2,
+                      grad_checkpoint=True, impl="kernel", attention="flash")
+    _, comp = estimate_peak(s, cfg, calib)
+    o_saved = 1 * 512 * 64 * 2       # attention output O in compute dtype (bf16)
+    l_saved = 1 * 4 * 512 * 4        # logsumexp L in fp32
+    expected = int(o_saved + l_saved
+                   + calib.attn_bytes_per_head_token_flash * (1 * 4 * 512))
+    assert comp["attention"] == expected
+
+
+def test_flash_attention_scales_linearly_with_seq() -> None:
+    """The flash attention component is O(N) in seq -- doubling seq_len ~2x it (vs the
+    stock term's 4x). Approx (not exact) because `estimate_peak` int-floors each
+    component."""
+    s = _shape()
+    calib = load_calibration()
+    cfg_n = TrainConfig(batch=1, seq_len=512, dtype="bfloat16", lora_rank=8, lora_layers=2,
+                        grad_checkpoint=True, impl="kernel", attention="flash")
+    cfg_2n = TrainConfig(batch=1, seq_len=1024, dtype="bfloat16", lora_rank=8, lora_layers=2,
+                         grad_checkpoint=True, impl="kernel", attention="flash")
+    _, comp_n = estimate_peak(s, cfg_n, calib)
+    _, comp_2n = estimate_peak(s, cfg_2n, calib)
+    assert comp_2n["attention"] == pytest.approx(2 * comp_n["attention"], rel=1e-5)
+
+
+def test_unknown_attention_raises_plan_input_error() -> None:
+    s = _shape()
+    calib = load_calibration()
+    cfg = TrainConfig(batch=1, seq_len=512, dtype="bfloat16", lora_rank=8, lora_layers=2,
+                      grad_checkpoint=True, impl="kernel", attention="bogus")
+    with pytest.raises(PlanInputError, match="attention"):
+        estimate_peak(s, cfg, calib)
+
+
+def _synthesize_flash_fit_point(
+    *, shape: ModelShape, calib, batch: int, seq_len: int, lora_rank: int,
+    lora_layers: int, grad_checkpoint: bool, a_flash: float,
+) -> FitPoint:
+    """Synthesize a flash FitPoint FORWARD from a known a_flash, holding base/a_lin at
+    the calibration's own values (which the flash fit holds fixed). marginal = base +
+    a_lin*x_lin + a_flash*x_flash + analytic_small + analytic_O/L."""
+    cfg = TrainConfig(batch=batch, seq_len=seq_len, dtype="bfloat16", lora_rank=lora_rank,
+                      lora_layers=lora_layers, grad_checkpoint=grad_checkpoint, impl="kernel",
+                      attention="flash")
+    analytic = (_lora_bytes(cfg, shape) + _optimizer_bytes(cfg, shape, calib)
+                + _loss_bytes(cfg, shape, calib))
+    a_lin = (calib.act_bytes_per_token_hidden_layer_ckpt if grad_checkpoint
+             else calib.act_bytes_per_token_hidden_layer_full)
+    x_lin = batch * seq_len * shape.hidden * shape.layers
+    x_flash = batch * shape.heads * seq_len
+    o_l = batch * seq_len * shape.hidden * 2 + batch * shape.heads * seq_len * 4
+    marginal = calib.base_transient_bytes + a_lin * x_lin + a_flash * x_flash + analytic + o_l
+    return FitPoint(shape=shape, cfg=cfg, marginal_peak_bytes=marginal)
+
+
+def test_fit_memory_coeffs_recovers_a_flash_from_flash_points() -> None:
+    """Fit-recovery for the flash coefficient: synthesize flash FitPoints FORWARD from a
+    known a_flash (base/a_lin held at calib), fit BACKWARD by 1-variable residual OLS,
+    assert recovery. Flash-only points do NOT require the stock rank guard (a_flash is a
+    through-origin 1-variable fit needing only >= 1 point, den>0)."""
+    shape = _shape()
+    calib = load_calibration()
+    a_flash = 12345.0
+    pts = [_synthesize_flash_fit_point(shape=shape, calib=calib, batch=1, seq_len=s,
+                                       lora_rank=8, lora_layers=2, grad_checkpoint=True,
+                                       a_flash=a_flash)
+           for s in (512, 1024, 2048)]
+    c = fit_memory_coeffs(pts, calib=calib)
+    assert c["attn_bytes_per_head_token_flash"] == pytest.approx(a_flash, rel=1e-6)
+
+
+def test_fit_memory_coeffs_recovers_a_flash_from_a_single_flash_point() -> None:
+    """The flash fit is identifiable from a single flash point (den = x_flash^2 > 0) --
+    the T13 campaign anchors it from as few as two Qwen points."""
+    shape = _shape()
+    calib = load_calibration()
+    a_flash = 9999.0
+    pts = [_synthesize_flash_fit_point(shape=shape, calib=calib, batch=1, seq_len=8192,
+                                       lora_rank=8, lora_layers=2, grad_checkpoint=True,
+                                       a_flash=a_flash)]
+    c = fit_memory_coeffs(pts, calib=calib)
+    assert c["attn_bytes_per_head_token_flash"] == pytest.approx(a_flash, rel=1e-6)
+
+
+def test_fit_memory_coeffs_flash_only_keeps_stock_coefficients() -> None:
+    """The real T13 campaign refits ONLY a_flash from a flash-only manifest -- the stock
+    coefficients (base, a_lin, a_quad) must be preserved unchanged from `calib`, never
+    silently reset by a flash-only fit."""
+    shape = _shape()
+    calib = load_calibration()
+    pts = [_synthesize_flash_fit_point(shape=shape, calib=calib, batch=1, seq_len=s,
+                                       lora_rank=8, lora_layers=2, grad_checkpoint=True,
+                                       a_flash=5000.0)
+           for s in (512, 1024, 2048)]
+    c = fit_memory_coeffs(pts, calib=calib)
+    assert c["base_transient_bytes"] == calib.base_transient_bytes
+    assert c["act_bytes_per_token_hidden_layer_ckpt"] == calib.act_bytes_per_token_hidden_layer_ckpt
+    assert c["act_bytes_per_token_hidden_layer_full"] == calib.act_bytes_per_token_hidden_layer_full
+    assert c["attn_bytes_per_head_token2"] == calib.attn_bytes_per_head_token2
+
+
+def test_fit_memory_coeffs_without_flash_points_keeps_calib_flash() -> None:
+    """With no flash points, `a_flash` is not identifiable -- the fit falls back to the
+    existing calib value rather than inventing one (mirrors the a_lin_full fallback)."""
+    shape = _shape()
+    calib = load_calibration()
+
+    def synth(seq_len: int) -> FitPoint:
+        return _synthesize_fit_point(
+            shape=shape, calib=calib, batch=1, seq_len=seq_len, lora_rank=8, lora_layers=2,
+            grad_checkpoint=True, base=1e9, a_lin_ckpt=3.0, a_lin_full=999.0, a_quad=5.0)
+
+    c = fit_memory_coeffs([synth(512), synth(1024), synth(2048)], calib=calib)
+    assert (c["attn_bytes_per_head_token_flash"]
+            == calib.attn_bytes_per_head_token_flash)
+
+
+def test_predicted_peak_matches_measured_qwen3_8b_flash_within_tolerance() -> None:
+    """Measured-vs-predicted acceptance for the flash branch: anchor the model to a T13
+    flash train-step measurement -- Qwen3-8B-4bit, seq 8192, grad_checkpoint=True, kernel,
+    attention=flash, MEASURED total peak 12.7462 GB
+    (`_artifacts/bench_train_step_flash/..._seq8192_ours.json`). The committed calibration
+    predicts within 15% and OVER-predicts (the safe direction). The measured over-
+    prediction is ~8.2% -- the ~1.10 overhead_frac cushion covers the small marginal-level
+    under-fit at this anchor. The whole point of the flash branch is visible here: the
+    stock O(N^2) term would predict ~17 GB of attention alone (grossly over the true
+    12.7 GB total), whereas the flash O(N) term tracks the real drop."""
+    qwen = ModelShape(vocab=151936, hidden=4096, layers=36, intermediate=12288, heads=32,
+                      kv_heads=8, tied=False, quant_bits=4, quant_group=64)
+    calib = load_calibration()
+    cfg = TrainConfig(batch=1, seq_len=8192, dtype="bfloat16", lora_rank=8, lora_layers=36,
+                      grad_checkpoint=True, impl="kernel", attention="flash")
+    peak, _ = estimate_peak(qwen, cfg, calib)
+    measured_bytes = 12.7462 * 1024**3
+    assert abs(peak - measured_bytes) / measured_bytes < 0.15
+    assert peak >= measured_bytes  # over-predicts -- the safe direction for a fit planner
+
+
+def test_flash_cross_model_validation_on_llama3b() -> None:
+    """Cross-model validation of the Qwen-fitted a_flash on Llama-3.2-3B-Instruct-4bit --
+    a DIFFERENT heads/(hidden*layers) ratio than the identification model, so this checks
+    generality, not fit. The Qwen-fitted coefficient predicts the measured Llama-3B flash
+    train-step TOTAL peak (seq 8192, gc=True, kernel;
+    `_artifacts/bench_train_step_flash_llama3b/..._seq8192_ours.json`, total 7.5133 GB)
+    within 20% and OVER-predicts (safe). Measured over-prediction ~15.4% -- consistent with
+    the stock model's own cross-model spread and always in the conservative direction."""
+    llama = ModelShape(vocab=128256, hidden=3072, layers=28, intermediate=8192, heads=24,
+                       kv_heads=8, tied=True, quant_bits=4, quant_group=64)
+    calib = load_calibration()
+    cfg = TrainConfig(batch=1, seq_len=8192, dtype="bfloat16", lora_rank=8, lora_layers=28,
+                      grad_checkpoint=True, impl="kernel", attention="flash")
+    peak, _ = estimate_peak(llama, cfg, calib)
+    measured_bytes = 7.5133 * 1024**3
+    assert abs(peak - measured_bytes) / measured_bytes < 0.20
+    assert peak >= measured_bytes  # over-predicts on the validation model too

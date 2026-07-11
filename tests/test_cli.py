@@ -149,6 +149,32 @@ def test_train_config_from_args_lora_layers_follows_lora_rank() -> None:
     assert full_ft_cfg.lora_layers == 0
 
 
+def test_train_config_from_args_threads_attention() -> None:
+    """`--attention` threads into the TrainConfig; it defaults to "stock" (the 0.1.0
+    behavior) when omitted."""
+    default_cfg = _train_config_from_args(batch=1, seq_len=512, lora_rank=8, impl="kernel",
+                                          shape_layers=12)
+    assert default_cfg.attention == "stock"
+    flash_cfg = _train_config_from_args(batch=1, seq_len=512, lora_rank=8, impl="kernel",
+                                        shape_layers=12, attention="flash")
+    assert flash_cfg.attention == "flash"
+
+
+def test_plan_attention_flash_flag_shrinks_attention_component(tmp_path: Path) -> None:
+    """`--attention flash` routes the planner through the O(N) flash term; at the flagship
+    long context (seq=8192) its attention component is far below the stock O(N^2) term."""
+    def _attention_component(extra_args: list[str]) -> int:
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            main(["plan", "--config", str(_config(tmp_path)), "--batch", "1",
+                  "--seq-len", "8192", "--lora-rank", "8", "--json", *extra_args])
+        return int(json.loads(buf.getvalue())["components"]["attention"])
+
+    stock = _attention_component([])
+    flash = _attention_component(["--attention", "flash"])
+    assert flash < stock
+
+
 # --- pure helper: FitReport rendering ------------------------------------------------
 
 

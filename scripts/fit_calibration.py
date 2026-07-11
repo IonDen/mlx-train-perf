@@ -65,10 +65,15 @@ def load_fit_points(manifest_path: Path) -> list[FitPoint]:
             )
         identity = artifact.get("identity", {})
         impl = str(identity.get("impl", "kernel"))
+        # `attention_impl` ("stock"/"flash") threads from the artifact identity into the
+        # FitPoint's cfg so `fit_memory_coeffs` routes the point into the right branch.
+        # Absent (pre-0.2.0 artifacts) it defaults to "stock".
+        attention = str(identity.get("attention_impl", "stock"))
         cfg = TrainConfig(
             batch=int(entry["batch"]), seq_len=int(entry["seq_len"]), dtype="bfloat16",
             lora_rank=int(entry["lora_rank"]), lora_layers=int(entry["lora_layers"]),
             grad_checkpoint=bool(entry.get("grad_checkpoint", True)), impl=impl,
+            attention=attention,
         )
         marginal_peak_bytes = float(artifact["marginal_peak_gb"]) * 1024**3
         points.append(FitPoint(shape=shape, cfg=cfg, marginal_peak_bytes=marginal_peak_bytes))
@@ -80,16 +85,33 @@ def build_updated_calibration_data(
     optimizer_bytes_per_param: float, manifest_path: Path, num_points: int,
 ) -> dict[str, object]:
     """Preserves `overhead_frac`/`naive_loss_bytes_per_nv` from `existing` UNCHANGED
-    (this fit never touches them) and replaces the four fitted memory coefficients (base +
-    gc-aware linear + O(N^2) attention) + `optimizer_bytes_per_param` (analytic) +
-    `provenance` -- `provenance` keeps the four keys `load_calibration`'s own tests require
-    truthy (`machine`, `macos`, `mlx_version`, `measured_date`) and adds a `fit_source` note
-    naming the manifest + point count for auditability."""
+    (this fit never touches them) and replaces the five fitted memory coefficients (base +
+    gc-aware linear + O(N^2) stock attention + O(N) flash attention) +
+    `optimizer_bytes_per_param` (analytic) + `provenance`.
+
+    `provenance` keeps the four keys `load_calibration`'s own tests require truthy
+    (`machine`, `macos`, `mlx_version`, `measured_date`). Its `fit_source` PRESERVES the
+    existing note (so a flash-only refit -- which keeps the stock coefficients unchanged --
+    doesn't erase the stock fit's provenance) and appends this run's clause naming the
+    manifest + point count for auditability."""
+    prior_provenance = existing.get("provenance", {})
+    prior_source = ""
+    if isinstance(prior_provenance, dict):
+        prior_source = str(prior_provenance.get("fit_source", "")).strip()
+    this_clause = (
+        f"refit via fit_memory_coeffs from {num_points} train_step (impl='kernel') marginal "
+        f"peaks (stock points fit base/gc-aware-linear/O(N^2)-attention by full-rank OLS; "
+        f"flash points fit attn_bytes_per_head_token_flash by 1-var residual OLS holding "
+        f"base/a_lin fixed; a branch with no points keeps its prior value); "
+        f"optimizer_bytes_per_param analytic (AdamW, 8 B/param); manifest={manifest_path.name}"
+    )
+    fit_source = f"{prior_source} || {this_clause}" if prior_source else this_clause
     return {
         "base_transient_bytes": coeffs["base_transient_bytes"],
         "act_bytes_per_token_hidden_layer_ckpt": coeffs["act_bytes_per_token_hidden_layer_ckpt"],
         "act_bytes_per_token_hidden_layer_full": coeffs["act_bytes_per_token_hidden_layer_full"],
         "attn_bytes_per_head_token2": coeffs["attn_bytes_per_head_token2"],
+        "attn_bytes_per_head_token_flash": coeffs["attn_bytes_per_head_token_flash"],
         "optimizer_bytes_per_param": optimizer_bytes_per_param,
         "overhead_frac": existing["overhead_frac"],
         "naive_loss_bytes_per_nv": existing["naive_loss_bytes_per_nv"],
@@ -98,12 +120,7 @@ def build_updated_calibration_data(
             "macos": platform.mac_ver()[0],
             "mlx_version": _installed_mlx_version(),
             "measured_date": date.today().isoformat(),
-            "fit_source": (
-                f"base + gc-aware linear + O(N^2) attention coefficients fitted from "
-                f"{num_points} train_step (impl='kernel') artifacts via fit_memory_coeffs; "
-                f"optimizer_bytes_per_param analytic (AdamW, 8 B/param); "
-                f"manifest={manifest_path.name}"
-            ),
+            "fit_source": fit_source,
         },
     }
 
@@ -135,6 +152,7 @@ def main(argv: list[str] | None = None) -> int:
             act_bytes_per_token_hidden_layer_full=float(
                 existing["act_bytes_per_token_hidden_layer_full"]),
             attn_bytes_per_head_token2=float(existing["attn_bytes_per_head_token2"]),
+            attn_bytes_per_head_token_flash=float(existing["attn_bytes_per_head_token_flash"]),
             optimizer_bytes_per_param=float(existing["optimizer_bytes_per_param"]),
             overhead_frac=float(existing["overhead_frac"]),
             naive_loss_bytes_per_nv=float(existing["naive_loss_bytes_per_nv"]),

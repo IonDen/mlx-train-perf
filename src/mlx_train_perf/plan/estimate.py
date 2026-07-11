@@ -113,6 +113,13 @@ class TrainConfig:
     lora_layers: int
     grad_checkpoint: bool
     impl: str
+    # Attention-backward memory model: "stock" (mlx's O(N^2) SDPA backward, the 0.1.0
+    # default that still binds the trainable-context ceiling) or "flash" (the 0.2.0
+    # opt-in O(N.D) flash-attention path). Typed as `str` for consistency with the
+    # existing `impl`/`dtype` fields and the argparse-`choices` CLI boundary; the runtime
+    # refusal in `_attention_bytes` is the guard against an out-of-set value (no silent
+    # fallback). Defaults to "stock" so every pre-0.2.0 caller is unchanged.
+    attention: str = "stock"
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -200,13 +207,39 @@ def _activation_bytes(cfg: TrainConfig, shape: ModelShape, calib: Calibration) -
     return int(a_lin * cfg.batch * cfg.seq_len * shape.hidden * shape.layers)
 
 
+def _flash_saved_state_bytes(cfg: TrainConfig, shape: ModelShape) -> int:
+    """Analytic O(N.D) flash-attention saved backward state: the attention output `O`
+    (batch*seq*hidden in the compute dtype) plus the logsumexp `L` (batch*heads*seq, always
+    fp32). This is what a recompute-based flash backward keeps instead of the O(N^2) score
+    matrix, and it is computed exactly from shape -- the FITTED `a_flash` coefficient
+    captures only the residual live backward transient on top of it. Shared by
+    `_attention_bytes` (the flash branch) and `fit_memory_coeffs` (the residual it
+    subtracts) so both use one definition."""
+    o_saved = cfg.batch * cfg.seq_len * shape.hidden * _dtype_bytes(cfg.dtype)
+    l_saved = cfg.batch * shape.heads * cfg.seq_len * 4
+    return o_saved + l_saved
+
+
 def _attention_bytes(cfg: TrainConfig, shape: ModelShape, calib: Calibration) -> int:
-    """Quadratic attention-backward memory: bytes per (head * seq^2), ONE layer for BOTH gc
-    settings -- mlx's O(N^2) SDPA backward materializes one (N,N) score matrix at a time as
-    the backward walks the layer stack. This term dominates peak training memory at long
-    context and caps the trainable context length regardless of the loss layer.
-    bf16-calibrated (dtype folded into the coefficient)."""
-    return int(calib.attn_bytes_per_head_token2 * cfg.batch * shape.heads * cfg.seq_len**2)
+    """Attention-backward memory, branching on `cfg.attention`.
+
+    STOCK (default): quadratic, bytes per (head * seq^2), ONE layer for BOTH gc settings --
+    mlx's O(N^2) SDPA backward materializes one (N,N) score matrix at a time as the backward
+    walks the layer stack. This term dominates peak training memory at long context and caps
+    the trainable context length regardless of the loss layer.
+
+    FLASH (0.2.0 opt-in): the analytic O(N.D) saved state (`_flash_saved_state_bytes`) plus
+    a fitted LINEAR live-transient term `a_flash * batch * heads * seq`. Driver form settled
+    from the T13 single-op scaling (linear growth; the split-regime steepening folded into
+    the coefficient, over-predict-safe). bf16-calibrated (dtype folded into a_flash)."""
+    if cfg.attention == "stock":
+        return int(calib.attn_bytes_per_head_token2 * cfg.batch * shape.heads * cfg.seq_len**2)
+    if cfg.attention == "flash":
+        return int(_flash_saved_state_bytes(cfg, shape)
+                   + calib.attn_bytes_per_head_token_flash * cfg.batch * shape.heads * cfg.seq_len)
+    raise PlanInputError(
+        f"unknown attention {cfg.attention!r}; expected 'stock' or 'flash'"
+    )
 
 
 def _head_trainable(cfg: TrainConfig) -> bool:
@@ -334,15 +367,33 @@ def fit_memory_coeffs(points: list[FitPoint], *, calib: Calibration) -> dict[str
     and gc-INDEPENDENT (mlx's O(N^2) SDPA backward materializes one (N,N) at a time);
     `grad_checkpoint` selects the linear coefficient (`_ckpt` vs `_full`).
 
-    grad_checkpoint=True points fit (base, a_lin_ckpt, a_quad) by ordinary least squares
-    -- needs a FULL-RANK (1, x_lin, x_quad) design to separate the constant, linear and
-    quadratic terms: with batch held fixed (the standard calibration regime) that means
+    Points are partitioned by `cfg.attention`. STOCK points fit the (base, a_lin, a_quad)
+    stock model; FLASH points fit `a_flash` alone.
+
+    STOCK, grad_checkpoint=True points fit (base, a_lin_ckpt, a_quad) by ordinary least
+    squares -- needs a FULL-RANK (1, x_lin, x_quad) design to separate the constant, linear
+    and quadratic terms: with batch held fixed (the standard calibration regime) that means
     >= 3 distinct seq_len; batch variation can restore rank at 2 distinct seq_len. A
     rank-deficient design raises PlanInputError (lstsq would otherwise silently return
-    minimum-norm garbage). grad_checkpoint=False points then fit a_lin_full alone (base and
-    a_quad held from the gc=True fit); with no gc=False points the existing `calib` value
-    is kept. Every point must be `impl="kernel"` -- `"chunked"`/`"naive"` measure a
-    materially different loss-layer memory shape that would contaminate the fit.
+    minimum-norm garbage). STOCK grad_checkpoint=False points then fit a_lin_full alone
+    (base and a_quad held from the gc=True fit); with no gc=False points the existing
+    `calib` value is kept. With NO stock points at all (a flash-only calibration manifest),
+    every stock coefficient is kept unchanged from `calib` -- a flash refit never disturbs
+    the stock model.
+
+    FLASH points fit `a_flash` (`attn_bytes_per_head_token_flash`) by a 1-variable
+    through-origin residual OLS: `x_flash = batch*heads*seq` is an EXACT scalar multiple of
+    `x_lin` at fixed model shape (ratio heads/(hidden*layers)), so a joint (base, a_lin,
+    a_flash) fit is rank-deficient at ANY number of same-model points -- instead base and
+    a_lin are held FIXED from the passed-in stock `calib`, the analytic small terms and the
+    O(N.D) saved state (`_flash_saved_state_bytes`) are subtracted, and a_flash absorbs the
+    residual live transient (`num/den`, den = sum x_flash^2 > 0 needs >= 1 flash point).
+    With no flash points the existing `calib` value is kept. The Llama-3.2-3B flash point
+    (a different heads/(hidden*layers) ratio) is used for cross-model VALIDATION, not
+    identification.
+
+    Every point must be `impl="kernel"` -- `"chunked"`/`"naive"` measure a materially
+    different loss-layer memory shape that would contaminate the fit.
     """
     import numpy as np  # noqa: PLC0415 -- transitive dep, calibration-time only
 
@@ -365,41 +416,76 @@ def fit_memory_coeffs(points: list[FitPoint], *, calib: Calibration) -> dict[str
     def x_quad(p: FitPoint) -> float:
         return float(p.cfg.batch * p.shape.heads * p.cfg.seq_len ** 2)
 
-    ckpt = [p for p in points if p.cfg.grad_checkpoint]
-    full = [p for p in points if not p.cfg.grad_checkpoint]
-    a_mat = np.array([[1.0, x_lin(p), x_quad(p)] for p in ckpt], dtype=float).reshape(-1, 3)
-    # Rank check, not a point/seq_len head-count: `np.linalg.lstsq` never raises on a
-    # rank-deficient design -- it returns the minimum-norm solution, i.e. silently-wrong
-    # coefficients (review reproduced a NEGATIVE a_quad from 3 points at 2 distinct
-    # seq_len, batch fixed). Full rank of the actual (1, x_lin, x_quad) matrix is the
-    # exact identifiability condition: batch-fixed runs need >= 3 distinct seq_len,
-    # while batch variation can restore rank at 2 (both cases tested).
-    if np.linalg.matrix_rank(a_mat) < 3:
-        raise PlanInputError(
-            "fit_memory_coeffs cannot separate (base, linear, quadratic): the gc=True "
-            "design matrix is rank-deficient. Supply at least 3 grad_checkpoint=True "
-            "FitPoints whose (1, x_lin, x_quad) rows are independent -- with batch held "
-            "fixed that means at least 3 distinct seq_len values (got "
-            f"{len(ckpt)} gc=True point(s), "
-            f"{len({p.cfg.seq_len for p in ckpt})} distinct seq_len)"
-        )
-    b_vec = np.array([residual(p) for p in ckpt], dtype=float)
-    solution = np.linalg.lstsq(a_mat, b_vec, rcond=None)[0]
-    base = float(solution[0])
-    a_lin_ckpt = float(solution[1])
-    a_quad = float(solution[2])
+    def x_flash(p: FitPoint) -> float:
+        return float(p.cfg.batch * p.shape.heads * p.cfg.seq_len)
 
-    if full:
-        # a_lin_full from: residual - base - a_quad*x_quad = a_lin_full * x_lin (1-var OLS)
-        num = sum((residual(p) - base - a_quad * x_quad(p)) * x_lin(p) for p in full)
-        den = sum(x_lin(p) ** 2 for p in full)
-        a_lin_full = num / den if den else calib.act_bytes_per_token_hidden_layer_full
+    stock_points = [p for p in points if p.cfg.attention == "stock"]
+    flash_points = [p for p in points if p.cfg.attention == "flash"]
+
+    if stock_points:
+        ckpt = [p for p in stock_points if p.cfg.grad_checkpoint]
+        full = [p for p in stock_points if not p.cfg.grad_checkpoint]
+        a_mat = np.array([[1.0, x_lin(p), x_quad(p)] for p in ckpt],
+                         dtype=float).reshape(-1, 3)
+        # Rank check, not a point/seq_len head-count: `np.linalg.lstsq` never raises on a
+        # rank-deficient design -- it returns the minimum-norm solution, i.e. silently-wrong
+        # coefficients (review reproduced a NEGATIVE a_quad from 3 points at 2 distinct
+        # seq_len, batch fixed). Full rank of the actual (1, x_lin, x_quad) matrix is the
+        # exact identifiability condition: batch-fixed runs need >= 3 distinct seq_len,
+        # while batch variation can restore rank at 2 (both cases tested).
+        if np.linalg.matrix_rank(a_mat) < 3:
+            raise PlanInputError(
+                "fit_memory_coeffs cannot separate (base, linear, quadratic): the gc=True "
+                "design matrix is rank-deficient. Supply at least 3 grad_checkpoint=True "
+                "FitPoints whose (1, x_lin, x_quad) rows are independent -- with batch held "
+                "fixed that means at least 3 distinct seq_len values (got "
+                f"{len(ckpt)} gc=True stock point(s), "
+                f"{len({p.cfg.seq_len for p in ckpt})} distinct seq_len)"
+            )
+        b_vec = np.array([residual(p) for p in ckpt], dtype=float)
+        solution = np.linalg.lstsq(a_mat, b_vec, rcond=None)[0]
+        base = float(solution[0])
+        a_lin_ckpt = float(solution[1])
+        a_quad = float(solution[2])
+        if full:
+            # a_lin_full from: residual - base - a_quad*x_quad = a_lin_full * x_lin (1-var OLS)
+            num = sum((residual(p) - base - a_quad * x_quad(p)) * x_lin(p) for p in full)
+            den = sum(x_lin(p) ** 2 for p in full)
+            a_lin_full = num / den if den else calib.act_bytes_per_token_hidden_layer_full
+        else:
+            a_lin_full = calib.act_bytes_per_token_hidden_layer_full
     else:
+        base = float(calib.base_transient_bytes)
+        a_lin_ckpt = calib.act_bytes_per_token_hidden_layer_ckpt
         a_lin_full = calib.act_bytes_per_token_hidden_layer_full
+        a_quad = calib.attn_bytes_per_head_token2
+
+    if flash_points:
+        # a_flash by 1-variable through-origin residual OLS, holding base/a_lin FIXED from
+        # the stock `calib` (the x_flash driver is collinear with x_lin at fixed shape, so
+        # they cannot be jointly identified). The analytic small terms and the O(N.D) saved
+        # state are subtracted; a_flash captures the residual live backward transient.
+        def flash_residual(p: FitPoint) -> float:
+            a_lin = (calib.act_bytes_per_token_hidden_layer_ckpt if p.cfg.grad_checkpoint
+                     else calib.act_bytes_per_token_hidden_layer_full)
+            return (residual(p) - calib.base_transient_bytes - a_lin * x_lin(p)
+                    - _flash_saved_state_bytes(p.cfg, p.shape))
+
+        den = sum(x_flash(p) ** 2 for p in flash_points)
+        if den <= 0:
+            raise PlanInputError(
+                "fit_memory_coeffs cannot identify a_flash: the flash design has "
+                "sum(x_flash^2) == 0 (need >= 1 flash FitPoint with batch*heads*seq > 0)"
+            )
+        num = sum(flash_residual(p) * x_flash(p) for p in flash_points)
+        a_flash = num / den
+    else:
+        a_flash = calib.attn_bytes_per_head_token_flash
 
     return {
         "base_transient_bytes": base,
         "act_bytes_per_token_hidden_layer_ckpt": a_lin_ckpt,
         "act_bytes_per_token_hidden_layer_full": float(a_lin_full),
         "attn_bytes_per_head_token2": a_quad,
+        "attn_bytes_per_head_token_flash": float(a_flash),
     }
