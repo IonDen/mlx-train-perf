@@ -40,7 +40,10 @@ from mlx_train_perf.bench.artifacts import (  # noqa: E402
     new_session_id,
     write_result,
 )
-from mlx_train_perf.core.guards import DEFAULT_WALL_BUDGET_S  # noqa: E402
+from mlx_train_perf.core.guards import (  # noqa: E402
+    DEFAULT_WALL_BUDGET_S,
+    EffectiveCeiling,
+)
 
 # ---------------------------------------------------------------------------
 # build_conditions: pure grid (impl x seq_lens) construction
@@ -313,8 +316,8 @@ def test_run_single_condition_installs_and_stops_the_memory_watchdog(
 ) -> None:
     """The attention bench's per-condition child installs the SAME active-memory
     watchdog the loss/train worker does (this script measured the 32.4 GB paging
-    condition), with a physical-memory-derived ceiling, and stops it on completion.
-    `measure_condition` is stubbed so no real GPU allocation happens."""
+    condition), with the EFFECTIVE ceiling `effective_memory_ceiling` computes, and stops
+    it on completion. `measure_condition` is stubbed so no real GPU allocation happens."""
     condition = _condition()
     captured: dict[str, object] = {}
     handle = _FakeWatchdogHandle()
@@ -332,17 +335,57 @@ def test_run_single_condition_installs_and_stops_the_memory_watchdog(
             "wall_s": 0.001, "walls_s": [0.001],
         }
 
+    monkeypatch.setattr(
+        bench_attention_op, "effective_memory_ceiling",
+        lambda: EffectiveCeiling(ceiling_bytes=987654321, warning=None),
+    )
     monkeypatch.setattr(bench_attention_op, "install_memory_watchdog", _fake_install)
     monkeypatch.setattr(bench_attention_op, "measure_condition", _fake_measure)
 
     out_path = bench_attention_op._run_single_condition(
         condition, out_dir=tmp_path, session_id="s1",
     )
-    assert isinstance(captured["ceiling_bytes"], int)
-    assert captured["ceiling_bytes"] > 0
+    assert captured["ceiling_bytes"] == 987654321  # the effective ceiling flowed through
     assert captured["wall_budget_s"] == DEFAULT_WALL_BUDGET_S
     assert handle.stopped is True
     assert json.loads(out_path.read_text())["status"] == "ok"
+
+
+def test_run_single_condition_records_memory_warning_when_present(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A degraded-start warning is carried into the attention child's `ok` artifact as
+    `memory_warning`; a nominal start (None) omits the key entirely."""
+    def _fake_measure(c: AttnCondition) -> dict[str, object]:
+        return {
+            "impl": c.impl, "n": c.n, "fwd_peak_gb": 0.0, "fwdbwd_peak_gb": 0.0,
+            "wall_s": 0.001, "walls_s": [0.001],
+        }
+
+    fake_handle = _FakeWatchdogHandle()
+    monkeypatch.setattr(bench_attention_op, "measure_condition", _fake_measure)
+    monkeypatch.setattr(
+        bench_attention_op, "install_memory_watchdog",
+        lambda *, ceiling_bytes, wall_budget_s, on_breach: fake_handle,  # noqa: ARG005
+    )
+
+    monkeypatch.setattr(
+        bench_attention_op, "effective_memory_ceiling",
+        lambda: EffectiveCeiling(ceiling_bytes=987654321, warning="only 8 GiB free"),
+    )
+    warned = bench_attention_op._run_single_condition(
+        _condition(), out_dir=tmp_path, session_id="s1",
+    )
+    assert json.loads(warned.read_text())["memory_warning"] == "only 8 GiB free"
+
+    monkeypatch.setattr(
+        bench_attention_op, "effective_memory_ceiling",
+        lambda: EffectiveCeiling(ceiling_bytes=987654321, warning=None),
+    )
+    clean = bench_attention_op._run_single_condition(
+        _condition(), out_dir=tmp_path, session_id="s2",
+    )
+    assert "memory_warning" not in json.loads(clean.read_text())
 
 
 @pytest.mark.benchmark

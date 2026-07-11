@@ -76,9 +76,9 @@ from mlx_train_perf.bench.artifacts import (
 )
 from mlx_train_perf.core.guards import (
     DEFAULT_WALL_BUDGET_S,
+    effective_memory_ceiling,
     install_guardrails,
     install_memory_watchdog,
-    memory_ceiling_bytes,
 )
 from mlx_train_perf.errors import LaunchBudgetError
 
@@ -275,7 +275,15 @@ def _run_single_condition(condition: AttnCondition, *, out_dir: Path, session_id
     the IOGPU panic. Stopped on every normal exit path (the `finally`)."""
     out_path = _out_path(out_dir, condition)
     ident = _identity_for(condition, session_id=session_id)
-    ceiling_bytes = memory_ceiling_bytes(int(mx.device_info()["memory_size"]))
+    # `effective_memory_ceiling` combines the static device-relative rule with the dynamic
+    # measured-availability at start (rank-local `vm_stat`): it may REFUSE (typed
+    # `MemoryBudgetError`) if this node is too crowded, and surfaces a degraded-start
+    # `memory_warning` recorded in the artifact (omit-when-None).
+    ceiling = effective_memory_ceiling()
+    ceiling_bytes = ceiling.ceiling_bytes
+    warning_field: dict[str, object] = (
+        {"memory_warning": ceiling.warning} if ceiling.warning is not None else {}
+    )
     watchdog = install_memory_watchdog(
         ceiling_bytes=ceiling_bytes, wall_budget_s=DEFAULT_WALL_BUDGET_S,
         on_breach=make_watchdog_on_breach(out_path, ident, ceiling_bytes),
@@ -284,9 +292,9 @@ def _run_single_condition(condition: AttnCondition, *, out_dir: Path, session_id
         try:
             fields = measure_condition(condition)
         except LaunchBudgetError as exc:
-            write_result(out_path, ident, "refused", error=str(exc))
+            write_result(out_path, ident, "refused", error=str(exc), **warning_field)
             return out_path
-        write_result(out_path, ident, "ok", **fields)
+        write_result(out_path, ident, "ok", **fields, **warning_field)
         return out_path
     finally:
         watchdog.stop()
