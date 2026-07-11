@@ -14,11 +14,13 @@ from pathlib import Path
 
 import pytest
 
+from mlx_train_perf import cli
 from mlx_train_perf.bench.artifacts import run_identity, write_result
 from mlx_train_perf.cli import (
     _apply_quant_override,
     _bench_exit_code,
     _conditions_for_suite,
+    _contribution_confirmed,
     _load_model_shape,
     _plan_exit_code,
     _read_status,
@@ -28,6 +30,7 @@ from mlx_train_perf.cli import (
     _train_config_from_args,
     main,
 )
+from mlx_train_perf.contribute import ContributionResult, MachineInfo
 from mlx_train_perf.errors import BenchInputError, PlanInputError
 from mlx_train_perf.plan.estimate import FitReport, ModelShape, TrainConfig
 
@@ -361,3 +364,73 @@ def test_bench_help_documents_exit_code_policy(capsys: pytest.CaptureFixture[str
     assert rc == 0
     assert "error" in out
     assert "refused" in out
+
+
+# --- contribute subcommand ----------------------------------------------------------
+
+
+def test_contribution_confirmed_yes_flag_always_proceeds() -> None:
+    assert _contribution_confirmed(yes=True, isatty=False, prompt=lambda _p: "n") is True
+
+
+def test_contribution_confirmed_non_tty_without_yes_refuses() -> None:
+    """A non-interactive run without --yes must NOT start a heavy GPU job unattended."""
+    assert _contribution_confirmed(yes=False, isatty=False, prompt=lambda _p: "y") is False
+
+
+def test_contribution_confirmed_tty_prompt_gates_on_yes_response() -> None:
+    assert _contribution_confirmed(yes=False, isatty=True, prompt=lambda _p: "y") is True
+    assert _contribution_confirmed(yes=False, isatty=True, prompt=lambda _p: "") is False
+
+
+def test_contribute_help_documents_the_tiers(capsys: pytest.CaptureFixture[str]) -> None:
+    rc = main(["contribute", "-h"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "quick" in out
+    assert "full" in out
+
+
+def _machine_info() -> MachineInfo:
+    return MachineInfo(chip="Apple M1 Max", ram_gib=32, ram_bytes=34359738368,
+                       macos="15.5", mlx_version="0.32.0", package_version="0.2.0")
+
+
+def test_cmd_contribute_prints_eta_and_pr_on_success(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path,
+) -> None:
+    """`contribute --yes` on a stubbed measurement path: the ETA prints up front, the
+    artifact path + suggested PR text print on success, exit 0."""
+    art_path = tmp_path / "apple-m1-max-32gb-2026-07-12.json"
+    art_path.write_text("{}")
+    result = ContributionResult(
+        refused=False, refusal=None, artifact_path=art_path,
+        warnings=("running on battery power",),
+        pr_title="Community benchmark: Apple M1 Max 32 GB", pr_body="body",
+    )
+    monkeypatch.setattr(cli, "detect_machine", _machine_info)
+    monkeypatch.setattr(cli, "run_contribution", lambda **_kw: result)
+
+    rc = main(["contribute", "--yes", "--tier", "quick", "--out", str(tmp_path)])
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "estimated time" in captured.out
+    assert "10" in captured.out          # the quick ETA range low bound
+    assert "15" in captured.out          # ... and high bound
+    assert "Community benchmark: Apple M1 Max 32 GB" in captured.out
+    assert "battery" in captured.err                              # warning to stderr
+
+
+def test_cmd_contribute_returns_one_on_refusal(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    result = ContributionResult(
+        refused=True, refusal="system memory pressure is critical (red)",
+        artifact_path=None, warnings=(), pr_title=None, pr_body=None,
+    )
+    monkeypatch.setattr(cli, "detect_machine", _machine_info)
+    monkeypatch.setattr(cli, "run_contribution", lambda **_kw: result)
+
+    rc = main(["contribute", "--yes"])
+    assert rc == 1
+    assert "refused" in capsys.readouterr().err

@@ -7,3 +7,6 @@ __pycache__/
 .coverage
 dist/
 _artifacts/
+# The contribution kit's intermediate per-condition artifacts; only the single
+# community-benchmarks/<chip>-<ram>gb-<date>.json is meant to be committed.
+/community-benchmarks/_work/

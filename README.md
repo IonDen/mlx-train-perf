@@ -96,6 +96,34 @@ python scripts/bench_train_step.py --model mlx-community/Qwen3-8B-4bit --seq-len
 python scripts/northstar_context_sweep.py # the max-context sweep (1-2 h; heavy)
 ```
 
+## Community benchmarks
+
+Every number above is from an M1 Max (32 GB), the machine this is developed on. Whether the
+kernel and the flash-attention path scale the way the memory model expects on larger
+machines is a question only other people's hardware can answer, so there is a one-command
+way to measure it and send the numbers back:
+
+```bash
+mlx-train-perf contribute --tier quick   # ~10-15 min; --tier full loads a model, ~1-2 h
+```
+
+It detects your machine, picks shapes for your RAM, prints a time estimate, runs the
+committed benches with the same memory guardrails the project uses, and writes one
+provenance-complete file plus a ready-to-paste PR. The three-step submission flow is in
+[community-benchmarks/README.md](community-benchmarks/README.md).
+
+Submitted results are folded into the table below (`python scripts/aggregate_community.py`).
+Each row is measured on that contributor's own hardware and reported as-is — nothing is
+extrapolated to machines no one has run, and a row does not imply a trainable-context
+ceiling beyond what that machine measured. The stock-attention baseline comparison is run
+on reference hardware by the maintainer, not asked of contributors.
+
+<!-- community-benchmarks:table -->
+| Chip | RAM (GB) | mlx | Tier | Loss kernel peak (GB) | Attn flash 2x ratio | Train tok/s (flash) | PR |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| _no submissions yet_ | | | | | | | |
+<!-- /community-benchmarks:table -->
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
