@@ -206,21 +206,32 @@ def make_watchdog_on_breach(
     The written artifact is the durable record of the breach; because its status is not
     `"ok"`, `result_is_fresh` treats it as stale, so a later resume run retries the
     condition (e.g. under a tighter budget). `exit_fn`/`exit_code` are injectable so a
-    test can assert the write and the exit code without terminating the test runner."""
+    test can assert the write and the exit code without terminating the test runner.
+
+    C1 (safety review): the write happens inside a `try`/`finally` so `exit_fn(exit_code)`
+    is UNCONDITIONAL. `core.guards._watchdog_step` calls `on_breach` under
+    `contextlib.suppress(Exception)` -- if `write_result` itself raises (MemoryError/
+    OSError are plausible in the exact paging-storm regime this watchdog exists to catch)
+    and there is no `finally`, that exception is swallowed upstream and the process never
+    hard-exits: the watchdog disarms itself while the storm continues. Losing the artifact
+    on a failed write is acceptable (the runner's `WorkerCrashed` envelope covers a
+    missing artifact after rc 70 -- see `bench/runner.py`); not dying is not."""
 
     def on_breach(reason: str, details: dict[str, object]) -> None:
-        active_bytes = int(cast(int, details.get("active_bytes", 0)))
-        elapsed_s = float(cast(float, details.get("elapsed_s", 0.0)))
-        write_result(
-            out, identity, f"aborted_{reason}",
-            observed_active_gb=round(active_bytes / 1024**3, 4),
-            ceiling_gb=round(ceiling_bytes / 1024**3, 4),
-            elapsed_s=round(elapsed_s, 3),
-            wall_budget_s=details.get("wall_budget_s"),
-        )
-        sys.stdout.flush()
-        sys.stderr.flush()
-        exit_fn(exit_code)
+        try:
+            active_bytes = int(cast(int, details.get("active_bytes", 0)))
+            elapsed_s = float(cast(float, details.get("elapsed_s", 0.0)))
+            write_result(
+                out, identity, f"aborted_{reason}",
+                observed_active_gb=round(active_bytes / 1024**3, 4),
+                ceiling_gb=round(ceiling_bytes / 1024**3, 4),
+                elapsed_s=round(elapsed_s, 3),
+                wall_budget_s=details.get("wall_budget_s"),
+            )
+            sys.stdout.flush()
+            sys.stderr.flush()
+        finally:
+            exit_fn(exit_code)  # ALWAYS -- losing the artifact is acceptable; not dying is not
 
     return on_breach
 

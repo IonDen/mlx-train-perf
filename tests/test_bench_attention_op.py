@@ -261,6 +261,39 @@ def test_run_grid_records_error_when_subprocess_exits_zero_without_artifact(
     assert data["error_type"] == "WorkerExitedWithoutArtifact"
 
 
+def test_run_grid_respects_a_breach_artifact_on_nonzero_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """FINDING H1 (safety review): a subprocess that wrote its OWN honest `aborted_*`
+    artifact before hard-exiting (the watchdog `os._exit(70)` breach path) must have that
+    record PRESERVED, not clobbered by the generic `WorkerCrashed` envelope -- mirrors
+    `bench.runner.run_conditions`'s respect contract (`out_path.exists()` guard) exactly.
+    Because the pre-spawn `unlink` already guarantees an existing artifact is this
+    subprocess's own write, a nonzero exit + an existing artifact means the subprocess
+    recorded its own honest breach and must not be overwritten."""
+    condition = _condition()
+
+    def _fake_breach(
+        c: AttnCondition, *, out_dir: Path, session_id: str,
+    ) -> subprocess.CompletedProcess[str]:
+        ident = condition_identity(
+            kind="attention_op", session_id=session_id,
+            params=bench_attention_op._params_for(c), attention_impl=c.impl,
+        )
+        write_result(
+            out_dir / f"{c.name}.json", ident, "aborted_memory_ceiling",
+            observed_active_gb=32.4, ceiling_gb=28.0,
+        )
+        return subprocess.CompletedProcess(args=[], returncode=70, stdout="", stderr="paging storm")
+
+    monkeypatch.setattr(bench_attention_op, "_spawn_condition", _fake_breach)
+    paths = run_grid([condition], out_dir=tmp_path, session_id=new_session_id())
+    data = json.loads(paths[0].read_text())
+    assert data["status"] == "aborted_memory_ceiling"
+    assert data["observed_active_gb"] == 32.4
+    assert data.get("error_type") != "WorkerCrashed"
+
+
 # ---------------------------------------------------------------------------
 # --run-benchmark-gated tiny smoke: real subprocesses, real Metal kernel + autodiff,
 # N=256 -- never a flagship dispatch (binding constraint: T13 owns real runs).

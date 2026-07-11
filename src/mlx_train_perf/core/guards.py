@@ -32,9 +32,19 @@ _GIB = 1024**3
 
 # The generous default wall-clock budget a bench condition gets when its config leaves
 # `wall_budget_s` unset -- long enough that no legitimate condition trips it, short
-# enough that a genuinely stuck run (spinning, not just slow) is failed within the hour
+# enough that a genuinely stuck run (spinning, not just slow) is eventually failed
 # instead of paging indefinitely. Campaign configs set a tighter budget explicitly.
-DEFAULT_WALL_BUDGET_S = 3600.0
+#
+# FINDING W (safety review): raised from 3600 -> 7200 -- the known-legit longest campaign
+# condition ran 3300 s, so the prior 1 h default cleared it by only 9%, uncomfortably
+# close for a value meant to be generous. The wall budget is a secondary backstop, not
+# the panic guard: the memory-ceiling watchdog (`install_memory_watchdog`'s
+# `ceiling_bytes` check) is what catches a PAGEABLE over-allocation before the IOGPU
+# paging-storm panic, and the wired cap (`install_guardrails`) turns a WIRED-class
+# over-allocation into a clean MLX OOM. Loosening the wall backstop to 2 h therefore
+# costs nothing on the safety axis -- it only gives more legitimate long-running
+# conditions headroom before a spurious wall-budget abort.
+DEFAULT_WALL_BUDGET_S = 7200.0
 
 # Device-proportional growth above the 32 GB-class reference (0019): the fixed wired_gb
 # ceiling was tuned for THIS project's 32 GB baseline (the M1 Max reports ~24.96 GiB, just

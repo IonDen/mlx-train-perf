@@ -648,6 +648,37 @@ def test_make_watchdog_on_breach_maps_wall_reason_to_aborted_wall_budget_status(
     assert exits == [70]
 
 
+def test_make_watchdog_on_breach_still_exits_when_write_result_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """FINDING C1 (safety review): `write_result` runs BEFORE `exit_fn` inside
+    `on_breach`, and the watchdog thread (`core.guards._watchdog_step`) swallows any
+    exception `on_breach` raises so a failing callback can't disarm the guard thread. If
+    `write_result` itself raises (MemoryError/OSError -- plausible in the exact paging
+    storm this watchdog exists to catch) with no `finally`, the swallowed exception means
+    `exit_fn(70)` never runs and the watchdog silently disarms while the storm continues.
+    `exit_fn` must ALWAYS fire, artifact write or not."""
+    out = tmp_path / "r.json"
+    ident = run_identity(model="m", session_id="s1")
+    exits: list[int] = []
+
+    def _raising_write_result(*_args: object, **_kwargs: object) -> None:
+        raise OSError("disk full mid-storm")
+
+    monkeypatch.setattr(artifacts, "write_result", _raising_write_result)
+    on_breach = make_watchdog_on_breach(out, ident, 28 * _GIB, exit_fn=exits.append)
+    # In production `exit_fn` is `os._exit`, which never returns -- the write's OSError
+    # never gets a chance to propagate past it. The injected `exit_fn` test double DOES
+    # return, so the `finally` block's re-raise of the original OSError is still visible
+    # here; what matters for C1 is that `exit_fn` was already called before that happens.
+    with pytest.raises(OSError, match="disk full mid-storm"):
+        on_breach(
+            "memory_ceiling",
+            {"active_bytes": 32 * _GIB, "elapsed_s": 12.5, "wall_budget_s": 3600.0},
+        )
+    assert exits == [70]
+
+
 def _spawn_breach_worker(config_path: Path) -> subprocess.CompletedProcess[str]:
     """A `_spawn_worker` stand-in that mimics the watchdog's `os._exit(70)` breach path:
     it writes an honest `aborted_memory_ceiling` artifact to the config's `out`, then

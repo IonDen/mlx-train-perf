@@ -290,5 +290,10 @@ def test_watchdog_fires_on_wall_budget_breach() -> None:
     assert captured["reason"] == "wall_budget"
 
 
-def test_default_wall_budget_is_one_hour() -> None:
-    assert DEFAULT_WALL_BUDGET_S == 3600.0
+def test_default_wall_budget_is_two_hours() -> None:
+    """FINDING W (safety review, reviewer-recommended): the known-legit longest campaign
+    condition ran 3300 s -- the prior 3600 s default cleared it by only 9%. The MEMORY
+    watchdog is the actual panic guard (a WIRED-class over-allocation goes clean-OOM via
+    the wired cap; a PAGEABLE over-allocation is what the memory-ceiling watchdog exists
+    to catch fast), so loosening the wall backstop costs nothing on the safety axis."""
+    assert DEFAULT_WALL_BUDGET_S == 7200.0
