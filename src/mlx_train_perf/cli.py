@@ -25,6 +25,7 @@ _BENCH_SUITES = ("loss-layer",)
 _PLAN_IMPLS = ("kernel", "chunked", "naive")
 _BENCH_IMPLS = ("auto", "kernel", "chunked", "naive")
 _DTYPES = ("float32", "bfloat16", "float16")
+_ATTENTIONS = ("stock", "flash")
 
 # Fixed pairing this project uses everywhere a quantized shape is priced (worker.py's
 # own quantized-condition default, and the planner's own quantized test fixture): a
@@ -69,15 +70,17 @@ def _apply_quant_override(shape: ModelShape, quant_bits: int | None) -> ModelSha
 
 def _train_config_from_args(
     *, batch: int, seq_len: int, lora_rank: int, impl: str, shape_layers: int,
+    attention: str = "stock",
 ) -> TrainConfig:
     """`lora_rank == 0` means full fine-tuning in this planner's terms (see
     `estimate._head_trainable`) -- no LoRA layers apply, so `lora_layers` is 0. Otherwise
     every model layer gets a LoRA adapter, the conventional default this planner already
-    assumes for its `q_proj`/`v_proj` target set."""
+    assumes for its `q_proj`/`v_proj` target set. `attention` selects the stock O(N^2) or
+    flash O(N) attention-backward memory model (default "stock")."""
     lora_layers = shape_layers if lora_rank > 0 else 0
     return TrainConfig(
         batch=batch, seq_len=seq_len, dtype="bfloat16", lora_rank=lora_rank,
-        lora_layers=lora_layers, grad_checkpoint=True, impl=impl,
+        lora_layers=lora_layers, grad_checkpoint=True, impl=impl, attention=attention,
     )
 
 
@@ -116,7 +119,7 @@ def _cmd_plan(args: argparse.Namespace) -> int:
     shape = _apply_quant_override(shape, args.quant_bits)
     cfg = _train_config_from_args(
         batch=args.batch, seq_len=args.seq_len, lora_rank=args.lora_rank, impl=args.impl,
-        shape_layers=shape.layers,
+        shape_layers=shape.layers, attention=args.attention,
     )
     budget_bytes = int(args.budget_gb * 1024**3) if args.budget_gb is not None else None
     fit_report = plan_fit(shape, cfg, budget_bytes=budget_bytes)
@@ -202,6 +205,9 @@ def _add_plan_parser(subparsers: "argparse._SubParsersAction[argparse.ArgumentPa
                             "own quantization metadata, if any)")
     plan.add_argument("--impl", choices=_PLAN_IMPLS, default="kernel",
                        help="loss-layer implementation to plan for (default: kernel)")
+    plan.add_argument("--attention", choices=_ATTENTIONS, default="stock",
+                       help="attention-backward memory model: stock O(N^2) (default) or "
+                            "the 0.2.0 flash O(N) path")
     plan.add_argument("--budget-gb", type=float, default=None,
                        help="memory budget in GiB (default: this project's own device-"
                             "clamped wired cap)")

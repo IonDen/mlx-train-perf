@@ -41,6 +41,7 @@ _EXISTING_CALIBRATION = {
     "act_bytes_per_token_hidden_layer_ckpt": 1.0,
     "act_bytes_per_token_hidden_layer_full": 50.0,
     "attn_bytes_per_head_token2": 1.0,
+    "attn_bytes_per_head_token_flash": 1.0,
     "optimizer_bytes_per_param": 8.0,
     "overhead_frac": 0.10,
     "naive_loss_bytes_per_nv": 12.0,
@@ -53,10 +54,11 @@ _EXISTING_CALIBRATION = {
 
 def _write_artifact(
     path: Path, *, status: str = "ok", marginal_peak_gb: float = 1.0, impl: str = "kernel",
+    attention_impl: str = "stock",
 ) -> None:
     path.write_text(json.dumps({
         "status": status, "marginal_peak_gb": marginal_peak_gb,
-        "identity": {"impl": impl},
+        "identity": {"impl": impl, "attention_impl": attention_impl},
     }))
 
 
@@ -144,6 +146,30 @@ def test_load_fit_points_reads_impl_from_the_artifact_identity(tmp_path: Path) -
     assert points[0].cfg.impl == "chunked"
 
 
+def test_load_fit_points_reads_attention_impl_from_the_artifact_identity(
+    tmp_path: Path,
+) -> None:
+    """The train-step artifact identity carries `attention_impl` ("stock"/"flash"); it
+    threads into the FitPoint's `cfg.attention` so `fit_memory_coeffs` routes the point
+    into the correct branch. Absent (old artifacts) it defaults to "stock"."""
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(_CONFIG))
+    flash_art = tmp_path / "flash.json"
+    stock_art = tmp_path / "stock.json"
+    _write_artifact(flash_art, attention_impl="flash")
+    _write_artifact(stock_art, attention_impl="stock")
+    manifest_path = tmp_path / "manifest.json"
+    _write_manifest(manifest_path, [
+        {"config": str(config_path), "artifact": str(flash_art), "batch": 1,
+         "seq_len": 512, "lora_rank": 8, "lora_layers": 2},
+        {"config": str(config_path), "artifact": str(stock_art), "batch": 1,
+         "seq_len": 512, "lora_rank": 8, "lora_layers": 2},
+    ])
+    points = load_fit_points(manifest_path)
+    assert points[0].cfg.attention == "flash"
+    assert points[1].cfg.attention == "stock"
+
+
 def test_load_fit_points_rejects_a_non_ok_artifact(tmp_path: Path) -> None:
     config_path = tmp_path / "config.json"
     config_path.write_text(json.dumps(_CONFIG))
@@ -167,6 +193,7 @@ def test_load_fit_points_rejects_a_non_ok_artifact(tmp_path: Path) -> None:
 _COEFFS = {
     "base_transient_bytes": 5.0, "act_bytes_per_token_hidden_layer_ckpt": 2.0,
     "act_bytes_per_token_hidden_layer_full": 60.0, "attn_bytes_per_head_token2": 3.0,
+    "attn_bytes_per_head_token_flash": 7.0,
 }
 
 
@@ -181,6 +208,7 @@ def test_build_updated_calibration_data_preserves_untouched_constants(tmp_path: 
     assert updated["act_bytes_per_token_hidden_layer_ckpt"] == 2.0
     assert updated["act_bytes_per_token_hidden_layer_full"] == 60.0
     assert updated["attn_bytes_per_head_token2"] == 3.0
+    assert updated["attn_bytes_per_head_token_flash"] == 7.0
     assert updated["optimizer_bytes_per_param"] == 8.0
     # untouched by this fit:
     assert updated["overhead_frac"] == _EXISTING_CALIBRATION["overhead_frac"]
@@ -240,6 +268,7 @@ def test_main_writes_the_updated_calibration_file_without_dry_run(tmp_path: Path
     # the fit replaced the memory coefficients (base moved off its placeholder 1.0):
     assert updated["base_transient_bytes"] != _EXISTING_CALIBRATION["base_transient_bytes"]
     assert "attn_bytes_per_head_token2" in updated
+    assert "attn_bytes_per_head_token_flash" in updated
     assert updated["overhead_frac"] == _EXISTING_CALIBRATION["overhead_frac"]
     # review item: main() wires optimizer_bytes_per_param from the EXISTING file (it is
     # analytic, not fitted -- a behavior change in the rework, previously fit-returned):
