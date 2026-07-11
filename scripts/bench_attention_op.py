@@ -317,7 +317,15 @@ def run_grid(
     unlinked BEFORE spawning (so `out_path.exists()` after the subprocess returns means
     exactly "this subprocess wrote it"); a nonzero exit or a clean exit that wrote
     nothing is recorded as an `"error"` result on this side, keyed by the identity the
-    subprocess would have used, so a later resume run still sees it as stale."""
+    subprocess would have used, so a later resume run still sees it as stale.
+
+    FINDING H1 (safety review): both branches below require `not out_path.exists()` --
+    mirroring `bench.runner.run_conditions` exactly -- so a subprocess that wrote its OWN
+    honest `aborted_*` artifact before hard-exiting (the watchdog `os._exit(70)` breach
+    path) is never clobbered by the generic `WorkerCrashed` envelope. Because the
+    pre-spawn `unlink` above already guarantees an existing artifact is THIS subprocess's
+    write, `out_path.exists()` after a nonzero exit unambiguously means the subprocess
+    recorded its own breach."""
     out_dir.mkdir(parents=True, exist_ok=True)
     paths: list[Path] = []
     for condition in conditions:
@@ -328,13 +336,13 @@ def run_grid(
             continue
         out_path.unlink(missing_ok=True)
         proc = _spawn_condition(condition, out_dir=out_dir, session_id=session_id)
-        if proc.returncode != 0:
+        if proc.returncode != 0 and not out_path.exists():
             stderr_tail = (proc.stderr or proc.stdout or "")[-_STDERR_TAIL_CHARS:]
             write_result(
                 out_path, ident, "error", error_type="WorkerCrashed",
                 error_msg=stderr_tail, returncode=proc.returncode,
             )
-        elif not out_path.exists():
+        elif proc.returncode == 0 and not out_path.exists():
             write_result(
                 out_path, ident, "error", error_type="WorkerExitedWithoutArtifact",
                 error_msg="subprocess exited 0 without writing an artifact", returncode=0,
