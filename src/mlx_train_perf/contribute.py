@@ -27,6 +27,7 @@ extrapolated -- the aggregation table (`scripts/aggregate_community.py`) states 
 own measured numbers with a PR reference, and the maintainer campaign (not the
 contributor) owns the stock-attention baseline comparisons.
 """
+import hashlib
 import json
 import os
 import platform
@@ -40,10 +41,15 @@ from pathlib import Path
 from typing import cast
 
 from mlx_train_perf._compat import _installed_mlx_version
-from mlx_train_perf.bench.artifacts import new_session_id
+from mlx_train_perf.bench.artifacts import run_identity, write_result
 from mlx_train_perf.bench.runner import Condition, run_conditions
 from mlx_train_perf.core.guards import EffectiveCeiling, effective_memory_ceiling
-from mlx_train_perf.errors import BenchInputError, MemoryBudgetError, MissingDependencyError
+from mlx_train_perf.errors import (
+    BenchInputError,
+    MachineDetectionError,
+    MemoryBudgetError,
+    MissingDependencyError,
+)
 
 COMMUNITY_SCHEMA_VERSION = 1
 
@@ -93,10 +99,22 @@ def artifact_filename(*, chip: str, ram_gib: int, date: str) -> str:
 
 
 def _read_chip() -> str:
-    out = subprocess.run(
-        ["sysctl", "-n", "machdep.cpu.brand_string"],
-        capture_output=True, text=True, check=True, timeout=10,
-    ).stdout
+    """The `sysctl` brand-string reader -- unlike `_read_memory_pressure`/
+    `_read_on_ac_power` (which degrade gracefully on failure; a stale-but-safe default is
+    fine there), a chip read failure has no honest default, so `check=True` raises. A
+    subprocess/OS failure (missing binary, nonzero exit, timeout) is mapped to the typed
+    `MachineDetectionError` here, not left to escape as a raw traceback -- `main` only
+    catches `MlxTrainPerfError`, so an unmapped `CalledProcessError` would exit 1 (an
+    uncaught crash) instead of this package's tool-error exit 2 (finding E)."""
+    try:
+        out = subprocess.run(
+            ["sysctl", "-n", "machdep.cpu.brand_string"],
+            capture_output=True, text=True, check=True, timeout=10,
+        ).stdout
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise MachineDetectionError(
+            f"failed to read the CPU brand string via `sysctl`: {exc}"
+        ) from exc
     return parse_chip(out)
 
 
@@ -469,13 +487,49 @@ def _train_conditions(grid: ShapeGrid) -> list[Condition]:
     ]
 
 
+_SPAWN_STDERR_TAIL_CHARS = 4000  # same convention as bench.runner._STDERR_TAIL_CHARS
+
+
+def _spawn_crash_artifact(
+    out_dir: Path, *, argv: list[str], proc: subprocess.CompletedProcess[str],
+) -> Path:
+    """Finding B: mirror `bench.runner.run_conditions`'s `WorkerCrashed` envelope for a
+    spawned bench SCRIPT (`bench_attention_op.py` / `northstar_context_sweep.py`), not
+    just the in-package `Condition` workers. A script that crashes (nonzero exit) before
+    writing ANY artifact of its own must not glob-read as a clean, empty bench -- that
+    silently records a total measurement loss as a successful zero-condition result.
+    Written with the SAME envelope shape (`status="error"`, `error_type`, `error_msg` =
+    stderr tail, `returncode`) via `bench.artifacts.write_result` so it renders through
+    `summarize_bench` / the community artifact exactly like any other crashed
+    condition."""
+    identity = run_identity(argv=argv)
+    stderr_tail = (proc.stderr or proc.stdout or "")[-_SPAWN_STDERR_TAIL_CHARS:]
+    path = out_dir / "_spawn_crashed.json"
+    write_result(
+        path, identity, "error", error_type="WorkerCrashed",
+        error_msg=stderr_tail, returncode=proc.returncode,
+    )
+    return path
+
+
 def _spawn_script(argv: list[str], *, out_dir: Path) -> list[Path]:
     """Run a committed bench script as a subprocess and return the artifacts it wrote.
     The script owns its own subprocess-per-condition + resume + watchdog machinery; the
-    kit just points it at `out_dir` and collects the resulting per-condition artifacts."""
+    kit just points it at `out_dir` and collects the resulting per-condition artifacts.
+    Output is captured (not streamed) -- the same convention `bench.runner._spawn_worker`
+    already uses for in-package workers -- so a crash's stderr is available for
+    `_spawn_crash_artifact` (finding B). A nonzero exit that left an artifact behind (the
+    script wrote its own honest partial record, e.g. a condition-level watchdog breach,
+    before dying) is respected as-is, never overwritten by a synthetic crash record --
+    same reasoning as `run_conditions`'s own crash-envelope path."""
     out_dir.mkdir(parents=True, exist_ok=True)
-    subprocess.run([sys.executable, *argv], check=False)
-    return sorted(out_dir.glob("*.json"))
+    proc = subprocess.run(
+        [sys.executable, *argv], capture_output=True, text=True, check=False,
+    )
+    paths = sorted(out_dir.glob("*.json"))
+    if proc.returncode != 0 and not paths:
+        return [_spawn_crash_artifact(out_dir, argv=argv, proc=proc)]
+    return paths
 
 
 def _spawn_attention(grid: ShapeGrid, *, out_dir: Path, session_id: str) -> list[Path]:
@@ -545,12 +599,82 @@ def _today() -> str:
     return date.today().isoformat()
 
 
+def run_preflight(
+    *,
+    ceiling_reader: Callable[[], EffectiveCeiling] = effective_memory_ceiling,
+    memory_pressure_reader: Callable[[], str] = _read_memory_pressure,
+    ac_power_reader: Callable[[], bool] = _read_on_ac_power,
+) -> Preflight:
+    """Run the pre-flight checks (the 0021 memory ceiling/divergence, `memory_pressure`,
+    AC power) and return the `Preflight` decision, WITHOUT taking any confirmation input
+    -- this is the standalone seam the CLI calls BEFORE prompting for confirmation
+    (finding A). The kit's README promises the pre-flight warning names the
+    expected-vs-measured memory gap "so you can close other apps and retry"; that promise
+    only holds if the warning is on screen before any heavy work starts, which requires it
+    to run (and be printed) ahead of the confirmation prompt, not folded into the same
+    call that also drives the measurement.
+
+    `effective_memory_ceiling` may itself REFUSE (typed `MemoryBudgetError`) on a
+    genuinely-crowded machine; that becomes a clean `Preflight(ok=False, ...)` here rather
+    than a raised exception, so every caller gets the same clean-refusal shape without its
+    own try/except."""
+    try:
+        ceiling = ceiling_reader()
+    except MemoryBudgetError as exc:
+        return Preflight(ok=False, refusal=str(exc), warnings=())
+    mp_state = classify_memory_pressure(memory_pressure_reader())
+    return evaluate_preflight(
+        memory_pressure_state=mp_state, on_ac_power=ac_power_reader(), ceiling=ceiling,
+    )
+
+
+_MODULE_PATH = Path(__file__).resolve()
+
+
+def _module_sha() -> str:
+    """Fingerprint of THIS module's own bytes -- same reasoning as
+    `scripts/northstar_context_sweep.py::script_sha()`: an edit to the condition-building
+    logic in this file must invalidate any session id derived below, so a stale,
+    incompatible session is never silently resumed after a code change."""
+    return hashlib.sha256(_MODULE_PATH.read_bytes()).hexdigest()[:16]
+
+
+def _contribute_session_id(*, machine: MachineInfo, tier: str, grid: ShapeGrid) -> str:
+    """Deterministic (NOT random) session id for one `mlx-train-perf contribute` run --
+    mirrors `scripts/northstar_context_sweep.py::_recipe_session_id`'s reasoning (finding
+    D). The `loss_layer`/`attention_op`/`train_step` conditions this session id feeds are
+    all dispatched through machinery that resume-skips a condition whose identity --
+    `session_id` included -- already has a FRESH artifact on disk (`bench.runner.
+    run_conditions`, and `bench_attention_op.py`'s own `--session-id`-driven grid). A
+    fresh `uuid4` session id on every invocation (the prior behavior) defeats that resume
+    property ACROSS separate `contribute` runs: an interrupted quick/full-tier kit run,
+    re-invoked, would re-measure every condition from scratch even though most of them
+    already finished.
+
+    Folding in the machine identity, the tier, the FULL shape grid (not just the RAM
+    class int), and this module's own `_module_sha()` keeps the id sensitive to anything
+    that changes what actually gets measured: a different machine, a wider seq grid, or
+    an edit to the condition-building logic in this file all hash to a DIFFERENT id, so a
+    stale/incompatible session is never silently resumed. `context_probe` is excluded on
+    purpose -- `northstar_context_sweep.py` already derives its own stable id via
+    `_recipe_session_id` and does not accept one from the caller."""
+    h = hashlib.sha256()
+    for part in (
+        machine.chip, str(machine.ram_gib), tier,
+        json.dumps(asdict(grid), sort_keys=True), _module_sha(),
+    ):
+        h.update(part.encode())
+        h.update(b"\x00")
+    return h.hexdigest()[:32]
+
+
 def run_contribution(
     *,
     tier: str,
     out_dir: Path,
     confirm: bool,
     machine: MachineInfo | None = None,
+    preflight: Preflight | None = None,
     ceiling_reader: Callable[[], EffectiveCeiling] = effective_memory_ceiling,
     memory_pressure_reader: Callable[[], str] = _read_memory_pressure,
     ac_power_reader: Callable[[], bool] = _read_on_ac_power,
@@ -563,6 +687,14 @@ def run_contribution(
     `MemoryBudgetError` REFUSES before any measurement starts), then drive each bench
     through the injectable `measure` seam, and finally write ONE provenance-complete
     community artifact plus the pre-filled PR text.
+
+    `preflight`, when given, is used AS-IS instead of being recomputed (finding A): the
+    CLI runs `run_preflight` itself BEFORE the confirmation prompt (so its warnings print
+    ahead of it, and a refusal is shown before ever asking to proceed) and passes the
+    result through here rather than paying for the readers a second time. A direct
+    caller that omits it (every test in this suite, and any other direct caller) gets the
+    SAME decision computed fresh via the injected readers -- this function's own
+    stand-alone refusal semantics are unchanged either way.
 
     All hardware/subprocess touchpoints are injectable (`ceiling_reader`,
     `memory_pressure_reader`, `ac_power_reader`, `measure`, `today`) so the whole flow is
@@ -580,19 +712,11 @@ def run_contribution(
             artifact_path=None, warnings=(), pr_title=None, pr_body=None,
         )
 
-    # Pre-flight. `effective_memory_ceiling` may itself REFUSE (typed MemoryBudgetError)
-    # on a genuinely-crowded machine; surface that as a clean kit refusal, not a crash.
-    try:
-        ceiling = ceiling_reader()
-    except MemoryBudgetError as exc:
-        return ContributionResult(
-            refused=True, refusal=str(exc), artifact_path=None, warnings=(),
-            pr_title=None, pr_body=None,
+    if preflight is None:
+        preflight = run_preflight(
+            ceiling_reader=ceiling_reader, memory_pressure_reader=memory_pressure_reader,
+            ac_power_reader=ac_power_reader,
         )
-    mp_state = classify_memory_pressure(memory_pressure_reader())
-    preflight = evaluate_preflight(
-        memory_pressure_state=mp_state, on_ac_power=ac_power_reader(), ceiling=ceiling,
-    )
     if not preflight.ok:
         return ContributionResult(
             refused=True, refusal=preflight.refusal, artifact_path=None,
@@ -601,7 +725,11 @@ def run_contribution(
 
     # Measure. Per-bench artifacts live under out_dir/_work/<bench> (resumable across kit
     # runs, intermediate); the single community artifact is written at out_dir/<name>.json.
-    session_id = new_session_id()
+    # `session_id` is DETERMINISTIC (finding D, `_contribute_session_id`), not a fresh
+    # uuid4 -- a `contribute` run interrupted and re-invoked with the SAME (machine, tier,
+    # grid) resumes by skipping already-fresh conditions instead of re-measuring
+    # everything.
+    session_id = _contribute_session_id(machine=machine, tier=tier, grid=grid)
     work_root = out_dir / "_work"
     summaries: list[dict[str, object]] = []
     for bench in benches:
