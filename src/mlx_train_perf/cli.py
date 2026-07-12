@@ -23,6 +23,7 @@ from mlx_train_perf.contribute import (
     detect_machine,
     format_eta,
     run_contribution,
+    run_preflight,
     shapes_for_ram,
 )
 from mlx_train_perf.errors import BenchInputError, MlxTrainPerfError, PlanInputError
@@ -228,17 +229,29 @@ def _cmd_contribute(args: argparse.Namespace) -> int:
     )
     print(f"shape grid: {grid.ram_class_gib} GB machine class")
     print(f"estimated time: {format_eta(args.tier)}")
+
+    # Pre-flight runs, and its warnings print, BEFORE the confirmation prompt (finding A):
+    # the README promises "the pre-flight prints a warning ... you can close other apps
+    # and retry" -- that promise only holds if a warn-band machine sees it up front, and a
+    # red/too-crowded machine must never even reach the "Proceed?" prompt. The computed
+    # decision is threaded into `run_contribution` so it is not re-run a second time.
+    preflight = run_preflight()
+    for warning in preflight.warnings:
+        print(f"warning: {warning}", file=sys.stderr)
+    if not preflight.ok:
+        print(f"refused: {preflight.refusal}", file=sys.stderr)
+        return 1
+
     confirmed = _contribution_confirmed(
         yes=args.yes, isatty=sys.stdin.isatty(), prompt=input,
     )
     result = run_contribution(
         tier=args.tier, out_dir=Path(args.out), confirm=confirmed, machine=machine,
+        preflight=preflight,
     )
     if result.refused:
         print(f"refused: {result.refusal}", file=sys.stderr)
         return 1
-    for warning in result.warnings:
-        print(f"warning: {warning}", file=sys.stderr)
     print(f"wrote {result.artifact_path}")
     print("\n--- suggested PR title ---")
     print(result.pr_title)

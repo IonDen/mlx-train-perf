@@ -10,6 +10,8 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 _SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts"
 sys.path.insert(0, str(_SCRIPTS_DIR))
 
@@ -156,6 +158,67 @@ def test_load_community_artifacts_skips_the_readme_and_bad_json(tmp_path: Path) 
     loaded = load_community_artifacts(tmp_path)
     assert len(loaded) == 1
     assert loaded[0]["machine"]["chip"] == "Apple M1 Max"
+
+
+# --- finding C: malformed/partial artifacts warn by name, never a degenerate row ------
+
+
+def test_load_community_artifacts_warns_by_name_on_corrupt_json(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    (tmp_path / "corrupt.json").write_text("{not json")
+    loaded = load_community_artifacts(tmp_path)
+    assert loaded == []
+    err = capsys.readouterr().err
+    assert "corrupt.json" in err
+
+
+def test_load_community_artifacts_warns_by_name_and_skips_a_partial_artifact(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A valid-but-partial artifact -- e.g. missing `benches` entirely -- must be skipped
+    with a NAMED warning, never rendered as a degenerate `?` chip / `0` RAM row."""
+    (tmp_path / "partial.json").write_text(json.dumps({"schema_version": 1, "tier": "quick"}))
+    loaded = load_community_artifacts(tmp_path)
+    assert loaded == []
+    err = capsys.readouterr().err
+    assert "partial.json" in err
+
+
+def test_load_community_artifacts_warns_when_the_machine_block_is_incomplete(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A `machine` block missing `chip`/`ram_gib` is exactly the "? chip / 0 RAM"
+    degenerate-row failure mode the finding names."""
+    (tmp_path / "partial.json").write_text(json.dumps({
+        "schema_version": 1, "tier": "quick", "machine": {"ram_gib": 32}, "benches": [],
+    }))
+    loaded = load_community_artifacts(tmp_path)
+    assert loaded == []
+    err = capsys.readouterr().err
+    assert "partial.json" in err
+
+
+def test_load_community_artifacts_loads_a_well_formed_artifact_without_warning(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    (tmp_path / "good.json").write_text(json.dumps(_artifact()))
+    loaded = load_community_artifacts(tmp_path)
+    assert len(loaded) == 1
+    assert capsys.readouterr().err == ""
+
+
+def test_main_warns_on_a_malformed_artifact_and_excludes_it_from_the_table(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    (tmp_path / "good.json").write_text(json.dumps(_artifact(chip="Apple M1 Max", ram_gib=32)))
+    (tmp_path / "partial.json").write_text(json.dumps({"tier": "quick"}))
+    rc = main(["--dir", str(tmp_path)])
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "Apple M1 Max" in captured.out
+    assert "partial.json" in captured.err
+    assert "| ? " not in captured.out          # no degenerate row rendered
 
 
 def test_main_prints_the_table(tmp_path: Path, capsys) -> None:  # type: ignore[no-untyped-def]

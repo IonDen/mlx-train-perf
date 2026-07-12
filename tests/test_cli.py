@@ -30,8 +30,8 @@ from mlx_train_perf.cli import (
     _train_config_from_args,
     main,
 )
-from mlx_train_perf.contribute import ContributionResult, MachineInfo
-from mlx_train_perf.errors import BenchInputError, PlanInputError
+from mlx_train_perf.contribute import ContributionResult, MachineInfo, Preflight
+from mlx_train_perf.errors import BenchInputError, MachineDetectionError, PlanInputError
 from mlx_train_perf.plan.estimate import FitReport, ModelShape, TrainConfig
 
 # --- brief's mandated Step 1 tests (verbatim) --------------------------------------
@@ -396,11 +396,16 @@ def _machine_info() -> MachineInfo:
                        macos="15.5", mlx_version="0.32.0", package_version="0.2.0")
 
 
+def _ok_preflight(warnings: tuple[str, ...] = ()) -> Preflight:
+    return Preflight(ok=True, refusal=None, warnings=warnings)
+
+
 def test_cmd_contribute_prints_eta_and_pr_on_success(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path,
 ) -> None:
     """`contribute --yes` on a stubbed measurement path: the ETA prints up front, the
-    artifact path + suggested PR text print on success, exit 0."""
+    pre-flight warning prints, and the artifact path + suggested PR text print on
+    success, exit 0."""
     art_path = tmp_path / "apple-m1-max-32gb-2026-07-12.json"
     art_path.write_text("{}")
     result = ContributionResult(
@@ -409,6 +414,8 @@ def test_cmd_contribute_prints_eta_and_pr_on_success(
         pr_title="Community benchmark: Apple M1 Max 32 GB", pr_body="body",
     )
     monkeypatch.setattr(cli, "detect_machine", _machine_info)
+    monkeypatch.setattr(cli, "run_preflight",
+                         lambda **_kw: _ok_preflight(("running on battery power",)))
     monkeypatch.setattr(cli, "run_contribution", lambda **_kw: result)
 
     rc = main(["contribute", "--yes", "--tier", "quick", "--out", str(tmp_path)])
@@ -425,12 +432,109 @@ def test_cmd_contribute_returns_one_on_refusal(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
 ) -> None:
     result = ContributionResult(
-        refused=True, refusal="system memory pressure is critical (red)",
+        refused=True, refusal="not confirmed -- pass --yes or confirm at the prompt to start",
         artifact_path=None, warnings=(), pr_title=None, pr_body=None,
     )
     monkeypatch.setattr(cli, "detect_machine", _machine_info)
+    monkeypatch.setattr(cli, "run_preflight", lambda **_kw: _ok_preflight())
     monkeypatch.setattr(cli, "run_contribution", lambda **_kw: result)
 
     rc = main(["contribute", "--yes"])
     assert rc == 1
     assert "refused" in capsys.readouterr().err
+
+
+# --- finding A: pre-flight runs BEFORE the confirmation prompt / any measurement -----
+
+
+def test_cmd_contribute_preflight_warning_prints_before_the_confirmation_prompt(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path,
+) -> None:
+    """The kit's README promises the pre-flight warning names the expected-vs-measured
+    memory gap "so you can close other apps and retry" -- that promise only holds if the
+    warning is on screen BEFORE the confirmation prompt (and well before any heavy
+    measurement), not after. Order is asserted via the fake seams: the preflight, the
+    confirmation prompt, and the measurement call each record themselves into `order`,
+    and the fake prompt snapshots stdout the instant it is invoked."""
+    order: list[str] = []
+    snapshot_at_confirm: list[str] = []
+
+    def _fake_run_preflight(**_kw: object) -> Preflight:
+        order.append("preflight")
+        return _ok_preflight(("expected ~58 GB free, measured 20 GB",))
+
+    def _fake_input(_msg: str) -> str:
+        order.append("confirm")
+        snapshot_at_confirm.append(capsys.readouterr().err)
+        return "y"
+
+    def _fake_run_contribution(**_kw: object) -> ContributionResult:
+        order.append("measure")
+        return ContributionResult(
+            refused=False, refusal=None, artifact_path=tmp_path / "a.json",
+            warnings=(), pr_title="t", pr_body="b",
+        )
+
+    monkeypatch.setattr(cli, "detect_machine", _machine_info)
+    monkeypatch.setattr(cli, "run_preflight", _fake_run_preflight)
+    monkeypatch.setattr(cli, "run_contribution", _fake_run_contribution)
+    monkeypatch.setattr("builtins.input", _fake_input)
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+
+    rc = main(["contribute", "--tier", "quick", "--out", str(tmp_path)])
+
+    assert rc == 0
+    assert order == ["preflight", "confirm", "measure"]
+    assert "58 GB" in snapshot_at_confirm[0]     # already printed by the time confirm ran
+
+
+def test_cmd_contribute_red_preflight_refuses_before_any_confirmation_prompt(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path,
+) -> None:
+    """A red/too-crowded pre-flight refuses outright and must never reach the
+    confirmation prompt or the measurement seam."""
+    prompted: list[str] = []
+
+    def _fake_run_preflight(**_kw: object) -> Preflight:
+        return Preflight(
+            ok=False,
+            refusal="system memory pressure is critical (red); refusing to start",
+            warnings=(),
+        )
+
+    def _fake_input(msg: str) -> str:
+        prompted.append(msg)
+        return "y"
+
+    def _fake_run_contribution(**_kw: object) -> ContributionResult:
+        raise AssertionError("run_contribution must not run when the pre-flight refuses")
+
+    monkeypatch.setattr(cli, "detect_machine", _machine_info)
+    monkeypatch.setattr(cli, "run_preflight", _fake_run_preflight)
+    monkeypatch.setattr(cli, "run_contribution", _fake_run_contribution)
+    monkeypatch.setattr("builtins.input", _fake_input)
+
+    rc = main(["contribute", "--tier", "quick", "--out", str(tmp_path)])
+
+    assert rc == 1
+    assert prompted == []                                    # never reached the prompt
+    assert "red" in capsys.readouterr().err
+
+
+# --- finding E: a machine-detection failure maps to the tool-error exit (2) ----------
+
+
+def test_cmd_contribute_machine_detection_failure_is_a_tool_error_not_a_traceback(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    def _raise() -> MachineInfo:
+        raise MachineDetectionError(
+            "failed to read the CPU brand string via `sysctl`: exit status 1"
+        )
+
+    monkeypatch.setattr(cli, "detect_machine", _raise)
+
+    rc = main(["contribute", "--yes"])
+    captured = capsys.readouterr()
+    assert rc == 2
+    assert "sysctl" in captured.err

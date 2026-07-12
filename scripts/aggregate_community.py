@@ -12,6 +12,7 @@ run by path: `python scripts/aggregate_community.py --dir community-benchmarks`.
 """
 import argparse
 import json
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
@@ -149,17 +150,42 @@ def render_markdown_table(rows: list[CommunityRow]) -> str:
     return "\n".join([header, separator, *body])
 
 
+def _artifact_is_complete(data: dict[str, object]) -> bool:
+    """A well-formed community artifact carries a `machine` block with a real `chip` and
+    an int `ram_gib` (what `summarize_row` needs to avoid the "?" chip / "0" RAM
+    degenerate row) and a `benches` list. Either missing/malformed is a partial artifact
+    -- caught here so `load_community_artifacts` can skip it with a named warning
+    instead of silently rendering the degenerate row."""
+    machine = data.get("machine")
+    if not isinstance(machine, dict):
+        return False
+    if not machine.get("chip") or not isinstance(machine.get("ram_gib"), int):
+        return False
+    return isinstance(data.get("benches"), list)
+
+
 def load_community_artifacts(directory: Path) -> list[dict[str, object]]:
-    """Every parseable `*.json` in `directory` (a corrupt file is skipped, not fatal). The
-    submission `README.md` is not `*.json`, so it is naturally ignored."""
+    """Every well-formed `*.json` artifact in `directory`. A corrupt/unparseable file, or
+    a valid-but-partial one (missing/malformed `machine` or `benches`), is skipped with a
+    warning NAMING the file printed to stderr -- never silently, and never folded into a
+    degenerate `?` chip / `0` RAM table row. The submission `README.md` is not `*.json`,
+    so it is naturally ignored."""
     artifacts: list[dict[str, object]] = []
     for path in sorted(directory.glob("*.json")):
         try:
             data = json.loads(path.read_text())
-        except (json.JSONDecodeError, OSError):
+        except (json.JSONDecodeError, OSError) as exc:
+            print(f"warning: skipping unparseable community artifact {path}: {exc}",
+                  file=sys.stderr)
             continue
-        if isinstance(data, dict):
-            artifacts.append(cast(dict[str, object], data))
+        if not isinstance(data, dict) or not _artifact_is_complete(data):
+            print(
+                f"warning: skipping partial/malformed community artifact {path} "
+                "(missing or incomplete 'machine'/'benches')",
+                file=sys.stderr,
+            )
+            continue
+        artifacts.append(cast(dict[str, object], data))
     return artifacts
 
 

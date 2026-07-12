@@ -63,3 +63,9 @@ class UnsupportedAttentionError(MlxTrainPerfError):
 class AttentionInputError(MlxTrainPerfError):
     """Shape validation failure at the flash_attention boundary (non-4D tensors,
     Hq not a multiple of Hkv, mismatched N/D/batch across q/k/v)."""
+
+
+class MachineDetectionError(MlxTrainPerfError):
+    """A machine-detection reader (e.g. `sysctl` for the CPU brand string) failed --
+    subprocess/OS errors are mapped here so they hit the package's typed tool-error exit
+    policy (2) instead of escaping as an uncaught traceback (exit 1)."""

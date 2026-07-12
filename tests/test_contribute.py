@@ -12,6 +12,7 @@ The real quick-tier run (a heavy GPU job) is the controller's `--run-smoke` step
 this suite.
 """
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -21,6 +22,7 @@ from mlx_train_perf.contribute import (
     COMMUNITY_SCHEMA_VERSION,
     ContributionResult,
     MachineInfo,
+    Preflight,
     artifact_filename,
     benches_for_tier,
     build_community_artifact,
@@ -37,11 +39,12 @@ from mlx_train_perf.contribute import (
     ram_class_for,
     ram_gib_from_bytes,
     run_contribution,
+    run_preflight,
     shapes_for_ram,
     summarize_artifact_file,
 )
 from mlx_train_perf.core.guards import EffectiveCeiling
-from mlx_train_perf.errors import BenchInputError, MemoryBudgetError
+from mlx_train_perf.errors import BenchInputError, MachineDetectionError, MemoryBudgetError
 
 # --- machine detection: pure parsing --------------------------------------------------
 
@@ -221,6 +224,109 @@ def test_evaluate_preflight_surfaces_the_divergence_warning_prominently() -> Non
     pf = evaluate_preflight(memory_pressure_state="normal", on_ac_power=True, ceiling=ceiling)
     assert pf.ok is True
     assert any("20 GB" in w for w in pf.warnings)
+
+
+# --- run_preflight: the standalone, pre-confirmation seam (finding A) -----------------
+
+
+def test_run_preflight_runs_before_any_confirmation_is_required() -> None:
+    """`run_preflight` is a self-contained seam the CLI calls BEFORE prompting for
+    confirmation (finding A) -- it takes no `confirm` input at all, so there is no way
+    to gate it behind a confirmation step."""
+    pf = run_preflight(
+        ceiling_reader=lambda: EffectiveCeiling(ceiling_bytes=1, warning=None),
+        memory_pressure_reader=lambda: "System-wide memory free percentage: 91%",
+        ac_power_reader=lambda: True,
+    )
+    assert pf == Preflight(ok=True, refusal=None, warnings=())
+
+
+def test_run_preflight_surfaces_the_divergence_warning() -> None:
+    pf = run_preflight(
+        ceiling_reader=lambda: EffectiveCeiling(
+            ceiling_bytes=1, warning="measured available 20 GB is far below 58 GB",
+        ),
+        memory_pressure_reader=lambda: "System-wide memory free percentage: 91%",
+        ac_power_reader=lambda: True,
+    )
+    assert pf.ok is True
+    assert any("20 GB" in w for w in pf.warnings)
+
+
+def test_run_preflight_refuses_on_red_memory_without_raising() -> None:
+    pf = run_preflight(
+        ceiling_reader=lambda: EffectiveCeiling(ceiling_bytes=1, warning=None),
+        memory_pressure_reader=lambda: "System-wide memory free percentage: 3%",
+        ac_power_reader=lambda: True,
+    )
+    assert pf.ok is False
+    assert pf.refusal is not None
+
+
+def test_run_preflight_turns_a_too_crowded_memory_budget_error_into_a_clean_refusal() -> None:
+    def _raises() -> EffectiveCeiling:
+        raise MemoryBudgetError("machine too crowded to start safely")
+
+    pf = run_preflight(
+        ceiling_reader=_raises,
+        memory_pressure_reader=lambda: "System-wide memory free percentage: 91%",
+        ac_power_reader=lambda: True,
+    )
+    assert pf.ok is False
+    assert "crowded" in (pf.refusal or "")
+
+
+def test_run_contribution_accepts_a_precomputed_preflight_and_skips_its_own_readers(
+    tmp_path: Path,
+) -> None:
+    """When the caller (the CLI, per finding A) already ran `run_preflight` before the
+    confirmation prompt, `run_contribution` must use that decision AS-IS rather than
+    re-invoking the readers a second time."""
+    reader_calls: list[str] = []
+
+    def _spy_ceiling() -> EffectiveCeiling:
+        reader_calls.append("ceiling")
+        return EffectiveCeiling(ceiling_bytes=20 * 1024**3, warning=None)
+
+    def _spy_mp() -> str:
+        reader_calls.append("memory_pressure")
+        return "System-wide memory free percentage: 91%"
+
+    def _spy_ac() -> bool:
+        reader_calls.append("ac_power")
+        return True
+
+    precomputed = Preflight(ok=True, refusal=None, warnings=("precomputed warning",))
+    result = run_contribution(
+        tier="quick", out_dir=tmp_path, confirm=True, machine=_machine(),
+        preflight=precomputed,
+        ceiling_reader=_spy_ceiling, memory_pressure_reader=_spy_mp, ac_power_reader=_spy_ac,
+        measure=lambda *a, **k: [_fake_artifact(tmp_path, "loss_layer_c0", "ok")],  # noqa: ARG005
+        today=lambda: "2026-07-12",
+    )
+    assert reader_calls == []                          # the precomputed decision was reused
+    assert result.warnings == ("precomputed warning",)
+
+
+def test_run_contribution_refuses_using_a_precomputed_red_preflight_before_measuring(
+    tmp_path: Path,
+) -> None:
+    called: list[str] = []
+
+    def _spy_measure(bench: str, **_kw: object) -> list[Path]:
+        called.append(bench)
+        return []
+
+    precomputed = Preflight(ok=False, refusal="system memory pressure is critical (red)",
+                             warnings=())
+    result = run_contribution(
+        tier="quick", out_dir=tmp_path, confirm=True, machine=_machine(),
+        preflight=precomputed,
+        measure=_spy_measure, today=lambda: "2026-07-12",
+    )
+    assert result.refused is True
+    assert result.refusal == "system memory pressure is critical (red)"
+    assert called == []
 
 
 # --- community artifact schema --------------------------------------------------------
@@ -509,6 +615,135 @@ def test_spawn_script_runs_a_subprocess_and_globs_the_output(tmp_path: Path) -> 
     assert [p.name for p in paths] == ["c0.json"]
 
 
+def test_spawn_script_records_a_crash_envelope_when_rc_nonzero_and_nothing_was_written(
+    tmp_path: Path,
+) -> None:
+    """Finding B: a script that crashes before writing ANY artifact must not glob-read
+    as a clean, empty bench -- `_spawn_script` mirrors `bench.runner.run_conditions`'s
+    `WorkerCrashed` envelope (status "error", error_type, a stderr tail) instead."""
+    code = "import sys; print('boom explanation', file=sys.stderr); sys.exit(3)"
+    paths = contribute._spawn_script(["-c", code], out_dir=tmp_path)
+    assert len(paths) == 1
+    data = json.loads(paths[0].read_text())
+    assert data["status"] == "error"
+    assert data["error_type"] == "WorkerCrashed"
+    assert "boom explanation" in data["error_msg"]
+    assert data["returncode"] == 3
+
+
+def test_spawn_script_respects_a_partial_artifact_the_crashed_script_already_wrote(
+    tmp_path: Path,
+) -> None:
+    """A script that wrote its OWN honest partial record before crashing (e.g. a
+    condition-level watchdog breach) must be respected, not clobbered by a synthetic
+    crash envelope -- same reasoning as `bench.runner.run_conditions`'s own crash path."""
+    code = (
+        f"import pathlib, json, sys; "
+        f"(pathlib.Path({str(tmp_path)!r})/'c0.json').write_text(json.dumps("
+        f"{{'status': 'aborted_memory_ceiling'}})); sys.exit(70)"
+    )
+    paths = contribute._spawn_script(["-c", code], out_dir=tmp_path)
+    assert [p.name for p in paths] == ["c0.json"]
+    data = json.loads(paths[0].read_text())
+    assert data["status"] == "aborted_memory_ceiling"    # untouched -- not overwritten
+
+
+def test_spawn_script_clean_exit_with_no_output_is_not_a_crash(tmp_path: Path) -> None:
+    """A script that exits 0 but legitimately writes nothing (an empty grid) is not the
+    crash case this finding targets -- no synthetic error artifact is invented."""
+    paths = contribute._spawn_script(["-c", "pass"], out_dir=tmp_path)
+    assert paths == []
+
+
+# --- _contribute_session_id: deterministic, resumable across invocations (finding D) ---
+
+
+def test_contribute_session_id_is_stable_for_the_same_recipe() -> None:
+    grid = shapes_for_ram(32)
+    id_a = contribute._contribute_session_id(machine=_machine(), tier="quick", grid=grid)
+    id_b = contribute._contribute_session_id(machine=_machine(), tier="quick", grid=grid)
+    assert id_a == id_b
+
+
+def test_contribute_session_id_changes_with_tier() -> None:
+    grid = shapes_for_ram(32)
+    id_quick = contribute._contribute_session_id(machine=_machine(), tier="quick", grid=grid)
+    id_full = contribute._contribute_session_id(machine=_machine(), tier="full", grid=grid)
+    assert id_quick != id_full
+
+
+def test_contribute_session_id_changes_with_the_shape_grid() -> None:
+    id_32 = contribute._contribute_session_id(
+        machine=_machine(), tier="quick", grid=shapes_for_ram(32),
+    )
+    id_16 = contribute._contribute_session_id(
+        machine=_machine(), tier="quick", grid=shapes_for_ram(16),
+    )
+    assert id_32 != id_16
+
+
+def test_contribute_session_id_changes_with_the_machine() -> None:
+    other_machine = MachineInfo(chip="Apple M2 Ultra", ram_gib=32, ram_bytes=34359738368,
+                                macos="15.5", mlx_version="0.32.0", package_version="0.2.0")
+    grid = shapes_for_ram(32)
+    id_a = contribute._contribute_session_id(machine=_machine(), tier="quick", grid=grid)
+    id_b = contribute._contribute_session_id(machine=other_machine, tier="quick", grid=grid)
+    assert id_a != id_b
+
+
+def _fake_artifact_with_session(
+    out_dir: Path, name: str, session_id: str, status: str, **fields: object,
+) -> Path:
+    ident = {
+        "schema_version": 1, "mlx_version": "0.32.0", "machine": "arm64",
+        "code_sha": "deadbeef", "session_id": session_id, "impl": "kernel", "n": 8192,
+    }
+    path = out_dir / f"{name}.json"
+    path.write_text(json.dumps({"identity": ident, "status": status, **fields}))
+    return path
+
+
+def test_run_contribution_reuses_the_session_id_and_resumes_across_invocations(
+    tmp_path: Path,
+) -> None:
+    """Finding D: two `run_contribution` calls with the SAME (machine, tier, grid) must
+    get the SAME session id, and a `measure` seam that resume-skips fresh artifacts
+    (exactly what `bench.runner.run_conditions` does, gated on `identity.session_id`)
+    must spawn nothing the second time."""
+    session_ids: list[str] = []
+    spawned: list[str] = []
+
+    def _resuming_measure(
+        bench: str, *, grid: object, out_dir: Path, session_id: str, machine: object,  # noqa: ARG001
+    ) -> list[Path]:
+        session_ids.append(session_id)
+        out_path = out_dir / f"{bench}_c0.json"
+        if out_path.exists():
+            existing = json.loads(out_path.read_text())
+            if existing["identity"]["session_id"] == session_id:
+                return [out_path]              # fresh -- resume-skip, no "spawn"
+        spawned.append(bench)
+        return [_fake_artifact_with_session(out_dir, f"{bench}_c0", session_id, "ok",
+                                            marginal_peak_gb=0.0006, wall_s=1.2)]
+
+    def _run() -> ContributionResult:
+        return run_contribution(
+            tier="quick", out_dir=tmp_path, confirm=True, machine=_machine(),
+            preflight=Preflight(ok=True, refusal=None, warnings=()),
+            measure=_resuming_measure, today=lambda: "2026-07-12",
+        )
+
+    _run()
+    first_ids, first_spawned = list(session_ids), list(spawned)
+    session_ids.clear()
+    spawned.clear()
+
+    _run()                                                 # SAME recipe, second invocation
+    assert session_ids == first_ids                        # stable session id
+    assert first_spawned != []                              # first run actually measured
+    assert spawned == []                                    # second run resumed, spawned nothing
+
+
 def test_real_non_metal_readers_return_plausible_values() -> None:
     """The subprocess/platform readers (chip, macOS, memory_pressure, AC power, date,
     package version) run on any macOS without a Metal device -- exercised for real, unlike
@@ -519,6 +754,43 @@ def test_real_non_metal_readers_return_plausible_values() -> None:
     assert contribute._read_package_version()
     assert len(contribute._today()) == 10                # YYYY-MM-DD
     assert isinstance(contribute._read_macos(), str)
+
+
+# --- _read_chip: subprocess failures map to the typed tool-error path (finding E) -----
+
+
+def test_read_chip_wraps_a_called_process_error_in_a_typed_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failing `sysctl` (nonzero exit under `check=True`) must not escape as a raw
+    `CalledProcessError` -- that traceback would bypass `main`'s `MlxTrainPerfError`
+    catch and exit 1 (an uncaught crash) instead of the package's tool-error exit 2."""
+    def _raise(*_a: object, **_kw: object) -> subprocess.CompletedProcess[str]:
+        raise subprocess.CalledProcessError(1, ["sysctl", "-n", "machdep.cpu.brand_string"])
+
+    monkeypatch.setattr(contribute.subprocess, "run", _raise)
+    with pytest.raises(MachineDetectionError, match="sysctl"):
+        contribute._read_chip()
+
+
+def test_read_chip_wraps_a_timeout_in_a_typed_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _raise(*_a: object, **_kw: object) -> subprocess.CompletedProcess[str]:
+        raise subprocess.TimeoutExpired(cmd=["sysctl"], timeout=10)
+
+    monkeypatch.setattr(contribute.subprocess, "run", _raise)
+    with pytest.raises(MachineDetectionError):
+        contribute._read_chip()
+
+
+def test_read_chip_wraps_a_missing_binary_in_a_typed_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _raise(*_a: object, **_kw: object) -> subprocess.CompletedProcess[str]:
+        raise FileNotFoundError("sysctl")
+
+    monkeypatch.setattr(contribute.subprocess, "run", _raise)
+    with pytest.raises(MachineDetectionError):
+        contribute._read_chip()
 
 
 # --- controller's Step 2: the real quick-tier run (gated, NOT run in this suite) -------
