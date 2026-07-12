@@ -20,9 +20,15 @@ forward and one full `value_and_grad` backward, so Metal JIT for every kernel --
 the uncalibrated D-preprocess, whose first dispatch is backward-only -- and, for `flash`,
 the construction-time rate/table calibration land OUTSIDE any timed/peak window):
 
-  fwd_peak_gb    -- one forward-only call.
+  fwd_peak_gb    -- forward-only calls; `fwd_wall_s` is the MEDIAN of `WALL_REPS` such
+                    calls (per-rep walls in `fwd_walls_s`, peak spans all reps).
   fwdbwd_peak_gb -- `mx.value_and_grad` over `attn(...).sum()` w.r.t. (q, k, v); `wall_s`
                     is the MEDIAN of `WALL_REPS` such calls (per-rep walls in `walls_s`).
+
+The artifact also records the forward/backward decomposition itself (`bwd_wall_s` =
+median fwd+bwd wall minus median forward wall, and `bwd_over_fwd`) -- see
+`decompose_walls`. Any public forward-vs-backward split figure quotes THESE recorded
+fields, reproducible from this one script.
 
 The O(N) PROOF is `fwdbwd_peak_gb`'s doubling ratio across `--seq-lens`: flash should show
 ~2x per doubling (O(N)-class), stock ~3.8x (the measured O(N^2) baseline, spec §8). That
@@ -162,6 +168,22 @@ def compute_doubling_ratios(
     return ratios
 
 
+def decompose_walls(
+    fwd_walls_s: Sequence[float], fwdbwd_walls_s: Sequence[float],
+) -> dict[str, float]:
+    """Median forward wall, the backward remainder (median fwd+bwd wall minus median
+    forward wall), and their ratio -- the recorded quantities behind any forward/backward
+    split this bench's artifact backs. Pure math over the two per-rep wall lists (both
+    non-empty); `bwd_over_fwd` is omitted when the forward median is not positive, so a
+    degenerate input never divides by zero."""
+    fwd = float(statistics.median(fwd_walls_s))
+    bwd = float(statistics.median(fwdbwd_walls_s)) - fwd
+    split = {"fwd_wall_s": fwd, "bwd_wall_s": bwd}
+    if fwd > 0:
+        split["bwd_over_fwd"] = bwd / fwd
+    return split
+
+
 def _params_for(condition: AttnCondition) -> dict[str, object]:
     return {
         "n": condition.n, "head_dim": condition.head_dim, "heads": condition.heads,
@@ -235,8 +257,12 @@ def measure_condition(
 
     active_before_fwd = mx.get_active_memory()
     mx.reset_peak_memory()
-    o = _attn_call(condition, q, k, v, scale=scale)
-    mx.eval(o)
+    fwd_walls: list[float] = []
+    for _ in range(WALL_REPS):
+        t0 = time.perf_counter()
+        o = _attn_call(condition, q, k, v, scale=scale)
+        mx.eval(o)
+        fwd_walls.append(time.perf_counter() - t0)
     fwd_peak_gb = (mx.get_peak_memory() - active_before_fwd) / 1024**3
 
     mx.synchronize()   # settle the fwd window's transient releases before the snapshot
@@ -252,6 +278,7 @@ def measure_condition(
     wall_s = statistics.median(walls)
     fwdbwd_peak_gb = (mx.get_peak_memory() - active_before_bwd) / 1024**3
 
+    split = decompose_walls(fwd_walls, walls)
     return {
         "impl": condition.impl,
         "n": condition.n,
@@ -259,6 +286,13 @@ def measure_condition(
         "fwdbwd_peak_gb": round(fwdbwd_peak_gb, 4),
         "wall_s": round(wall_s, 6),
         "walls_s": [round(w, 6) for w in walls],
+        "fwd_wall_s": round(split["fwd_wall_s"], 6),
+        "fwd_walls_s": [round(w, 6) for w in fwd_walls],
+        "bwd_wall_s": round(split["bwd_wall_s"], 6),
+        **(
+            {"bwd_over_fwd": round(split["bwd_over_fwd"], 4)}
+            if "bwd_over_fwd" in split else {}
+        ),
     }
 
 
