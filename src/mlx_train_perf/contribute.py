@@ -1,4 +1,4 @@
-"""Community hardware-measurement contribution kit (backlog 0015, spec §7).
+"""Community hardware-measurement contribution kit.
 
 One command (`mlx-train-perf contribute`) that any Apple-Silicon user can run to measure
 this project's committed benchmarks on THEIR machine and submit the numbers back. It
@@ -17,9 +17,9 @@ Safety on UNKNOWN hardware is the design center. The kit does NOT install its ow
 watchdog: every bench it runs (via `bench.runner.run_conditions` for loss_layer/
 train_step, and the committed `bench_attention_op`/`northstar_context_sweep` scripts for
 the attention and context probes) already installs the device-clamped wired cap plus the
-two-term dynamic memory watchdog (backlog 0021). The kit's job is provenance -- it
+two-term dynamic memory watchdog. The kit's job is provenance -- it
 propagates any `memory_warning` those artifacts recorded into the community artifact, and
-surfaces the 0021 divergence warning prominently in the pre-flight so someone on a crowded
+surfaces the divergence warning prominently in the pre-flight so someone on a crowded
 machine sees "expected ~58 GB free, measured 20 GB" before burning an hour.
 
 Claims policy: community numbers are "measured on contributor hardware", never
@@ -95,7 +95,7 @@ def machine_slug(*, chip: str, ram_gib: int) -> str:
 
 
 def artifact_filename(*, chip: str, ram_gib: int, date: str) -> str:
-    """`<chip>-<ram>gb-<yyyy-mm-dd>.json` (spec §7 convention)."""
+    """`<chip>-<ram>gb-<yyyy-mm-dd>.json`."""
     return f"{machine_slug(chip=chip, ram_gib=ram_gib)}-{date}.json"
 
 
@@ -106,7 +106,7 @@ def _read_chip() -> str:
     subprocess/OS failure (missing binary, nonzero exit, timeout) is mapped to the typed
     `MachineDetectionError` here, not left to escape as a raw traceback -- `main` only
     catches `MlxTrainPerfError`, so an unmapped `CalledProcessError` would exit 1 (an
-    uncaught crash) instead of this package's tool-error exit 2 (finding E)."""
+    uncaught crash) instead of this package's tool-error exit 2."""
     try:
         out = subprocess.run(
             ["sysctl", "-n", "machdep.cpu.brand_string"],
@@ -249,7 +249,7 @@ def bench_eta_label(bench: str) -> str:
     """The per-bench ETA range as a short `"~N-M min"` label (or `"~N min"` when the
     range collapses to a point) -- the kit-level progress line's "before" text quotes
     this so a contributor sees WHY a bench is expected to take a while, not just its
-    name (review round 2, finding 2)."""
+    name."""
     low, high = _BENCH_ETA_MIN[bench]
     if low == high:
         return f"~{low:.0f} min"
@@ -297,7 +297,7 @@ _WARN_FREE_PCT = 25.0
 def classify_memory_pressure(text: str) -> str:
     """Classify `memory_pressure`'s output as `"normal"`/`"warn"`/`"red"` off its
     `System-wide memory free percentage: N%` line. A missing/unparseable line degrades to
-    `"normal"` -- the real panic guard is the effective-ceiling refusal (the two-term 0021
+    `"normal"` -- the real panic guard is the effective-ceiling refusal (the two-term
     watchdog each bench installs), not this coarse gate, so a parse hiccup must never
     falsely block a healthy machine."""
     import re  # noqa: PLC0415
@@ -321,7 +321,7 @@ def evaluate_preflight(
     `MemoryBudgetError`, handled in `run_contribution`). Everything else proceeds with
     WARNINGS: running on battery (measurements drift under power throttling), an elevated
     memory-pressure state, and -- surfaced prominently, this is the kit's audience -- the
-    0021 divergence warning (`expected ~N GB free, measured M GB`) the effective ceiling
+    divergence warning (`expected ~N GB free, measured M GB`) the effective ceiling
     recorded."""
     warnings: list[str] = []
     refusal: str | None = None
@@ -376,7 +376,7 @@ def summarize_bench(bench: str, paths: list[Path]) -> dict[str, object]:
 
 def _bench_status_label(summary: dict[str, object]) -> str:
     """Short completion status for the kit-level progress line's "after" text -- `"N/M
-    ok"` over the conditions this bench produced (review round 2, finding 2). An
+    ok"` over the conditions this bench produced. An
     empty-condition bench reads as `"0/0 ok"`, not an error -- some benches legitimately
     produce zero conditions on a degenerate grid."""
     conditions = cast(list[dict[str, object]], summary["conditions"])
@@ -386,9 +386,9 @@ def _bench_status_label(summary: dict[str, object]) -> str:
 
 
 def collect_memory_warnings(bench_summaries: list[dict[str, object]]) -> list[str]:
-    """Every distinct `memory_warning` any underlying bench artifact recorded (0021
-    divergence / degraded-vm_stat start), in first-seen order -- the provenance the
-    maintainer needs to weight a crowded-machine submission."""
+    """Every distinct `memory_warning` any underlying bench artifact recorded (divergence
+    / degraded-vm_stat start), in first-seen order -- the provenance the maintainer needs
+    to weight a crowded-machine submission."""
     seen: list[str] = []
     for bench in bench_summaries:
         for condition in cast(list[dict[str, object]], bench["conditions"]):
@@ -516,7 +516,7 @@ _SPAWN_STDERR_TAIL_CHARS = 4000  # same convention as bench.runner._STDERR_TAIL_
 def _spawn_crash_artifact(
     out_dir: Path, *, argv: list[str], proc: subprocess.CompletedProcess[str],
 ) -> Path:
-    """Finding B: mirror `bench.runner.run_conditions`'s `WorkerCrashed` envelope for a
+    """Mirror `bench.runner.run_conditions`'s `WorkerCrashed` envelope for a
     spawned bench SCRIPT (`bench_attention_op.py` / `northstar_context_sweep.py`), not
     just the in-package `Condition` workers. A script that crashes (nonzero exit) before
     writing ANY artifact of its own must not glob-read as a clean, empty bench -- that
@@ -541,13 +541,13 @@ def _spawn_script(argv: list[str], *, out_dir: Path) -> list[Path]:
     kit just points it at `out_dir` and collects the resulting per-condition artifacts.
     Output is captured (not streamed) -- the same convention `bench.runner._spawn_worker`
     already uses for in-package workers -- so a crash's stderr is available for
-    `_spawn_crash_artifact` (finding B). A nonzero exit that left an artifact behind (the
+    `_spawn_crash_artifact`. A nonzero exit that left an artifact behind (the
     script wrote its own honest partial record, e.g. a condition-level watchdog breach,
     before dying) is respected as-is, never overwritten by a synthetic crash record --
     same reasoning as `run_conditions`'s own crash-envelope path.
 
-    Review round 2, finding 1: `_spawn_crash_artifact` writes a FIXED filename
-    (`_spawn_crashed.json`), and this kit's session id is now deterministic (finding D),
+    `_spawn_crash_artifact` writes a FIXED filename
+    (`_spawn_crashed.json`), and this kit's session id is now deterministic,
     so the SAME `out_dir` is reused across invocations for the same recipe. A stale
     marker from an earlier crash must not glob-read as part of THIS call's result
     forever -- unlink it before respawning, mirroring `bench.runner.run_conditions`'s
@@ -639,10 +639,10 @@ def run_preflight(
     memory_pressure_reader: Callable[[], str] = _read_memory_pressure,
     ac_power_reader: Callable[[], bool] = _read_on_ac_power,
 ) -> Preflight:
-    """Run the pre-flight checks (the 0021 memory ceiling/divergence, `memory_pressure`,
+    """Run the pre-flight checks (the memory ceiling/divergence, `memory_pressure`,
     AC power) and return the `Preflight` decision, WITHOUT taking any confirmation input
-    -- this is the standalone seam the CLI calls BEFORE prompting for confirmation
-    (finding A). The kit's README promises the pre-flight warning names the
+    -- this is the standalone seam the CLI calls BEFORE prompting for confirmation.
+    The kit's README promises the pre-flight warning names the
     expected-vs-measured memory gap "so you can close other apps and retry"; that promise
     only holds if the warning is on screen before any heavy work starts, which requires it
     to run (and be printed) ahead of the confirmation prompt, not folded into the same
@@ -722,7 +722,7 @@ def run_contribution(
     through the injectable `measure` seam, and finally write ONE provenance-complete
     community artifact plus the pre-filled PR text.
 
-    `preflight`, when given, is used AS-IS instead of being recomputed (finding A): the
+    `preflight`, when given, is used AS-IS instead of being recomputed: the
     CLI runs `run_preflight` itself BEFORE the confirmation prompt (so its warnings print
     ahead of it, and a refusal is shown before ever asking to proceed) and passes the
     result through here rather than paying for the readers a second time. A direct
