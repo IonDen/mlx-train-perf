@@ -21,9 +21,10 @@ end-to-end against SYNTHETIC (fabricated) manifest/config/artifact files written
 temp directory -- never against a real `run_train_step` artifact, since none exist yet
 (the production benches have not been run). `--dry-run` prints the fitted constants
 without writing anything -- the safe default for a first look at real numbers. The
-controller runs this for real, against real artifacts, after the production runs;
-`src/mlx_train_perf/plan/calibration_data.json`'s own committed constants are left
-untouched by this task.
+controller runs this for real, against real artifacts, after the production runs. The
+committed `src/mlx_train_perf/plan/calibration_data.json` now carries measured
+coefficients: the stock terms are the original 0.31.2-era campaign carried forward, and
+the flash coefficient was fit on 0.32.0.
 """
 import argparse
 import json

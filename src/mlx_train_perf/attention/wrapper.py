@@ -1,7 +1,7 @@
 """`enable_flash_attention`: the opt-in, per-model-instance mlx-lm integration wrapper.
 
 Replaces each decoder layer's `self_attn` with a `FlashAttentionWrapper` that routes the
-post-RoPE attention through T4's `flash_attention` (kernel forward + kernel backward) --
+post-RoPE attention through `flash_attention` (kernel forward + kernel backward) --
 the training-only path this whole 0.2.0 release exists to switch on.
 
 Verified against the installed mlx-lm==0.31.3 (mlx==0.32.0) source, 2026-07-09:
@@ -25,13 +25,13 @@ Verified against the installed mlx-lm==0.31.3 (mlx==0.32.0) source, 2026-07-09:
      assigning a submodule stores it as a child; assigning an int/float/str stores a plain
      attribute -- verified against the installed `nn.Module.__setattr__`.)
 
-- **Call-time mask contract** (review-mlx): in the real training path
+- **Call-time mask contract**: in the real training path
   `mlx_lm.models.base.create_attention_mask` returns the STRING `"causal"` for `N>1` with no
   cache -- THAT is the supported case (-> `causal=True`); `None` (its `N==1` return) also maps
   to causal. Any `mx.array` mask (sliding-window / additive) or any non-`"causal"` string
   raises `AttentionInputError`; any cache raises `AttentionInputError` (training-only path).
 
-- **Pre-calibration** (inherited from the T5 review, binding): `flash_attention`'s kernel
+- **Pre-calibration**: `flash_attention`'s kernel
   path runs a host-synced rate probe from its Python body at construction time -- harmless
   under `mx.grad`, but under mlx-lm's compiled `train()` the FIRST trace would host-sync
   inside the compiled region. `enable_flash_attention` therefore PRE-WARMS all three rate
@@ -198,8 +198,11 @@ def enable_flash_attention(
     kernel impl, pre-warm the kernel rate caches at that shape so a subsequently compiled
     `train()` traces without a host-synced calibration inside the compiled region (see
     `_prewarm_rate_caches`). Pass hints matching your training shape when you will run the
-    enabled model through mlx-lm's compiled `train()`. When omitted, enable still succeeds --
-    eager / `mx.grad` callers calibrate lazily and harmlessly on the first attention call.
+    enabled model through mlx-lm's compiled `train()`. The hints are load-bearing there: a
+    compiled `train()` traced at a shape the caches were not warmed for host-syncs inside the
+    compiled region and RAISES during the trace, a loud failure rather than a silent
+    slowdown. When omitted, enable still succeeds -- eager / `mx.grad` callers calibrate
+    lazily and harmlessly on the first attention call.
 
     Refuses (`UnsupportedAttentionError`): an unsupported model family; a sliding-window or
     mixed `layer_types` model (`layer_types` entry != "full_attention", or any `use_sliding`

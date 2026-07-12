@@ -1,11 +1,11 @@
-"""`flash_attention` public API -- reference-backed v0 (spec Section 4.1).
+"""`flash_attention` public API.
 
-The full custom_function boundary working BEFORE any Metal kernel exists: forward
-routes through T3's `flash_attention_reference`, backward is a hand-written pure-MLX
-vjp (the FlashAttention paper's backward equations, over full un-tiled tensors). T5
-swaps a Metal kernel in underneath this surface without changing it.
+The full custom_function boundary. The reference forward routes through
+`flash_attention_reference`; its backward is a hand-written pure-MLX vjp (the
+FlashAttention paper's backward equations, over full un-tiled tensors). The Metal kernel
+swaps in underneath this surface without changing it.
 
-Residual contract (review-mlx): the inner `mx.custom_function`-decorated core returns
+Residual contract: the inner `mx.custom_function`-decorated core returns
 `(O, L)` -- `L` is a real tuple OUTPUT, never a closure-captured stash (closure arrays
 are CONSTANTS under compile/checkpoint recompute). The public `flash_attention` does
 `o, _ = core_fn(...)`, so L's cotangent is always zero and L never leaks to callers;
@@ -13,7 +13,7 @@ the vjp reads `O, L` from `outputs` and `q, k, v` from `primals`.
 
 `impl='reference'` is an ORACLE, never a production path: its backward materializes
 the full `(N, N)` score/probability matrices, reintroducing the exact O(N^2) peak this
-feature exists to remove. Every caller (here, in tests, and in T5+) must fence it to
+feature exists to remove. Every caller (here and in tests) must fence it to
 tiny N -- never run it at flagship context.
 """
 from collections.abc import Callable
@@ -75,7 +75,7 @@ def resolve_attention_impl(
 ) -> str:
     """"reference" is always allowed (the oracle). "auto"/"kernel" run the full
     kernel-support gate (dtype, head_dim, causal, Metal availability, mlx-verified) and,
-    when every gate passes, resolve to "kernel" (T5 -- the Metal forward is built). An
+    when every gate passes, resolve to "kernel". An
     unsupported dtype/head_dim/causal/device raises `UnsupportedAttentionError` with a
     pointer to impl="reference"; there is no silent fallback."""
     _validate_shapes(q, k, v)
@@ -117,7 +117,7 @@ def _bwd_D(d_o: mx.array, o: mx.array) -> mx.array:  # noqa: N802 -- D is the pa
 
 
 def _kv_gather(x: mx.array, *, hq: int, hkv: int) -> mx.array:
-    """Gathers K or V per q-head via the T2/T3-pinned contiguous GQA convention
+    """Gathers K or V per q-head via the pinned contiguous GQA convention
     (`kv_head_for`), matching flash_attention_reference's own forward gather."""
     group_size = hq // hkv
     head_idx = mx.array([kv_head_for(h, group_size) for h in range(hq)])
@@ -179,9 +179,9 @@ def flash_attention(
     impl: Literal["auto", "kernel", "reference"] = "auto",
 ) -> mx.array:
     """`softmax(scale * Q K^T + causal_mask) @ V`, GQA via the pinned contiguous
-    convention. `impl='auto'`/`'kernel'` route the FORWARD through the T5 Metal kernel
+    convention. `impl='auto'`/`'kernel'` route the FORWARD through the Metal kernel
     (O + L, query-range split) AND the BACKWARD through the fully kernel-backed vjp
-    (T7 D + T8 dQ + T9 chained dK/dV) -- the (N, N) score matrix is never materialized on
+    (D + dQ + chained dK/dV) -- the (N, N) score matrix is never materialized on
     either pass; the two per-kernel backward split rates are calibrated at construction and
     closure-captured.
     `impl='reference'` is the oracle (never a production path): its backward materializes the
