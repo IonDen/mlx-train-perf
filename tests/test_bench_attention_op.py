@@ -30,6 +30,7 @@ from bench_attention_op import (  # noqa: E402
     AttnCondition,
     build_conditions,
     compute_doubling_ratios,
+    decompose_walls,
     main,
     run_grid,
     script_sha,
@@ -153,6 +154,37 @@ def test_compute_doubling_ratios_keeps_impls_independent() -> None:
     ratios = compute_doubling_ratios(entries)
     assert set(ratios) == {"flash", "stock"}
     assert ratios["flash"]["2048->4096"] != ratios["stock"]["2048->4096"]
+
+
+# ---------------------------------------------------------------------------
+# decompose_walls: pure fwd/bwd wall decomposition over the two per-rep wall lists --
+# the recorded quantities behind the README's forward/backward split claim (RC review
+# finding 2: the split must come from THIS committed script's artifact, not from
+# gitignored development runs).
+# ---------------------------------------------------------------------------
+
+
+def test_decompose_walls_medians_and_backward_remainder() -> None:
+    split = decompose_walls([0.1, 0.2, 0.3], [0.5, 0.7, 0.6])
+    assert split["fwd_wall_s"] == pytest.approx(0.2)
+    assert split["bwd_wall_s"] == pytest.approx(0.4)
+    assert split["bwd_over_fwd"] == pytest.approx(2.0)
+
+
+def test_decompose_walls_uses_medians_not_means() -> None:
+    # One wild outlier per list must not move the decomposition.
+    split = decompose_walls([0.1, 0.1, 10.0], [0.3, 0.3, 30.0])
+    assert split["fwd_wall_s"] == pytest.approx(0.1)
+    assert split["bwd_wall_s"] == pytest.approx(0.2)
+
+
+def test_decompose_walls_omits_ratio_for_a_nonpositive_forward() -> None:
+    # Degenerate (never expected from perf_counter deltas, but the helper is pure):
+    # no division blow-up, the ratio key is simply absent.
+    split = decompose_walls([0.0, 0.0, 0.0], [0.5, 0.5, 0.5])
+    assert split["fwd_wall_s"] == 0.0
+    assert split["bwd_wall_s"] == pytest.approx(0.5)
+    assert "bwd_over_fwd" not in split
 
 
 # ---------------------------------------------------------------------------
@@ -407,5 +439,18 @@ def test_bench_attention_op_tiny_smoke_writes_ok_artifacts_for_both_impls(
         # JIT warmed outside the window, wall no longer single-shot)
         assert len(data["walls_s"]) == bench_attention_op.WALL_REPS
         assert data["wall_s"] == statistics.median(data["walls_s"])
+        # The forward window is rep-timed the same way, and the artifact records the
+        # fwd/bwd decomposition itself (RC review finding 2: the split claim must be
+        # reproducible from this one committed script's output).
+        assert data["fwd_wall_s"] > 0
+        assert len(data["fwd_walls_s"]) == bench_attention_op.WALL_REPS
+        assert data["fwd_wall_s"] == statistics.median(data["fwd_walls_s"])
+        # Identity up to the per-field round(..., 6) applied when the artifact is built.
+        assert data["bwd_wall_s"] == pytest.approx(
+            data["wall_s"] - data["fwd_wall_s"], abs=2e-6,
+        )
+        assert data["bwd_over_fwd"] == pytest.approx(
+            data["bwd_wall_s"] / data["fwd_wall_s"], rel=1e-2,
+        )
     assert flash["impl"] == "flash"
     assert stock["impl"] == "stock"
