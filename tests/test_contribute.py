@@ -528,6 +528,35 @@ def test_run_contribution_refuses_when_not_confirmed(tmp_path: Path) -> None:
     assert result.artifact_path is None
 
 
+def test_run_contribution_prints_kit_level_progress_per_bench_in_order(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Review round 2, finding 2: a full-tier run sat in total silence between the
+    confirmation prompt and the final 'wrote ...' line -- the attention_op/context_probe
+    arm regressed from live inherited subprocess output to fully-captured-and-discarded.
+    `run_contribution` must print a kit-level progress line naming each bench and its
+    position BEFORE calling the measurement seam, and a completion line (status +
+    elapsed) AFTER -- this is the kit's own liveness signal, independent of whatever the
+    (here faked) measurement seam does or doesn't print itself."""
+    def _fake_measure(bench: str, *, out_dir: Path, **_kw: object) -> list[Path]:
+        return [_fake_artifact(out_dir, f"{bench}_c0", "ok")]
+
+    run_contribution(
+        tier="quick", out_dir=tmp_path, confirm=True, machine=_machine(),
+        ceiling_reader=_healthy_ceiling,
+        memory_pressure_reader=lambda: "System-wide memory free percentage: 91%",
+        ac_power_reader=lambda: True,
+        measure=_fake_measure,
+        today=lambda: "2026-07-12",
+    )
+    out = capsys.readouterr().out
+    loss_running = out.index("[1/2] loss_layer")
+    loss_done = out.index("done", loss_running)
+    attn_running = out.index("[2/2] attention_op", loss_done)
+    attn_done = out.index("done", attn_running)
+    assert loss_running < loss_done < attn_running < attn_done
+
+
 def test_run_contribution_returns_a_result_dataclass(tmp_path: Path) -> None:
     result = run_contribution(
         tier="quick", out_dir=tmp_path, confirm=True, machine=_machine(),
@@ -653,6 +682,50 @@ def test_spawn_script_clean_exit_with_no_output_is_not_a_crash(tmp_path: Path) -
     crash case this finding targets -- no synthetic error artifact is invented."""
     paths = contribute._spawn_script(["-c", "pass"], out_dir=tmp_path)
     assert paths == []
+
+
+def test_spawn_script_supersedes_a_stale_crash_marker_on_a_successful_retry(
+    tmp_path: Path,
+) -> None:
+    """Review round 2, finding 1: `_spawn_crash_artifact` writes `out_dir/
+    _spawn_crashed.json` with a FIXED name. Because the kit's session id is now
+    deterministic (finding D), the SAME out_dir is reused across invocations for the
+    same recipe -- a transient crash leaves that fixed-name marker on disk forever, and
+    `_spawn_script`'s glob picks it up on every later call even after a clean retry.
+    Reproduced live: crash -> `['_spawn_crashed.json']`; then a successful retry against
+    the same dir -> `['_spawn_crashed.json', 'attn_seq2048_flash.json']` (the phantom
+    error rides along with the real result). `_spawn_script` must unlink any
+    pre-existing crash marker BEFORE respawning (mirrors bench/runner.py:69-74's
+    remove-stale-artifact-before-respawn reasoning)."""
+    crash_code = "import sys; print('boom explanation', file=sys.stderr); sys.exit(3)"
+    contribute._spawn_script(["-c", crash_code], out_dir=tmp_path)
+    assert (tmp_path / "_spawn_crashed.json").exists()  # sanity: the crash was recorded
+
+    success_code = (
+        f"import pathlib, json; (pathlib.Path({str(tmp_path)!r})/"
+        f"'attn_seq2048_flash.json').write_text(json.dumps({{'status': 'ok'}}))"
+    )
+    paths = contribute._spawn_script(["-c", success_code], out_dir=tmp_path)
+
+    assert [p.name for p in paths] == ["attn_seq2048_flash.json"]  # no phantom entry
+    assert not (tmp_path / "_spawn_crashed.json").exists()  # superseded, not lingering
+
+    summary = contribute.summarize_bench("attention_op", paths)
+    assert [c["name"] for c in summary["conditions"]] == ["attn_seq2048_flash"]
+    assert all(c["status"] != "error" for c in summary["conditions"])
+
+
+def test_spawn_script_crash_marker_still_present_with_no_retry(tmp_path: Path) -> None:
+    """The honest-crash behavior (finding B, round 1) must survive the round-2 fix: a
+    single crash with no follow-up call still leaves the crash envelope on disk and in
+    the returned paths -- unlinking a stale marker before respawning must not also erase
+    a marker THIS call itself just wrote."""
+    crash_code = "import sys; print('boom explanation', file=sys.stderr); sys.exit(3)"
+    paths = contribute._spawn_script(["-c", crash_code], out_dir=tmp_path)
+    assert [p.name for p in paths] == ["_spawn_crashed.json"]
+    data = json.loads(paths[0].read_text())
+    assert data["status"] == "error"
+    assert data["error_type"] == "WorkerCrashed"
 
 
 # --- _contribute_session_id: deterministic, resumable across invocations (finding D) ---
