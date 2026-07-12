@@ -33,6 +33,7 @@ import os
 import platform
 import subprocess
 import sys
+import time
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from datetime import date
@@ -244,6 +245,17 @@ _BENCH_ETA_MIN: dict[str, tuple[float, float]] = {
 }
 
 
+def bench_eta_label(bench: str) -> str:
+    """The per-bench ETA range as a short `"~N-M min"` label (or `"~N min"` when the
+    range collapses to a point) -- the kit-level progress line's "before" text quotes
+    this so a contributor sees WHY a bench is expected to take a while, not just its
+    name (review round 2, finding 2)."""
+    low, high = _BENCH_ETA_MIN[bench]
+    if low == high:
+        return f"~{low:.0f} min"
+    return f"~{low:.0f}-{high:.0f} min"
+
+
 def benches_for_tier(tier: str) -> tuple[str, ...]:
     if tier not in TIERS:
         raise ValueError(f"unknown tier {tier!r}; expected one of {tuple(TIERS)}")
@@ -360,6 +372,17 @@ def summarize_artifact_file(path: Path) -> dict[str, object]:
 
 def summarize_bench(bench: str, paths: list[Path]) -> dict[str, object]:
     return {"bench": bench, "conditions": [summarize_artifact_file(p) for p in paths]}
+
+
+def _bench_status_label(summary: dict[str, object]) -> str:
+    """Short completion status for the kit-level progress line's "after" text -- `"N/M
+    ok"` over the conditions this bench produced (review round 2, finding 2). An
+    empty-condition bench reads as `"0/0 ok"`, not an error -- some benches legitimately
+    produce zero conditions on a degenerate grid."""
+    conditions = cast(list[dict[str, object]], summary["conditions"])
+    total = len(conditions)
+    ok = sum(1 for c in conditions if c.get("status") == "ok")
+    return f"{ok}/{total} ok"
 
 
 def collect_memory_warnings(bench_summaries: list[dict[str, object]]) -> list[str]:
@@ -521,8 +544,19 @@ def _spawn_script(argv: list[str], *, out_dir: Path) -> list[Path]:
     `_spawn_crash_artifact` (finding B). A nonzero exit that left an artifact behind (the
     script wrote its own honest partial record, e.g. a condition-level watchdog breach,
     before dying) is respected as-is, never overwritten by a synthetic crash record --
-    same reasoning as `run_conditions`'s own crash-envelope path."""
+    same reasoning as `run_conditions`'s own crash-envelope path.
+
+    Review round 2, finding 1: `_spawn_crash_artifact` writes a FIXED filename
+    (`_spawn_crashed.json`), and this kit's session id is now deterministic (finding D),
+    so the SAME `out_dir` is reused across invocations for the same recipe. A stale
+    marker from an earlier crash must not glob-read as part of THIS call's result
+    forever -- unlink it before respawning, mirroring `bench.runner.run_conditions`'s
+    remove-stale-artifact-before-respawn reasoning (runner.py:69-74). This is safe for
+    the honest-crash case too: if THIS call also crashes with no artifact, the unlink
+    above already ran before the subprocess started, so `_spawn_crash_artifact` below
+    writes a fresh marker that is never touched by it again."""
     out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "_spawn_crashed.json").unlink(missing_ok=True)
     proc = subprocess.run(
         [sys.executable, *argv], capture_output=True, text=True, check=False,
     )
@@ -732,12 +766,30 @@ def run_contribution(
     session_id = _contribute_session_id(machine=machine, tier=tier, grid=grid)
     work_root = out_dir / "_work"
     summaries: list[dict[str, object]] = []
-    for bench in benches:
+    total_benches = len(benches)
+    # Review round 2, finding 2: between the confirmation prompt and the final "wrote
+    # ..." line, a full-tier run (~1-2 h) previously printed NOTHING -- subprocess output
+    # is captured, not streamed (the honest-crash mechanism at `_spawn_script` needs the
+    # capture), so silence read as a hang. These kit-level lines are the liveness signal:
+    # printed by THIS function around each `measure` call, independent of whatever the
+    # (captured) subprocess does or doesn't print itself. Flushed explicitly since stdout
+    # may be line-buffered-off when not attached to a TTY (e.g. piped to a log file).
+    for i, bench in enumerate(benches, start=1):
         bench_dir = work_root / bench
         bench_dir.mkdir(parents=True, exist_ok=True)
+        print(f"[{i}/{total_benches}] {bench} -- running ({bench_eta_label(bench)})...")
+        sys.stdout.flush()
+        started = time.monotonic()
         paths = measure(bench, grid=grid, out_dir=bench_dir, session_id=session_id,
                         machine=machine)
-        summaries.append(summarize_bench(bench, paths))
+        elapsed_s = time.monotonic() - started
+        summary = summarize_bench(bench, paths)
+        summaries.append(summary)
+        print(
+            f"[{i}/{total_benches}] {bench} -- done in {elapsed_s:.0f}s "
+            f"({_bench_status_label(summary)})"
+        )
+        sys.stdout.flush()
 
     generated_date = today()
     artifact = build_community_artifact(
