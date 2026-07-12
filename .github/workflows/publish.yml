@@ -15,13 +15,30 @@ jobs:
           fetch-depth: 0   # hatch-vcs derives the version from the git tag/history
       - uses: astral-sh/setup-uv@v5
       - run: uv build
+      # Refuse a mistyped or dev-versioned tag before anything reaches the (immutable)
+      # PyPI upload: the tag must be exactly vX.Y.Z and dist/ must hold exactly that
+      # version's sdist + wheel. Stdlib-only, so the runner's python3 suffices.
+      - run: python3 scripts/assert_tag_version.py "$GITHUB_REF_NAME" dist/
       - uses: actions/upload-artifact@v4
         with:
           name: dist
           path: dist/
 
+  # The same Metal lane ci.yml gates on (kernel parity suite + the fail_under coverage
+  # gate from pyproject.toml). Publication must depend on it IN THIS workflow -- the
+  # separately-triggered ci.yml run neither blocks nor orders against a tag push, so
+  # without this job a tag could publish before (or despite) a failing kernel gate.
+  metal-tests:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --all-extras
+      - run: uv run pytest tests/ --run-metal --cov=mlx_train_perf
+
   publish:
-    needs: build
+    needs: [build, metal-tests]
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
