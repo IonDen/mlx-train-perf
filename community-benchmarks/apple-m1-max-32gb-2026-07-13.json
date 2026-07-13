@@ -1,0 +1,607 @@
+{
+  "schema_version": 1,
+  "generated_date": "2026-07-13",
+  "tier": "quick",
+  "machine": {
+    "chip": "Apple M1 Max",
+    "ram_gib": 32,
+    "ram_bytes": 34359738368,
+    "macos": "26.5.2",
+    "mlx_version": "0.32.0",
+    "package_version": "0.1.1.dev31+g1717b077f.d20260711"
+  },
+  "shapes": {
+    "ram_class_gib": 32,
+    "loss_n": [
+      512,
+      2048,
+      8192
+    ],
+    "loss_d": 4096,
+    "loss_v": 151936,
+    "attn_seq": [
+      2048,
+      4096,
+      8192
+    ],
+    "attn_head_dim": 128,
+    "attn_heads": 32,
+    "attn_kv_heads": 8,
+    "train_model": "mlx-community/Qwen3-8B-4bit",
+    "train_seq": [
+      2048,
+      8192
+    ],
+    "context_start": 1024,
+    "context_granularity": 256
+  },
+  "benches": [
+    {
+      "bench": "loss_layer",
+      "conditions": [
+        {
+          "name": "loss_layer_n512_kernel",
+          "status": "ok",
+          "identity": {
+            "schema_version": 1,
+            "mlx_version": "0.32.0",
+            "mlx_lm_version": "0.31.3",
+            "machine": "arm64",
+            "macos": "26.5.2",
+            "code_sha": "f1765993faef3a4e",
+            "package_version": "0.1.1.dev31+g1717b077f.d20260711",
+            "kind": "loss_layer",
+            "session_id": "9e26e35673b047c14c4cee13aeb4bb12",
+            "n": 512,
+            "d": 4096,
+            "v": 151936,
+            "dtype": "bfloat16",
+            "impl": "kernel",
+            "reps": 3,
+            "seed": 0
+          },
+          "result": {
+            "wall_s": 0.983649,
+            "wall_s_all": [
+              0.983649,
+              0.98366,
+              0.982386
+            ],
+            "g_mac_per_s": 323.93,
+            "active_before_gb": 1.1631,
+            "marginal_peak_gb": 0.0,
+            "total_peak_gb": 1.1631
+          }
+        },
+        {
+          "name": "loss_layer_n512_chunked",
+          "status": "ok",
+          "identity": {
+            "schema_version": 1,
+            "mlx_version": "0.32.0",
+            "mlx_lm_version": "0.31.3",
+            "machine": "arm64",
+            "macos": "26.5.2",
+            "code_sha": "f1765993faef3a4e",
+            "package_version": "0.1.1.dev31+g1717b077f.d20260711",
+            "kind": "loss_layer",
+            "session_id": "9e26e35673b047c14c4cee13aeb4bb12",
+            "n": 512,
+            "d": 4096,
+            "v": 151936,
+            "dtype": "bfloat16",
+            "impl": "chunked",
+            "reps": 3,
+            "seed": 0
+          },
+          "result": {
+            "wall_s": 0.083603,
+            "wall_s_all": [
+              0.091855,
+              0.083603,
+              0.08359
+            ],
+            "g_mac_per_s": 3811.273,
+            "active_before_gb": 1.2306,
+            "marginal_peak_gb": 0.3517,
+            "total_peak_gb": 1.5823
+          }
+        },
+        {
+          "name": "loss_layer_n512_naive",
+          "status": "ok",
+          "identity": {
+            "schema_version": 1,
+            "mlx_version": "0.32.0",
+            "mlx_lm_version": "0.31.3",
+            "machine": "arm64",
+            "macos": "26.5.2",
+            "code_sha": "f1765993faef3a4e",
+            "package_version": "0.1.1.dev31+g1717b077f.d20260711",
+            "kind": "loss_layer",
+            "session_id": "9e26e35673b047c14c4cee13aeb4bb12",
+            "n": 512,
+            "d": 4096,
+            "v": 151936,
+            "dtype": "bfloat16",
+            "impl": "naive",
+            "reps": 3,
+            "seed": 0
+          },
+          "result": {
+            "wall_s": 0.081504,
+            "wall_s_all": [
+              0.094868,
+              0.081504,
+              0.081398
+            ],
+            "g_mac_per_s": 3909.434,
+            "active_before_gb": 1.1631,
+            "marginal_peak_gb": 0.4347,
+            "total_peak_gb": 1.5978
+          }
+        },
+        {
+          "name": "loss_layer_n2048_kernel",
+          "status": "ok",
+          "identity": {
+            "schema_version": 1,
+            "mlx_version": "0.32.0",
+            "mlx_lm_version": "0.31.3",
+            "machine": "arm64",
+            "macos": "26.5.2",
+            "code_sha": "f1765993faef3a4e",
+            "package_version": "0.1.1.dev31+g1717b077f.d20260711",
+            "kind": "loss_layer",
+            "session_id": "9e26e35673b047c14c4cee13aeb4bb12",
+            "n": 2048,
+            "d": 4096,
+            "v": 151936,
+            "dtype": "bfloat16",
+            "impl": "kernel",
+            "reps": 3,
+            "seed": 0
+          },
+          "result": {
+            "wall_s": 1.331516,
+            "wall_s_all": [
+              1.331516,
+              1.330578,
+              1.332214
+            ],
+            "g_mac_per_s": 957.203,
+            "active_before_gb": 1.1748,
+            "marginal_peak_gb": 0.0002,
+            "total_peak_gb": 1.175
+          }
+        },
+        {
+          "name": "loss_layer_n2048_chunked",
+          "status": "ok",
+          "identity": {
+            "schema_version": 1,
+            "mlx_version": "0.32.0",
+            "mlx_lm_version": "0.31.3",
+            "machine": "arm64",
+            "macos": "26.5.2",
+            "code_sha": "f1765993faef3a4e",
+            "package_version": "0.1.1.dev31+g1717b077f.d20260711",
+            "kind": "loss_layer",
+            "session_id": "9e26e35673b047c14c4cee13aeb4bb12",
+            "n": 2048,
+            "d": 4096,
+            "v": 151936,
+            "dtype": "bfloat16",
+            "impl": "chunked",
+            "reps": 3,
+            "seed": 0
+          },
+          "result": {
+            "wall_s": 0.324328,
+            "wall_s_all": [
+              0.338311,
+              0.324328,
+              0.324269
+            ],
+            "g_mac_per_s": 3929.755,
+            "active_before_gb": 1.2887,
+            "marginal_peak_gb": 1.1989,
+            "total_peak_gb": 2.4876
+          }
+        },
+        {
+          "name": "loss_layer_n2048_naive",
+          "status": "ok",
+          "identity": {
+            "schema_version": 1,
+            "mlx_version": "0.32.0",
+            "mlx_lm_version": "0.31.3",
+            "machine": "arm64",
+            "macos": "26.5.2",
+            "code_sha": "f1765993faef3a4e",
+            "package_version": "0.1.1.dev31+g1717b077f.d20260711",
+            "kind": "loss_layer",
+            "session_id": "9e26e35673b047c14c4cee13aeb4bb12",
+            "n": 2048,
+            "d": 4096,
+            "v": 151936,
+            "dtype": "bfloat16",
+            "impl": "naive",
+            "reps": 3,
+            "seed": 0
+          },
+          "result": {
+            "wall_s": 0.324988,
+            "wall_s_all": [
+              0.350267,
+              0.323411,
+              0.324988
+            ],
+            "g_mac_per_s": 3921.778,
+            "active_before_gb": 1.1748,
+            "marginal_peak_gb": 1.7388,
+            "total_peak_gb": 2.9136
+          }
+        },
+        {
+          "name": "loss_layer_n8192_kernel",
+          "status": "ok",
+          "identity": {
+            "schema_version": 1,
+            "mlx_version": "0.32.0",
+            "mlx_lm_version": "0.31.3",
+            "machine": "arm64",
+            "macos": "26.5.2",
+            "code_sha": "f1765993faef3a4e",
+            "package_version": "0.1.1.dev31+g1717b077f.d20260711",
+            "kind": "loss_layer",
+            "session_id": "9e26e35673b047c14c4cee13aeb4bb12",
+            "n": 8192,
+            "d": 4096,
+            "v": 151936,
+            "dtype": "bfloat16",
+            "impl": "kernel",
+            "reps": 3,
+            "seed": 0
+          },
+          "result": {
+            "wall_s": 2.104592,
+            "wall_s_all": [
+              2.113387,
+              2.103766,
+              2.104592
+            ],
+            "g_mac_per_s": 2422.382,
+            "active_before_gb": 1.2218,
+            "marginal_peak_gb": 0.0006,
+            "total_peak_gb": 1.2224
+          }
+        },
+        {
+          "name": "loss_layer_n8192_chunked",
+          "status": "ok",
+          "identity": {
+            "schema_version": 1,
+            "mlx_version": "0.32.0",
+            "mlx_lm_version": "0.31.3",
+            "machine": "arm64",
+            "macos": "26.5.2",
+            "code_sha": "f1765993faef3a4e",
+            "package_version": "0.1.1.dev31+g1717b077f.d20260711",
+            "kind": "loss_layer",
+            "session_id": "9e26e35673b047c14c4cee13aeb4bb12",
+            "n": 8192,
+            "d": 4096,
+            "v": 151936,
+            "dtype": "bfloat16",
+            "impl": "chunked",
+            "reps": 3,
+            "seed": 0
+          },
+          "result": {
+            "wall_s": 1.289181,
+            "wall_s_all": [
+              1.314678,
+              1.288903,
+              1.289181
+            ],
+            "g_mac_per_s": 3954.545,
+            "active_before_gb": 1.3588,
+            "marginal_peak_gb": 3.6133,
+            "total_peak_gb": 4.9721
+          }
+        },
+        {
+          "name": "loss_layer_n8192_naive",
+          "status": "ok",
+          "identity": {
+            "schema_version": 1,
+            "mlx_version": "0.32.0",
+            "mlx_lm_version": "0.31.3",
+            "machine": "arm64",
+            "macos": "26.5.2",
+            "code_sha": "f1765993faef3a4e",
+            "package_version": "0.1.1.dev31+g1717b077f.d20260711",
+            "kind": "loss_layer",
+            "session_id": "9e26e35673b047c14c4cee13aeb4bb12",
+            "n": 8192,
+            "d": 4096,
+            "v": 151936,
+            "dtype": "bfloat16",
+            "impl": "naive",
+            "reps": 3,
+            "seed": 0
+          },
+          "result": {
+            "wall_s": 1.285595,
+            "wall_s_all": [
+              1.36876,
+              1.285595,
+              1.285413
+            ],
+            "g_mac_per_s": 3965.577,
+            "active_before_gb": 5.8585,
+            "marginal_peak_gb": 2.3184,
+            "total_peak_gb": 8.1768
+          }
+        }
+      ]
+    },
+    {
+      "bench": "attention_op",
+      "conditions": [
+        {
+          "name": "flash_n2048",
+          "status": "ok",
+          "identity": {
+            "schema_version": 1,
+            "mlx_version": "0.32.0",
+            "mlx_lm_version": "0.31.3",
+            "machine": "arm64",
+            "macos": "26.5.2",
+            "code_sha": "f1765993faef3a4e",
+            "package_version": "0.1.1.dev31+g1717b077f.d20260711",
+            "kind": "attention_op",
+            "session_id": "9e26e35673b047c14c4cee13aeb4bb12",
+            "attention_impl": "flash",
+            "n": 2048,
+            "head_dim": 128,
+            "heads": 32,
+            "kv_heads": 8,
+            "dtype": "mlx.core.bfloat16",
+            "causal": true,
+            "seed": 0,
+            "script_sha": "7dd2b15803965300"
+          },
+          "result": {
+            "impl": "flash",
+            "n": 2048,
+            "fwd_peak_gb": 0.0159,
+            "fwdbwd_peak_gb": 0.1177,
+            "wall_s": 0.071147,
+            "walls_s": [
+              0.075278,
+              0.071042,
+              0.071147
+            ],
+            "fwd_wall_s": 0.014419,
+            "fwd_walls_s": [
+              0.015346,
+              0.014419,
+              0.013663
+            ],
+            "bwd_wall_s": 0.056729,
+            "bwd_over_fwd": 3.9344
+          }
+        },
+        {
+          "name": "flash_n4096",
+          "status": "ok",
+          "identity": {
+            "schema_version": 1,
+            "mlx_version": "0.32.0",
+            "mlx_lm_version": "0.31.3",
+            "machine": "arm64",
+            "macos": "26.5.2",
+            "code_sha": "f1765993faef3a4e",
+            "package_version": "0.1.1.dev31+g1717b077f.d20260711",
+            "kind": "attention_op",
+            "session_id": "9e26e35673b047c14c4cee13aeb4bb12",
+            "attention_impl": "flash",
+            "n": 4096,
+            "head_dim": 128,
+            "heads": 32,
+            "kv_heads": 8,
+            "dtype": "mlx.core.bfloat16",
+            "causal": true,
+            "seed": 0,
+            "script_sha": "7dd2b15803965300"
+          },
+          "result": {
+            "impl": "flash",
+            "n": 4096,
+            "fwd_peak_gb": 0.0317,
+            "fwdbwd_peak_gb": 0.2354,
+            "wall_s": 0.20948,
+            "walls_s": [
+              0.209608,
+              0.20948,
+              0.207284
+            ],
+            "fwd_wall_s": 0.049037,
+            "fwd_walls_s": [
+              0.051263,
+              0.048254,
+              0.049037
+            ],
+            "bwd_wall_s": 0.160443,
+            "bwd_over_fwd": 3.2719
+          }
+        },
+        {
+          "name": "flash_n8192",
+          "status": "ok",
+          "identity": {
+            "schema_version": 1,
+            "mlx_version": "0.32.0",
+            "mlx_lm_version": "0.31.3",
+            "machine": "arm64",
+            "macos": "26.5.2",
+            "code_sha": "f1765993faef3a4e",
+            "package_version": "0.1.1.dev31+g1717b077f.d20260711",
+            "kind": "attention_op",
+            "session_id": "9e26e35673b047c14c4cee13aeb4bb12",
+            "attention_impl": "flash",
+            "n": 8192,
+            "head_dim": 128,
+            "heads": 32,
+            "kv_heads": 8,
+            "dtype": "mlx.core.bfloat16",
+            "causal": true,
+            "seed": 0,
+            "script_sha": "7dd2b15803965300"
+          },
+          "result": {
+            "impl": "flash",
+            "n": 8192,
+            "fwd_peak_gb": 0.0635,
+            "fwdbwd_peak_gb": 0.7207,
+            "wall_s": 0.75556,
+            "walls_s": [
+              0.753334,
+              0.766515,
+              0.75556
+            ],
+            "fwd_wall_s": 0.182923,
+            "fwd_walls_s": [
+              0.188595,
+              0.182628,
+              0.182923
+            ],
+            "bwd_wall_s": 0.572637,
+            "bwd_over_fwd": 3.1305
+          }
+        },
+        {
+          "name": "stock_n2048",
+          "status": "ok",
+          "identity": {
+            "schema_version": 1,
+            "mlx_version": "0.32.0",
+            "mlx_lm_version": "0.31.3",
+            "machine": "arm64",
+            "macos": "26.5.2",
+            "code_sha": "f1765993faef3a4e",
+            "package_version": "0.1.1.dev31+g1717b077f.d20260711",
+            "kind": "attention_op",
+            "session_id": "9e26e35673b047c14c4cee13aeb4bb12",
+            "attention_impl": "stock",
+            "n": 2048,
+            "head_dim": 128,
+            "heads": 32,
+            "kv_heads": 8,
+            "dtype": "mlx.core.bfloat16",
+            "causal": true,
+            "seed": 0,
+            "script_sha": "7dd2b15803965300"
+          },
+          "result": {
+            "impl": "stock",
+            "n": 2048,
+            "fwd_peak_gb": 1.1917,
+            "fwdbwd_peak_gb": 2.8206,
+            "wall_s": 0.064315,
+            "walls_s": [
+              0.10219,
+              0.064315,
+              0.063493
+            ],
+            "fwd_wall_s": 0.022988,
+            "fwd_walls_s": [
+              0.049472,
+              0.022988,
+              0.022934
+            ],
+            "bwd_wall_s": 0.041327,
+            "bwd_over_fwd": 1.7978
+          }
+        },
+        {
+          "name": "stock_n4096",
+          "status": "ok",
+          "identity": {
+            "schema_version": 1,
+            "mlx_version": "0.32.0",
+            "mlx_lm_version": "0.31.3",
+            "machine": "arm64",
+            "macos": "26.5.2",
+            "code_sha": "f1765993faef3a4e",
+            "package_version": "0.1.1.dev31+g1717b077f.d20260711",
+            "kind": "attention_op",
+            "session_id": "9e26e35673b047c14c4cee13aeb4bb12",
+            "attention_impl": "stock",
+            "n": 4096,
+            "head_dim": 128,
+            "heads": 32,
+            "kv_heads": 8,
+            "dtype": "mlx.core.bfloat16",
+            "causal": true,
+            "seed": 0,
+            "script_sha": "7dd2b15803965300"
+          },
+          "result": {
+            "impl": "stock",
+            "n": 4096,
+            "fwd_peak_gb": 4.4224,
+            "fwdbwd_peak_gb": 10.6099,
+            "wall_s": 0.246902,
+            "walls_s": [
+              0.379565,
+              0.246902,
+              0.239152
+            ],
+            "fwd_wall_s": 0.087573,
+            "fwd_walls_s": [
+              0.200148,
+              0.087573,
+              0.087456
+            ],
+            "bwd_wall_s": 0.159328,
+            "bwd_over_fwd": 1.8194
+          }
+        },
+        {
+          "name": "stock_n8192",
+          "status": "aborted_memory_ceiling",
+          "identity": {
+            "schema_version": 1,
+            "mlx_version": "0.32.0",
+            "mlx_lm_version": "0.31.3",
+            "machine": "arm64",
+            "macos": "26.5.2",
+            "code_sha": "f1765993faef3a4e",
+            "package_version": "0.1.1.dev31+g1717b077f.d20260711",
+            "kind": "attention_op",
+            "session_id": "9e26e35673b047c14c4cee13aeb4bb12",
+            "attention_impl": "stock",
+            "n": 8192,
+            "head_dim": 128,
+            "heads": 32,
+            "kv_heads": 8,
+            "dtype": "mlx.core.bfloat16",
+            "causal": true,
+            "seed": 0,
+            "script_sha": "7dd2b15803965300"
+          },
+          "result": {
+            "observed_active_gb": 32.5322,
+            "ceiling_gb": 25.7367,
+            "elapsed_s": 1.522,
+            "wall_budget_s": 7200.0
+          }
+        }
+      ]
+    }
+  ],
+  "memory_warnings": []
+}
