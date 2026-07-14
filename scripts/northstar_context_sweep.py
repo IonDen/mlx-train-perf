@@ -36,10 +36,20 @@ agent session, and never invoke it without that explicit go, even at a small
 import argparse
 import hashlib
 import json
+import time
 from collections.abc import Callable
 from pathlib import Path
 
 from mlx_train_perf.bench.runner import Condition, run_conditions
+from mlx_train_perf.errors import MemoryBudgetError
+
+# 0.3.0: a `refused_environment` probe (the machine too crowded to START safely) is NOT a
+# fit verdict -- the first 0.3.0 sweep converged both arms on such probes and published
+# them as ceilings. A probe retries a transiently crowded start, and persistent crowding
+# fails the ARM loudly (`MemoryBudgetError` -> `converged: false`) instead of silently
+# converging on an environment artifact.
+_ENV_REFUSAL_ATTEMPTS = 3
+_ENV_REFUSAL_WAIT_S = 120.0
 
 FLAGSHIP_MODEL = "mlx-community/Qwen3-8B-4bit"
 PROBE_STEPS = 2                # just enough to exercise one full training step
@@ -141,22 +151,41 @@ def make_probe(
     *, model: str, revision: str | None, batch: int, lora_rank: int, lora_layers: int,
     seed: int, arm: str, out_dir: Path, session_id: str, compute_dtype: str = "bfloat16",
     grad_checkpoint: bool = True,
+    _sleep: Callable[[float], None] = time.sleep,
 ) -> Callable[[int], bool]:
     """Builds the `probe(seq_len) -> bool` callable `find_max_context` drives: ONE
     `train_step` condition per call, dispatched through `run_conditions`
     (subprocess-isolated; a legitimate OOM/crash records the standard crash envelope,
     read here as "does not fit" -- see the module docstring). Resume-by-skipping is
     `run_conditions`'s own existing behavior: a context length already probed under
-    this EXACT `session_id` is recognized as fresh and never re-launched."""
+    this EXACT `session_id` is recognized as fresh and never re-launched.
+
+    A `refused_environment` artifact (the worker's too-crowded-at-start refusal) is a
+    NON-verdict: the probe retries up to `_ENV_REFUSAL_ATTEMPTS` times with
+    `_ENV_REFUSAL_WAIT_S` between attempts (a stale refusal is never fresh, so each
+    attempt genuinely re-runs), then raises `MemoryBudgetError` so the arm fails loudly
+    rather than converging on the machine's crowding. `_sleep` is injectable for tests."""
 
     def probe(seq_len: int) -> bool:
-        condition = build_probe(
-            model=model, revision=revision, batch=batch, lora_rank=lora_rank,
-            lora_layers=lora_layers, seed=seed, arm=arm, seq_len=seq_len,
-            compute_dtype=compute_dtype, grad_checkpoint=grad_checkpoint,
+        for attempt in range(_ENV_REFUSAL_ATTEMPTS):
+            condition = build_probe(
+                model=model, revision=revision, batch=batch, lora_rank=lora_rank,
+                lora_layers=lora_layers, seed=seed, arm=arm, seq_len=seq_len,
+                compute_dtype=compute_dtype, grad_checkpoint=grad_checkpoint,
+            )
+            paths = run_conditions([condition], out_dir, session_id=session_id)
+            status = _read_status(paths[0])
+            if status != "refused_environment":
+                return status == "ok"
+            if attempt + 1 < _ENV_REFUSAL_ATTEMPTS:
+                _sleep(_ENV_REFUSAL_WAIT_S)
+        raise MemoryBudgetError(
+            f"probe at seq_len={seq_len} ({arm}) was refused as too crowded "
+            f"{_ENV_REFUSAL_ATTEMPTS} times over ~"
+            f"{_ENV_REFUSAL_WAIT_S * (_ENV_REFUSAL_ATTEMPTS - 1):.0f} s -- the machine "
+            "cannot answer this probe; re-run the sweep on a quieter machine (completed "
+            "probes resume)"
         )
-        paths = run_conditions([condition], out_dir, session_id=session_id)
-        return _read_status(paths[0]) == "ok"
 
     return probe
 
@@ -208,7 +237,15 @@ def sweep_arm(
         lora_layers=lora_layers, seed=seed, arm=arm, out_dir=out_dir,
         session_id=session_id, compute_dtype=compute_dtype, grad_checkpoint=grad_checkpoint,
     )
-    max_fitting, min_failing = find_max_context(probe, start=start, granularity=granularity)
+    try:
+        max_fitting, min_failing = find_max_context(
+            probe, start=start, granularity=granularity,
+        )
+    except MemoryBudgetError as exc:
+        # Persistent too-crowded refusals: NO ceiling number is published for this arm --
+        # a polluted bound is worse than none. Completed ok probes stay on disk and
+        # resume on a quieter re-run.
+        return {"arm": arm, "converged": False, "environment_refusal": str(exc)}
     return {
         "arm": arm, "max_fitting_seq_len": max_fitting, "min_failing_seq_len": min_failing,
         "converged": min_failing is not None or max_fitting == 0,
@@ -266,7 +303,9 @@ def main(argv: list[str] | None = None) -> int:
         "compute_dtype": args.compute_dtype, "grad_checkpoint": args.grad_checkpoint,
         "session_id": session_id, "results": results,
     }, indent=2))
-    return 0
+    # Bench exit policy: an arm that could not converge (persistent environment
+    # refusals) exits 1 so an unattended campaign cannot mistake it for a result.
+    return 0 if all(r.get("converged") for r in results) else 1
 
 
 if __name__ == "__main__":
