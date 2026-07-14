@@ -2,6 +2,20 @@
 
 ## Released
 
+### 0.3.0 - 2026-07-14
+- Removed the launch-safety cap that held the flash-attention path's trainable context below
+  its memory limit. The 2-second per-chain budget guarded a misread of how macOS kills Metal
+  work: the watchdog acts on a single command buffer, not a chain, and at training shapes
+  each backward dispatch already runs in its own buffer. The guard is now per command buffer,
+  at the same 0.5-second worst-day budget. On a 32 GB machine the maximum trainable context
+  measured 23,040 tokens with flash attention against 7,936 with stock, both bound by the
+  same effective memory ceiling — the flash path reaches 2.9x the context at one memory
+  budget, because it keeps O(N) saved state.
+- Qwen2 (Qwen2.5 family) support in the mlx-lm loss adapter, with loss parity against the
+  stock trainer verified on a real checkpoint.
+- Benchmark hygiene: attention-arm artifact filenames, a distinct too-crowded status that
+  re-runs on a quieter machine, and a measured quick-tier time estimate for the community kit.
+
 ### 0.2.0 - 2026-07-14
 - Flash-attention training path: a Metal forward and backward that keep O(N) saved state
   instead of the O(N²) score matrix. At 8192-token context on Qwen3-8B-4bit it roughly halves
@@ -27,11 +41,11 @@
 
 ## Planned
 
-### Faster backward kernels to raise the context ceiling
-On a 32 GB machine the flash-attention path is capped by a per-launch GPU-safety budget, not
-by memory, so it does not currently extend the maximum trainable context there. Faster
-backward kernels raise that budget cap and let the ceiling grow with the flash path's memory
-headroom, on 32 GB and above.
+### Faster dK/dV backward kernels
+The dK/dV backward is the slowest part of the flash path. A register-scheduling change to its
+Metal kernel (interleaving the key-tile work to lower register pressure) is the next lever on
+its throughput, which sets tokens/sec at long context. This is a speed item, not a memory or
+context-ceiling one — 0.3.0 already made the context ceiling memory-bound.
 
 ### Fused backward kernel for the loss
 The loss ships a fused forward paired with a proven chunked backward. A fully fused backward
@@ -42,11 +56,6 @@ Pack variable-length examples into fixed blocks to cut padding waste in SFT trai
 needs a block-diagonal (additive) attention mask so examples packed into one block do not
 attend across each other — a mask the current causal-only flash path refuses, so supporting
 it means extending the flash kernel to a packed-block mask.
-
-### Distinct too-crowded artifact status
-When a run refuses because the machine is too loaded to start safely, record that with its own
-status in the artifact, separate from a memory-ceiling abort or a clean result, so the two are
-easy to tell apart when aggregating community submissions.
 
 ### Planner anchors beyond 8192
 The flash planner coefficient is fit to anchors up to 8192 tokens. Add measured anchors past
