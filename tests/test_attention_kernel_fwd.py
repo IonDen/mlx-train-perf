@@ -645,14 +645,25 @@ def test_fwd_drop_diagonal_perturbation_fails_parity(variant: str) -> None:
     o_ref, l_ref = _reference_o_l(q, k, v, scale=scale)
     mx.eval(o_bad, l_bad, o_ref, l_ref)
 
-    # Row 0's keep-set is EMPTY under kk < row -- a NaN/inf output is the off-by-one's own
-    # fingerprint and counts as divergence (nan > x is False, so test finiteness first).
-    finite = bool(mx.isfinite(o_bad).all().item() and mx.isfinite(l_bad).all().item())
-    d_o = mx.abs(o_bad.astype(mx.float32) - o_ref.astype(mx.float32)).max().item()
-    d_l = mx.abs(l_bad - l_ref).max().item()
-    assert (not finite) or d_o > 1e-2 or d_l > 1e-2, (
-        f"drop-diagonal kernel matched the causal reference (dO={d_o:.3e}, dL={d_l:.3e}) "
-        "-- the parity grid cannot detect a diagonal off-by-one"
+    # Row 0's keep-set is EMPTY under kk < row (0/0 -> NaN) for ANY kernel that even reads
+    # the comparison, so a whole-tensor check passes trivially on row 0 alone. Prove the
+    # perturbation on rows >= 1 instead: their keep-sets stay non-empty (finite) but drop
+    # the diagonal key, so they MUST diverge from the causal reference -- this catches a
+    # future mma tile-boundary bug that broke rows 1..n-1 while leaving row 0 empty.
+    o_rest = o_bad[:, :, 1:, :].astype(mx.float32)
+    l_rest = l_bad[:, :, 1:]
+    rows_finite = bool(mx.isfinite(o_rest).all().item()) and bool(
+        mx.isfinite(l_rest).all().item()
+    )
+    assert rows_finite, (
+        "drop-diagonal rows >= 1 went non-finite -- the divergence proof needs finite rows "
+        "there (only row 0's empty keep-set should NaN)"
+    )
+    d_o = mx.abs(o_rest - o_ref[:, :, 1:, :].astype(mx.float32)).max().item()
+    d_l = mx.abs(l_rest - l_ref[:, :, 1:]).max().item()
+    assert d_o > 1e-2 or d_l > 1e-2, (
+        f"drop-diagonal kernel matched the causal reference on rows>=1 (dO={d_o:.3e}, "
+        f"dL={d_l:.3e}) -- the parity grid cannot detect a diagonal off-by-one"
     )
 
 

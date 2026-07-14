@@ -1800,10 +1800,11 @@ def test_dq_drop_diagonal_perturbation_fails_parity(variant: str) -> None:
     dq_ref = _dq_oracle(q, k, v, cot, scale=scale, causal=True)
     mx.eval(dq_bad, dq_ref)
 
-    # A non-finite dQ (an empty keep-set fingerprint) counts as divergence too.
-    finite = bool(mx.isfinite(dq_bad).all().item())
+    # The backward reuses the forward's precomputed L/D, so dropping the diagonal removes a
+    # term from a plain accumulation (no 0/0) -- dQ stays FINITE and must diverge outright.
+    assert bool(mx.isfinite(dq_bad).all().item()), "drop-diagonal dQ went non-finite"
     diff = mx.abs(dq_bad.astype(mx.float32) - dq_ref.astype(mx.float32)).max().item()
-    assert (not finite) or diff > 1e-2, (
+    assert diff > 1e-2, (
         f"drop-diagonal dQ ({variant}) matched the causal oracle (diff={diff:.3e}) -- "
         "the parity grid cannot detect a diagonal off-by-one"
     )
@@ -1836,12 +1837,16 @@ def test_dkv_drop_diagonal_perturbation_fails_parity(variant: str) -> None:
     dk_ref, dv_ref = _dkv_oracle(q, k, v, cot, scale=scale, causal=True)
     mx.eval(dk_bad, dv_bad, dk_ref, dv_ref)
 
-    finite = bool(mx.isfinite(dk_bad).all().item() and mx.isfinite(dv_bad).all().item())
+    # dK/dV likewise reuse precomputed L/D -- finite, so they must diverge outright.
+    dkv_finite = bool(mx.isfinite(dk_bad).all().item()) and bool(
+        mx.isfinite(dv_bad).all().item()
+    )
+    assert dkv_finite, "drop-diagonal dK/dV went non-finite"
     diff = max(
         mx.abs(dk_bad.astype(mx.float32) - dk_ref.astype(mx.float32)).max().item(),
         mx.abs(dv_bad.astype(mx.float32) - dv_ref.astype(mx.float32)).max().item(),
     )
-    assert (not finite) or diff > 1e-2, (
+    assert diff > 1e-2, (
         f"drop-diagonal dK/dV ({variant}) matched the causal oracle (diff={diff:.3e}) -- "
         "the parity grid cannot detect a diagonal off-by-one"
     )

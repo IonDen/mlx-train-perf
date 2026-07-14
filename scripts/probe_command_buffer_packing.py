@@ -59,7 +59,12 @@ print(statistics.median(walls))
 _CHILD_BIG_SIZES = """
 import time, statistics
 import mlx.core as mx
-mx.set_wired_limit(int(20 * 1024**3))
+# Device-derived wired cap (never hardcode above a smaller machine's device max): 80% of
+# the recommended working set, strictly under the device ceiling on any Apple Silicon box.
+_DEV_MAX = int(mx.device_info()["max_recommended_working_set_size"])
+_CAP = int(_DEV_MAX * 0.8)
+assert _CAP < _DEV_MAX
+mx.set_wired_limit(_CAP)
 xs = [mx.random.normal((13_000_000,)) for _ in range(4)]   # ~13 M elements each, fp32
 mx.eval(*xs)
 def run():
@@ -80,8 +85,10 @@ import mlx.core as mx
 from mlx_train_perf.attention.kernel.launch import (
     _bwd_dkv_kernel, _dispatch_bwd_dkv_range,
 )
-mx.set_wired_limit(int(20 * 1024**3))
-mx.set_memory_limit(int(22 * 1024**3))
+# Device-derived caps (never hardcode above a smaller machine's device max).
+_DEV_MAX = int(mx.device_info()["max_recommended_working_set_size"])
+mx.set_wired_limit(int(_DEV_MAX * 0.8))
+mx.set_memory_limit(int(_DEV_MAX * 0.9))
 B, HQ, HKV, N, D = 1, 32, 8, 12288, 128
 dt = mx.bfloat16
 ks = mx.random.split(mx.random.key(0), 4)

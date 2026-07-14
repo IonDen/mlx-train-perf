@@ -34,7 +34,7 @@ On Qwen3-8B-4bit (LoRA rank 8, batch 1, gradient checkpointing on, bf16) the two
 | stock attention | 25.68 GiB | 21.31 GiB |
 | flash attention | 12.75 GiB | 8.37 GiB |
 
-(`scripts/bench_train_step.py`; M1 Max 32 GB, macOS 26.5, mlx 0.32.0.)
+(`scripts/bench_train_step.py`; M1 Max 32 GB, macOS 26.5, mlx 0.32.0. These memory and throughput figures are the 0.2.0 measurements, carried into 0.3.0 unchanged: 0.3.0 changed how the backward splits its kernel launches, not what it allocates, and the 0.3.0 context sweep below — measured fresh — confirms the flash path's memory still scales linearly in sequence length.)
 
 The 32 GB machine that peaked near its ceiling with stock attention now runs the same step at half the memory. That is real headroom: a longer sequence, or a second job on the GPU.
 

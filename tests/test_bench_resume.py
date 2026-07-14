@@ -386,7 +386,13 @@ def test_run_conditions_skips_fresh_without_spawning_a_subprocess(
     assert json.loads(out_path.read_text())["wall_s"] == 0.01  # untouched
 
 
+@_needs_room_for_real_worker
 def test_run_conditions_records_error_envelope_on_worker_crash(tmp_path: Path) -> None:
+    # Spawns a REAL worker (unsupported kind -> crash -> WorkerCrashed envelope). On a
+    # machine that trips guards' safe-start floor (small CI runner) the worker refuses at
+    # `effective_memory_ceiling()` with `refused_environment` BEFORE it reaches the kind
+    # crash, so the "error" assertion only holds where the worker has room to run -- hence
+    # the skipif its sibling real-worker tests carry.
     session_id = new_session_id()
     bad = Condition(name="bad_kind", kind="not_a_real_kind", params={"n": 8, "d": 4, "v": 16})
     paths = run_conditions([bad], tmp_path, session_id=session_id)

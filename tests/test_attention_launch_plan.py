@@ -15,14 +15,20 @@ and honest about the mechanism.
 """
 import itertools
 
+import mlx.core as mx
 import pytest
 
+from mlx_train_perf.attention.kernel import launch as _launch
 from mlx_train_perf.attention.kernel.launch import (
     MAX_DISPATCH_SECONDS,
+    TileShape,
     _bwd_dkv_macs_per_row,
     _calibrate_fwd,
     _fwd_macs_per_row,
     causal_pairs,
+    launch_bwd_dkv,
+    launch_bwd_dq,
+    launch_flash_fwd,
     plan_dkv_dispatches,
     range_macs,
 )
@@ -229,3 +235,75 @@ def test_calibrate_ramp_credits_the_causal_triangle() -> None:
     pair = _bwd_dkv_macs_per_row(n=1, d=d, b=b, hq=hq)
     expected = causal_pairs(0, n) * pair / dispatch_s
     assert result == pytest.approx(expected, rel=1e-9)
+
+
+# ---------------------------------------------------------------------------------------
+# Launcher -> planner argument WIRING (default lane, no GPU). The GPU split/chain tests use
+# the TEST-ONLY `_force_ranges` seam (the per-buffer planner never splits a tiny shape), so
+# without these the real `plan_*_dispatches(...)` call INSIDE each launcher -- its n/d/b/hq/
+# hkv/rate/causal wiring -- had zero coverage. A spy captures the kwargs and stops before any
+# GPU dispatch, so a swapped hq/hkv or a dropped `causal` fails here loudly.
+# ---------------------------------------------------------------------------------------
+
+
+class _SpyStopError(Exception):
+    pass
+
+
+def _capturing_planner(record: dict) -> object:
+    def planner(**kwargs: object) -> list:
+        record.update(kwargs)
+        raise _SpyStopError
+    return planner
+
+
+def test_launch_flash_fwd_wires_shape_rate_causal_into_plan_fwd_dispatches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rec: dict = {}
+    monkeypatch.setattr(_launch, "plan_fwd_dispatches", _capturing_planner(rec))
+    q = mx.zeros((1, 8, 4096, 128))
+    k = mx.zeros((1, 2, 4096, 128))
+    v = mx.zeros((1, 2, 4096, 128))
+    with pytest.raises(_SpyStopError):
+        launch_flash_fwd(q, k, v, scale=0.1, causal=True, tile=TileShape(), rate_macs_per_s=1e12)
+    assert rec == {"n": 4096, "d": 128, "b": 1, "hq": 8, "hkv": 2, "rate": 1e12, "causal": True}
+
+
+def test_launch_bwd_dq_wires_shape_rate_causal_into_plan_dq_dispatches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rec: dict = {}
+    monkeypatch.setattr(_launch, "plan_dq_dispatches", _capturing_planner(rec))
+    q = mx.zeros((1, 8, 4096, 128))
+    k = mx.zeros((1, 2, 4096, 128))
+    v = mx.zeros((1, 2, 4096, 128))
+    d_o = mx.zeros((1, 8, 4096, 128))
+    lse = mx.zeros((1, 8, 4096))
+    d_arr = mx.zeros((1, 8, 4096))
+    with pytest.raises(_SpyStopError):
+        launch_bwd_dq(q, k, v, d_o, lse, d_arr, scale=0.1, causal=True, rate_macs_per_s=1e12)
+    assert rec == {"n": 4096, "d": 128, "b": 1, "hq": 8, "hkv": 2, "rate": 1e12, "causal": True}
+
+
+def test_launch_bwd_dkv_wires_shape_rate_causal_alignment_into_plan_dkv_dispatches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rec: dict = {}
+    monkeypatch.setattr(_launch, "plan_dkv_dispatches", _capturing_planner(rec))
+    q = mx.zeros((1, 8, 4096, 128))
+    k = mx.zeros((1, 2, 4096, 128))
+    v = mx.zeros((1, 2, 4096, 128))
+    d_o = mx.zeros((1, 8, 4096, 128))
+    lse = mx.zeros((1, 8, 4096))
+    d_arr = mx.zeros((1, 8, 4096))
+    with pytest.raises(_SpyStopError):
+        launch_bwd_dkv(
+            q, k, v, d_o, lse, d_arr, scale=0.1, causal=True, rate_macs_per_s=1e12,
+            variant="mma",
+        )
+    # mma variant passes block_align=32 (a mid-block split would break chained bit-identity)
+    assert rec == {
+        "n": 4096, "d": 128, "b": 1, "hq": 8, "hkv": 2, "rate": 1e12, "causal": True,
+        "block_align": 32,
+    }
