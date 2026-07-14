@@ -27,12 +27,24 @@ import mlx_lm.tuner.utils as lora_utils
 from mlx_lm.models import llama
 
 from mlx_train_perf.bench import worker
-from mlx_train_perf.core.guards import clamped_caps, install_guardrails
+from mlx_train_perf.core.guards import EffectiveCeiling, clamped_caps, install_guardrails
 from mlx_train_perf.errors import (
     MissingDependencyError,
     MlxTrainPerfError,
     WiredCapRegressionError,
 )
+
+
+@pytest.fixture(autouse=True)
+def _plentiful_memory_ceiling(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Small CI runners (7 GB, ~3.5 GB free) trip guards' safe-start floor inside
+    `worker.main` -- that is the runner's environment, not the behavior under test.
+    Every in-process test in this module runs as if the machine had honest room; the
+    floor's own decision logic is covered with injected readers in the guards tests."""
+    monkeypatch.setattr(
+        worker, "effective_memory_ceiling",
+        lambda: EffectiveCeiling(ceiling_bytes=64 << 30, warning=None),
+    )
 
 
 def _tiny_llama() -> llama.Model:

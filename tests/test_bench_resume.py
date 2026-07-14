@@ -24,8 +24,49 @@ from mlx_train_perf.bench.artifacts import (
     write_result,
 )
 from mlx_train_perf.bench.runner import Condition, report, run_conditions
-from mlx_train_perf.core.guards import DEFAULT_WALL_BUDGET_S, EffectiveCeiling
-from mlx_train_perf.errors import BenchInputError, LaunchBudgetError, MlxTrainPerfError
+from mlx_train_perf.core.guards import (
+    DEFAULT_WALL_BUDGET_S,
+    EffectiveCeiling,
+    effective_memory_ceiling,
+)
+from mlx_train_perf.errors import (
+    BenchInputError,
+    LaunchBudgetError,
+    MemoryBudgetError,
+    MlxTrainPerfError,
+)
+
+
+@pytest.fixture(autouse=True)
+def _plentiful_memory_ceiling(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Small CI runners (7 GB, ~3.5 GB free) trip guards' safe-start floor inside
+    `worker.main` -- that is the runner's environment, not the behavior under test. The
+    in-process tests in this module run as if the machine had honest room; the floor's
+    own decision logic is covered with injected readers in the guards tests, and the
+    real-subprocess tests below skip instead (their children compute the real ceiling,
+    out of any monkeypatch's reach)."""
+    monkeypatch.setattr(
+        worker, "effective_memory_ceiling",
+        lambda: EffectiveCeiling(ceiling_bytes=64 << 30, warning=None),
+    )
+
+
+def _machine_refuses_worker_start() -> bool:
+    """True when THIS machine's real availability trips guards' safe-start floor. Tests
+    marked with `_needs_room_for_real_worker` spawn real worker subprocesses whose
+    children compute the real ceiling, so on such a machine (e.g. a 7 GB CI runner) the
+    honest outcome is a skip, not a failure that says nothing about the code."""
+    try:
+        effective_memory_ceiling()
+    except MemoryBudgetError:
+        return True
+    return False
+
+
+_needs_room_for_real_worker = pytest.mark.skipif(
+    _machine_refuses_worker_start(),
+    reason="machine trips guards' safe-start floor; a real worker subprocess would refuse",
+)
 
 _GIB = 1024**3
 
@@ -315,6 +356,7 @@ def _tiny_loss_layer(name: str, impl: str = "naive") -> Condition:
     )
 
 
+@_needs_room_for_real_worker
 def test_run_conditions_spawns_worker_and_writes_ok_artifact(tmp_path: Path) -> None:
     session_id = new_session_id()
     paths = run_conditions([_tiny_loss_layer("naive_tiny")], tmp_path, session_id=session_id)
@@ -518,6 +560,7 @@ def test_worker_main_installs_guardrails_first(
     assert calls == ["guardrails", "run"]
 
 
+@_needs_room_for_real_worker
 def test_bench_worker_module_runnable_as_main(tmp_path: Path) -> None:
     """`python -m mlx_train_perf.bench.worker --config ...` — the exact subprocess
     invocation `run_conditions` uses."""
