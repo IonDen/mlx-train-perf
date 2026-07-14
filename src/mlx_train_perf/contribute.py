@@ -234,12 +234,15 @@ TIERS: dict[str, tuple[str, ...]] = {
     "full": ("loss_layer", "attention_op", "train_step", "context_probe"),
 }
 
-# Honest per-bench wall estimate ranges (minutes). Summed per tier: quick = (10, 15) min
-# (the brief's ~10-15 min), full = (70, 135) min (~1-2 h). These are deliberately wide,
-# machine-independent ranges -- a coarse expectation, not a per-shape prediction.
+# Honest per-bench wall estimate ranges (minutes). Summed per tier: quick = (1, 5) min,
+# full = (61, 125) min (~1-2 h). The quick-tier entries are anchored to the first REAL
+# quick-tier run (M1 Max 32 GB: ~1 min wall against the old printed 10-15 min -- a ~10x
+# over-wide bound, retightened per 0022e); the high edges keep a ~5x machine-variance
+# cushion, safe-direction but no longer dishonest. The heavy benches keep their original
+# wide ranges until a full-tier run measures them.
 _BENCH_ETA_MIN: dict[str, tuple[float, float]] = {
-    "loss_layer": (5.0, 8.0),
-    "attention_op": (5.0, 7.0),
+    "loss_layer": (0.5, 3.0),
+    "attention_op": (0.5, 2.0),
     "train_step": (20.0, 40.0),
     "context_probe": (40.0, 80.0),
 }
@@ -378,11 +381,15 @@ def _bench_status_label(summary: dict[str, object]) -> str:
     """Short completion status for the kit-level progress line's "after" text -- `"N/M
     ok"` over the conditions this bench produced. An
     empty-condition bench reads as `"0/0 ok"`, not an error -- some benches legitimately
-    produce zero conditions on a degenerate grid."""
+    produce zero conditions on a degenerate grid. A `refused_environment` condition (too
+    crowded at start, 0022d) is called out as "machine-busy" -- the contributor should
+    re-run on a quieter machine, nothing is wrong with the bench."""
     conditions = cast(list[dict[str, object]], summary["conditions"])
     total = len(conditions)
     ok = sum(1 for c in conditions if c.get("status") == "ok")
-    return f"{ok}/{total} ok"
+    busy = sum(1 for c in conditions if c.get("status") == "refused_environment")
+    label = f"{ok}/{total} ok"
+    return f"{label} ({busy} machine-busy)" if busy else label
 
 
 def collect_memory_warnings(bench_summaries: list[dict[str, object]]) -> list[str]:
@@ -532,6 +539,13 @@ def _spawn_crash_artifact(
         path, identity, "error", error_type="WorkerCrashed",
         error_msg=stderr_tail, returncode=proc.returncode,
     )
+    # 0022e courtesy tail: bench-script output is CAPTURED (the crash-envelope mechanism
+    # needs it), so without this a contributor watching a silent 1-2 h run learns nothing
+    # when it dies. Print the captured tail to the console alongside the artifact write.
+    print(f"    bench script failed (exit {proc.returncode}); last output:")
+    for line in stderr_tail.splitlines()[-15:]:
+        print(f"      {line}")
+    sys.stdout.flush()
     return path
 
 

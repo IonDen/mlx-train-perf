@@ -53,6 +53,7 @@ from mlx_train_perf.core.guards import (
 from mlx_train_perf.core.loss import DenseHead, HeadRef, QuantizedHead, linear_cross_entropy
 from mlx_train_perf.errors import (
     LaunchBudgetError,
+    MemoryBudgetError,
     MissingDependencyError,
     MlxTrainPerfError,
     WiredCapRegressionError,
@@ -490,7 +491,15 @@ def main(argv: list[str] | None = None) -> int:
     # measured-availability at start (rank-local `vm_stat`) -- it may REFUSE (typed
     # `MemoryBudgetError`) if this node is too crowded to start safely, and surfaces a
     # degraded-start `memory_warning` we log + record in the artifact.
-    ceiling = effective_memory_ceiling()
+    try:
+        ceiling = effective_memory_ceiling()
+    except MemoryBudgetError as exc:
+        # 0022d: too crowded to START safely is an ENVIRONMENT-transient outcome -- its own
+        # `refused_environment` status, distinct from the condition-intrinsic `refused`
+        # (launch budget) and from a crash envelope. Only `"ok"` artifacts are fresh on
+        # resume, so a later, quieter invocation re-runs this condition automatically.
+        write_result(out, ident, "refused_environment", error=str(exc))
+        return 0
     ceiling_bytes = ceiling.ceiling_bytes
     # Omit-when-None (identity convention): a nominal start carries no `memory_warning`.
     warning_field: dict[str, object] = (

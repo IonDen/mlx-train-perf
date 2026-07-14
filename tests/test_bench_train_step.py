@@ -60,9 +60,27 @@ def test_model_slug_is_filesystem_safe() -> None:
     assert slug == "mlx-community__Qwen3-8B-4bit"
 
 
-def test_condition_name_embeds_slug_seq_len_and_arm() -> None:
-    name = condition_name(model="mlx-community/Qwen3-8B-4bit", seq_len=2048, arm="ours")
-    assert name == "train_step_mlx-community__Qwen3-8B-4bit_seq2048_ours"
+def test_condition_name_embeds_slug_seq_len_attention_and_arm() -> None:
+    name = condition_name(
+        model="mlx-community/Qwen3-8B-4bit", seq_len=2048, arm="ours",
+        attention_impl="stock",
+    )
+    assert name == "train_step_mlx-community__Qwen3-8B-4bit_seq2048_attn-stock_ours"
+
+
+def test_condition_names_differ_across_attention_arms() -> None:
+    """Gotcha 18 / 0022c: two invocations differing ONLY by --attention against the same
+    --out dir must never share artifact FILENAMES (the identity already differed; the
+    filename did not, and the T13 flash run silently overwrote the stock artifacts)."""
+    kwargs: dict = {
+        "models": ["m/a"], "seq_lens": [1024], "batch": 1, "steps": 20, "lora_rank": 8,
+        "lora_layers": -1, "learning_rate": 1e-5, "seed": 0, "revision": None,
+    }
+    stock_names = {c.name for c in build_conditions(attention_impl="stock", **kwargs)}
+    flash_names = {c.name for c in build_conditions(attention_impl="flash", **kwargs)}
+    assert stock_names
+    assert flash_names
+    assert stock_names.isdisjoint(flash_names)
 
 
 # ---------------------------------------------------------------------------
@@ -81,7 +99,9 @@ def test_build_conditions_covers_the_full_model_seq_len_arm_cross_product() -> N
     for model in ("m/a", "m/b"):
         for seq_len in (1024, 2048):
             for arm in ("ours", "stock"):
-                assert condition_name(model=model, seq_len=seq_len, arm=arm) in names
+                assert condition_name(
+                    model=model, seq_len=seq_len, arm=arm, attention_impl="stock",
+                ) in names
 
 
 def test_build_conditions_ours_and_stock_share_every_param_except_stock_and_impl() -> None:
@@ -90,8 +110,8 @@ def test_build_conditions_ours_and_stock_share_every_param_except_stock_and_impl
         learning_rate=1e-5, seed=7, revision="main",
     )
     by_name = {c.name: c for c in conditions}
-    ours = by_name[condition_name(model="m/a", seq_len=1024, arm="ours")]
-    stock = by_name[condition_name(model="m/a", seq_len=1024, arm="stock")]
+    ours = by_name[condition_name(model="m/a", seq_len=1024, arm="ours", attention_impl="stock")]
+    stock = by_name[condition_name(model="m/a", seq_len=1024, arm="stock", attention_impl="stock")]
     assert ours.kind == "train_step"
     assert stock.kind == "train_step"
     assert ours.params["stock"] is False
@@ -241,16 +261,25 @@ def _write_result(path: Path, *, status: str, session_id: str = "s1", **fields: 
     }))
 
 
+def _pair_paths(tmp_path: Path, *, seq_len: int = 1024) -> tuple[Path, Path]:
+    ours = condition_name(
+        model="m/a", seq_len=seq_len, arm="ours", attention_impl="stock",
+    )
+    stock = condition_name(
+        model="m/a", seq_len=seq_len, arm="stock", attention_impl="stock",
+    )
+    return tmp_path / f"{ours}.json", tmp_path / f"{stock}.json"
+
+
 def test_compare_ok_pair_reports_tps_ratio_and_loss_curve_diff(tmp_path: Path) -> None:
-    ours_path = tmp_path / f"{condition_name(model='m/a', seq_len=1024, arm='ours')}.json"
-    stock_path = tmp_path / f"{condition_name(model='m/a', seq_len=1024, arm='stock')}.json"
+    ours_path, stock_path = _pair_paths(tmp_path)
     _write_result(ours_path, status="ok", tokens_per_sec_median=200.0,
                   loss_all=[3.0, 2.9, 2.8])
     _write_result(stock_path, status="ok", tokens_per_sec_median=100.0,
                   loss_all=[3.0, 2.91, 2.79])
     entry = compare_ours_vs_stock(
         {ours_path.stem: ours_path, stock_path.stem: stock_path},
-        model="m/a", seq_len=1024,
+        model="m/a", seq_len=1024, attention_impl="stock",
     )
     assert entry["status"] == "ok"
     assert entry["ours_tps_over_stock_tps"] == 2.0   # ours is 2x faster
@@ -258,18 +287,17 @@ def test_compare_ok_pair_reports_tps_ratio_and_loss_curve_diff(tmp_path: Path) -
 
 
 def test_compare_reports_missing_when_a_condition_is_absent() -> None:
-    entry = compare_ours_vs_stock({}, model="m/a", seq_len=1024)
+    entry = compare_ours_vs_stock({}, model="m/a", seq_len=1024, attention_impl="stock")
     assert entry["status"] == "missing"
 
 
 def test_compare_reports_corrupt_artifact(tmp_path: Path) -> None:
-    ours_path = tmp_path / f"{condition_name(model='m/a', seq_len=1024, arm='ours')}.json"
-    stock_path = tmp_path / f"{condition_name(model='m/a', seq_len=1024, arm='stock')}.json"
+    ours_path, stock_path = _pair_paths(tmp_path)
     ours_path.write_text("{not json")
     _write_result(stock_path, status="ok", tokens_per_sec_median=1.0, loss_all=[1.0])
     entry = compare_ours_vs_stock(
         {ours_path.stem: ours_path, stock_path.stem: stock_path},
-        model="m/a", seq_len=1024,
+        model="m/a", seq_len=1024, attention_impl="stock",
     )
     assert entry["status"] == "corrupt"
 
@@ -278,14 +306,13 @@ def test_compare_reports_incomplete_when_stock_oomed(tmp_path: Path) -> None:
     """The exact flagship scenario: stock legitimately crashes (recorded as the
     standard `runner.run_conditions` crash envelope) while ours succeeds -- this is
     the EXPECTED, demonstrating result, not a bug in this reporting function."""
-    ours_path = tmp_path / f"{condition_name(model='m/a', seq_len=8192, arm='ours')}.json"
-    stock_path = tmp_path / f"{condition_name(model='m/a', seq_len=8192, arm='stock')}.json"
+    ours_path, stock_path = _pair_paths(tmp_path, seq_len=8192)
     _write_result(ours_path, status="ok", tokens_per_sec_median=50.0, loss_all=[1.0])
     _write_result(stock_path, status="error", error_type="WorkerCrashed",
                   error_msg="RuntimeError: [malloc] Attempting to allocate ...")
     entry = compare_ours_vs_stock(
         {ours_path.stem: ours_path, stock_path.stem: stock_path},
-        model="m/a", seq_len=8192,
+        model="m/a", seq_len=8192, attention_impl="stock",
     )
     assert entry["status"] == "incomplete"
     assert entry["ours_status"] == "ok"
@@ -293,27 +320,25 @@ def test_compare_reports_incomplete_when_stock_oomed(tmp_path: Path) -> None:
 
 
 def test_compare_refuses_a_cross_session_comparison(tmp_path: Path) -> None:
-    ours_path = tmp_path / f"{condition_name(model='m/a', seq_len=1024, arm='ours')}.json"
-    stock_path = tmp_path / f"{condition_name(model='m/a', seq_len=1024, arm='stock')}.json"
+    ours_path, stock_path = _pair_paths(tmp_path)
     _write_result(ours_path, status="ok", tokens_per_sec_median=1.0, loss_all=[1.0],
                   session_id="old")
     _write_result(stock_path, status="ok", tokens_per_sec_median=1.0, loss_all=[1.0],
                   session_id="new")
     entry = compare_ours_vs_stock(
         {ours_path.stem: ours_path, stock_path.stem: stock_path},
-        model="m/a", seq_len=1024,
+        model="m/a", seq_len=1024, attention_impl="stock",
     )
     assert entry["status"] == "cross_session"
 
 
 def test_compare_skips_loss_curve_diff_when_lengths_differ(tmp_path: Path) -> None:
-    ours_path = tmp_path / f"{condition_name(model='m/a', seq_len=1024, arm='ours')}.json"
-    stock_path = tmp_path / f"{condition_name(model='m/a', seq_len=1024, arm='stock')}.json"
+    ours_path, stock_path = _pair_paths(tmp_path)
     _write_result(ours_path, status="ok", tokens_per_sec_median=1.0, loss_all=[1.0, 2.0])
     _write_result(stock_path, status="ok", tokens_per_sec_median=1.0, loss_all=[1.0])
     entry = compare_ours_vs_stock(
         {ours_path.stem: ours_path, stock_path.stem: stock_path},
-        model="m/a", seq_len=1024,
+        model="m/a", seq_len=1024, attention_impl="stock",
     )
     assert entry["status"] == "ok"
     assert "loss_curve_worst_diff" not in entry
@@ -322,10 +347,13 @@ def test_compare_skips_loss_curve_diff_when_lengths_differ(tmp_path: Path) -> No
 def test_build_report_covers_every_model_seq_len_pair(tmp_path: Path) -> None:
     for model in ("m/a", "m/b"):
         for arm in ("ours", "stock"):
-            p = tmp_path / f"{condition_name(model=model, seq_len=1024, arm=arm)}.json"
+            p = tmp_path / (
+                f"{condition_name(model=model, seq_len=1024, arm=arm, attention_impl='stock')}"
+                ".json"
+            )
             _write_result(p, status="ok", tokens_per_sec_median=1.0, loss_all=[1.0])
     paths = list(tmp_path.glob("*.json"))
-    rows = build_report(paths, models=["m/a", "m/b"], seq_lens=[1024])
+    rows = build_report(paths, models=["m/a", "m/b"], seq_lens=[1024], attention_impl="stock")
     assert len(rows) == 2
     assert {row["model"] for row in rows} == {"m/a", "m/b"}
     assert all(row["status"] == "ok" for row in rows)

@@ -451,8 +451,7 @@ def test_cmd_contribute_prints_eta_and_pr_on_success(
     captured = capsys.readouterr()
     assert rc == 0
     assert "estimated time" in captured.out
-    assert "10" in captured.out          # the quick ETA range low bound
-    assert "15" in captured.out          # ... and high bound
+    assert "~1-5 min" in captured.out    # the retightened quick ETA range (0022e)
     assert "Community benchmark: Apple M1 Max 32 GB" in captured.out
     assert "battery" in captured.err                              # warning to stderr
 

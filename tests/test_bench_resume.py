@@ -531,6 +531,32 @@ def test_worker_main_records_refusal_not_a_crash(
     assert "watchdog" in data["error"]
 
 
+def test_worker_main_records_environment_refusal_distinctly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """0022d: a too-crowded-at-start refusal (guards' `MemoryBudgetError` out of
+    `effective_memory_ceiling`) is ENVIRONMENT-transient -- a distinct
+    `refused_environment` status, never a `WorkerCrashed` envelope and never the
+    condition-intrinsic `refused`. Only `"ok"` is fresh on resume, so a later, quieter
+    invocation re-runs it automatically."""
+    out = tmp_path / "r.json"
+    cfg = tmp_path / "config.json"
+    cfg.write_text(json.dumps({
+        "kind": "loss_layer", "params": {"n": 8, "d": 4, "v": 16}, "session_id": "s1",
+        "out": str(out),
+    }))
+
+    def _too_crowded() -> EffectiveCeiling:
+        raise MemoryBudgetError("machine too crowded to start safely")
+
+    monkeypatch.setattr(worker, "effective_memory_ceiling", _too_crowded)
+    rc = worker.main(["--config", str(cfg)])
+    assert rc == 0                    # transient environment refusal IS a result
+    data = json.loads(out.read_text())
+    assert data["status"] == "refused_environment"
+    assert "crowded" in data["error"]
+
+
 def test_worker_main_crashes_on_unsupported_kind(tmp_path: Path) -> None:
     out = tmp_path / "r.json"
     cfg = tmp_path / "config.json"

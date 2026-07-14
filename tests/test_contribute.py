@@ -162,22 +162,25 @@ def test_benches_for_tier_rejects_unknown_tier() -> None:
         benches_for_tier("bogus")
 
 
-def test_eta_minutes_for_tier_quick_is_the_briefs_10_to_15_min() -> None:
-    assert eta_minutes_for_tier("quick") == (10.0, 15.0)
+def test_eta_minutes_for_tier_quick_is_anchored_to_the_measured_run() -> None:
+    # 0022e: the first real quick-tier run measured ~1 min wall against a printed
+    # 10-15 min ETA (~10x over-wide). Re-anchored: low edge = the measured M1 Max wall,
+    # high edge a 5x machine-variance bound -- still safe-direction, now honest.
+    assert eta_minutes_for_tier("quick") == (1.0, 5.0)
 
 
 def test_eta_minutes_for_tier_full_is_roughly_one_to_two_hours() -> None:
     low, high = eta_minutes_for_tier("full")
     assert low >= 60.0            # at least ~1 h
     assert high <= 150.0          # no more than ~2.5 h
-    assert (low, high) == (70.0, 135.0)
+    assert (low, high) == (61.0, 125.0)
 
 
 def test_format_eta_mentions_the_tier_and_a_range() -> None:
     text = format_eta("quick")
     assert "quick" in text
-    assert "10" in text
-    assert "15" in text
+    assert "1" in text
+    assert "5" in text
 
 
 # --- pre-flight decision (pure) -------------------------------------------------------
@@ -645,11 +648,14 @@ def test_spawn_script_runs_a_subprocess_and_globs_the_output(tmp_path: Path) -> 
 
 
 def test_spawn_script_records_a_crash_envelope_when_rc_nonzero_and_nothing_was_written(
-    tmp_path: Path,
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
 ) -> None:
     """Finding B: a script that crashes before writing ANY artifact must not glob-read
     as a clean, empty bench -- `_spawn_script` mirrors `bench.runner.run_conditions`'s
-    `WorkerCrashed` envelope (status "error", error_type, a stderr tail) instead."""
+    `WorkerCrashed` envelope (status "error", error_type, a stderr tail) instead.
+    0022e: the failure also prints a courtesy output tail to the CONSOLE, so a
+    contributor watching a captured (silent) run learns what broke without opening the
+    artifact."""
     code = "import sys; print('boom explanation', file=sys.stderr); sys.exit(3)"
     paths = contribute._spawn_script(["-c", code], out_dir=tmp_path)
     assert len(paths) == 1
@@ -658,6 +664,9 @@ def test_spawn_script_records_a_crash_envelope_when_rc_nonzero_and_nothing_was_w
     assert data["error_type"] == "WorkerCrashed"
     assert "boom explanation" in data["error_msg"]
     assert data["returncode"] == 3
+    printed = capsys.readouterr().out
+    assert "boom explanation" in printed
+    assert "exit 3" in printed
 
 
 def test_spawn_script_respects_a_partial_artifact_the_crashed_script_already_wrote(
@@ -881,3 +890,17 @@ def test_contribute_quick_tier_end_to_end(tmp_path: Path) -> None:
     art = json.loads(result.artifact_path.read_text())
     assert art["schema_version"] == COMMUNITY_SCHEMA_VERSION
     assert {b["bench"] for b in art["benches"]} == {"loss_layer", "attention_op"}
+
+
+def test_bench_status_label_counts_machine_busy_separately() -> None:
+    """0022d: a `refused_environment` condition (too crowded at start) reads as "machine
+    busy" on the kit's progress line -- distinct from ok counts and from real errors."""
+    summary: dict[str, object] = {"conditions": [
+        {"status": "ok"}, {"status": "refused_environment"}, {"status": "error"},
+    ]}
+    assert contribute._bench_status_label(summary) == "1/3 ok (1 machine-busy)"
+
+
+def test_bench_status_label_omits_busy_note_when_none() -> None:
+    summary: dict[str, object] = {"conditions": [{"status": "ok"}, {"status": "ok"}]}
+    assert contribute._bench_status_label(summary) == "2/2 ok"
