@@ -33,7 +33,6 @@ a survival here is TODAY'S-STATE evidence and never licenses raising any pinned 
 import json
 import os
 import platform
-import statistics
 import subprocess
 import sys
 import time
@@ -120,6 +119,7 @@ def _run_child(code: str, env_extra: dict[str, str]) -> str:
     env = dict(os.environ, **env_extra)
     out = subprocess.run(
         [sys.executable, "-c", code], capture_output=True, text=True, env=env, timeout=600,
+        check=False,
     )
     if out.returncode != 0:
         return f"CHILD_FAILED rc={out.returncode} stderr_tail={out.stderr[-800:]}"
@@ -154,7 +154,7 @@ def main() -> None:
     }
     print("   ", results["probe2_big_sizes"])
 
-    print("probe 3/3: real dK/dV chain at 12288, total FAR above the old 2.0 s class (~1-2 min) ...")
+    print("probe 3/3: real dK/dV chain at 12288, far above the old 2.0 s class (~1-2 min) ...")
     results["probe3_dkv_chain_12288"] = {
         "result": _run_child(_CHILD_DKV_CHAIN, {}),
         "fields": "wall_s finite_ok peak_bytes",

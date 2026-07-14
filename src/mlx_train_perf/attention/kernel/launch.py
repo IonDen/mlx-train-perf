@@ -7,7 +7,8 @@ any rate. Forward O/L rows are DISJOINT across query blocks, so the launcher loo
 query-row-range dispatches, each writing its own tile-local (b, hq, rows, d) chunk (the CE
 forward's disjoint-output pattern -- no accumulator chaining), and reassembles with
 `mx.concatenate`. It SPLITS rather than refuses; `LaunchBudgetError` is raised only when
-even one minimal range (or the whole forward's total time) over-budgets.
+the shape cannot be planned within the per-command-buffer budget (the 0.3.0 buffer model,
+backlog 0025 -- see `plan_budgeted_ranges` and the constants block below).
 
 Full buffers + an in-kernel query-row offset (`qoffs`), never a Python-side `q[r0:r1]`
 slice into a chained launch (the CE kernel's measured 1.22 GB retained-copy lesson --
@@ -82,19 +83,23 @@ from mlx_train_perf.errors import AttentionInputError, LaunchBudgetError
 # permissive-day survival never licenses raising it.
 MAX_DISPATCH_SECONDS = 0.5
 _CANARY_BUDGET_S = 0.1   # projected cost of the calibration's final full-working-set probe
-# 2.0, NOT 60 (T6 rung-0, second measurement): the OS kill is per COMMAND BUFFER /
-# cumulative eval GPU-time, not per dispatch -- 35 honest ~0.25s-real range dispatches
-# packed into one eval (~8.7s total) were killed even though every dispatch was inside its
-# own budget; MLX packs consecutive custom-kernel dispatches, and Python cannot flush
-# buffers from inside a compiled/traced region. The CE kernel's ~2.2s evals have never
-# been killed, so ~2s is the proven-safe class for one eval's packed custom-kernel work.
-# Consequence: a flagship v0-scalar forward REFUSES honestly (its 8.7s total cannot ship);
-# MMA-class rates fit a full forward far inside this cap. The same 2026-07-10 probe packed
-# 8.6-9.2s single-eval work that all SURVIVED on a permissive day -- but the kill is
-# system-state-dependent (a kill-active day still bounds one eval's packed custom-kernel work to
-# the ~2s class), so this too stays pinned to the worst observed day; a permissive-day probe
-# never licenses raising it.
-MAX_TOTAL_SECONDS = 2.0
+# 0.3.0 (backlog 0025, launch-budget evidence study): the OS kill unit is the individual
+# COMMAND BUFFER -- there is no chain-total or per-eval kill mechanism (the retired
+# MAX_TOTAL_SECONDS = 2.0 guarded a mis-attributed reading of the rung-0 kill: those "35
+# packed dispatches" were really ~4-6-dispatch ~1.0-1.5 s packed BUFFERS dying on a
+# kill-active day; external corroboration ml-explore/mlx#3267). mlx 0.32.0 commits a buffer
+# when it holds >50 ops OR >50 M unique input+output ELEMENTS (device.cpp needs_commit,
+# L512-515; array.data_size() counts elements; outputs count via set_output_array; both
+# counters reset per commit; 50/50 is the LARGEST arch class ('s'/'d' -- max/ultra), so
+# modeling with it never predicts a commit an arch with smaller limits would skip). The
+# planner (`plan_budgeted_ranges`) models that composition and caps each MODELED BUFFER's
+# summed projected time at MAX_DISPATCH_SECONDS -- which therefore stays the ONE pinned
+# worst-day budget (projected ~0.5 s = ~0.25 s real behind the 2x SAFETY margin; never
+# killed on any observed day, while ~0.5-1.0 s-real buffers died on the kill-active day).
+# Full evidence: docs/superpowers/research/2026-07-14-mlx-train-perf-launch-budget-evidence.md
+# (workspace root) + scripts/probe_command_buffer_packing.py.
+_PACK_COMMIT_ELEMS = 51 << 20   # buffer_sizes_ >> 20 > 50  <=>  elements >= 51 * 2^20
+_PACK_COMMIT_OPS = 51           # buffer_ops_ > 50          <=>  ops >= 51
 SAFETY_FACTOR = 0.5      # halve the measured rate (session drift + probe noise, 2x margin)
 _PROBE_N_FLOOR = 128     # ramp's minimum/starting probe key-count -- the original fixed
                          # probe shape, small enough to be safe at any plausible v0 rate
@@ -150,37 +155,154 @@ def _fwd_macs_per_row(*, n: int, d: int, b: int, hq: int) -> int:
     return 2 * d * n * b * hq
 
 
-def _check_launch_budget(*, per_row: int, n: int, rows: int, rate: float) -> None:
-    """Refuse-before-launch, shared by the forward and the dQ backward (query-range split
-    kernels with the same watchdog exposure): the GPU watchdog SIGABRT is uncatchable.
-    Projects both the per-dispatch time (this range of `rows` query rows at the given
-    per-row MAC cost) and the whole pass's total time, and raises if either exceeds its
-    budget. `per_row` is the caller's conservative per-query-row MAC upper bound (2*D*n*b*hq
-    for the forward, 3*D*n*b*hq for dQ) -- the only kernel-specific input to this math."""
-    per_dispatch = rows * per_row / rate
-    total = n * per_row / rate
-    if per_dispatch > MAX_DISPATCH_SECONDS or total > MAX_TOTAL_SECONDS:
-        raise LaunchBudgetError(
-            f"projected {per_dispatch:.2f} s/dispatch ({rows} rows), {total:.0f} s total "
-            f"at {rate / 1e9:.1f} G MAC/s (budget {MAX_DISPATCH_SECONDS} s / "
-            f"{MAX_TOTAL_SECONDS} s). Reduce shape/context, or pass a measured rate."
+def causal_pairs(r0: int, r1: int) -> int:
+    """Exact (query, key) pair count for causal query rows [r0, r1): row i attends to the
+    i+1 keys j <= i, so this is `sum_{i=r0}^{r1-1} (i+1) = (r1-r0)(r0+r1+1)/2`. The 0.3.0
+    projection basis (backlog 0025): the old full-rectangle per-row cost over-charged causal
+    work ~2x -- an upper bound the budget model no longer needs, since the exact count is
+    itself an upper bound of nothing (it IS the work) and the 2x SAFETY_FACTOR on the rate
+    carries the margin."""
+    rows = r1 - r0
+    return rows * (r0 + r1 + 1) // 2
+
+
+def range_macs(*, r0: int, r1: int, n: int, pair_cost: int, causal: bool) -> int:
+    """Exact MAC count for query rows [r0, r1) of an n-key pass. `pair_cost` is the MACs one
+    (query, key) pair costs across every (batch, q-head): `2*D*b*hq` forward, `3*D*b*hq` dQ,
+    `4*D*b*hq` dK/dV -- i.e. `macs_per_row(n=1, ...)` of the matching nominal cost model.
+    Causal charges the exact triangle; non-causal charges the full rectangle (exact there)."""
+    if causal:
+        return causal_pairs(r0, r1) * pair_cost
+    return (r1 - r0) * n * pair_cost
+
+
+def _widest_within(
+    *, r0: int, n: int, pair_cost: int, rate: float, causal: bool,
+    budget_s: float, block_align: int,
+) -> int:
+    """Widest row count `w` (a `block_align` multiple, except a final tail reaching n) whose
+    range [r0, r0+w) projects within `budget_s` at `rate`; 0 when even the minimal unit does
+    not fit. Pure arithmetic; the closed-form causal solve is belt-verified against
+    `range_macs` so float error can never return an over-budget width."""
+    budget_macs = budget_s * rate
+    if budget_macs <= 0:
+        return 0
+    if causal:
+        # w rows starting at r0 cost w*(2*r0 + w + 1)/2 pairs: solve the quadratic bound.
+        bp = budget_macs / pair_cost
+        a = 2 * r0 + 1
+        w = int((math.sqrt(a * a + 8.0 * bp) - a) / 2)
+    else:
+        w = int(budget_macs / (n * pair_cost))
+    w = min(w, n - r0)
+    if w < n - r0 and block_align > 1:
+        w = (w // block_align) * block_align
+    step = block_align if block_align > 1 else 1
+    while w > 0 and (
+        range_macs(r0=r0, r1=r0 + w, n=n, pair_cost=pair_cost, causal=causal) / rate
+        > budget_s
+    ):
+        w -= step
+    return max(0, w)
+
+
+def plan_budgeted_ranges(
+    *, n: int, pair_cost: int, rate: float, causal: bool,
+    live_input_elems: int,
+    output_elems_per_range: Callable[[int, int], int] | None = None,
+    block_align: int = 1,
+) -> list[tuple[int, int]]:
+    """Ascending contiguous query ranges tiling [0, n) exactly, sized so that every MODELED
+    COMMAND BUFFER's summed projected time stays within `MAX_DISPATCH_SECONDS` -- the 0.3.0
+    launch guard (backlog 0025: the macOS interactivity kill applies to an individual command
+    buffer, never a chain or eval total, so there is NO chain-total cap).
+
+    Buffer composition follows mlx 0.32.0's verified commit rule (module constants above): a
+    modeled buffer accumulates our dispatches until its GUARANTEED-counted unique elements
+    reach `_PACK_COMMIT_ELEMS` or its ops reach `_PACK_COMMIT_OPS`, then resets.
+    Guaranteed-counted = `live_input_elems` (the caller-held tensors every dispatch reads --
+    stable buffers, counted once per command buffer by mlx) plus, when the caller's per-range
+    outputs provably stay live across the whole chain (the forward's O/L chunks, dQ's chunks
+    -- all held until the final concatenate), `output_elems_per_range` per dispatch. The
+    chained dK/dV passes None: its intermediate accumulators are freed mid-chain and their
+    buffers can be recycled by the allocator, so crediting them could model a commit reality
+    skips -- the ONLY unsafe direction. Ops other frameworks interleave between our
+    dispatches only ADD elements/ops (earlier real commits = shorter real buffers = safe).
+
+    Consequences: at flagship shapes (unique inputs alone >= the threshold) every dispatch
+    owns its buffer and a chain may project an UNBOUNDED total; at small-footprint shapes
+    dispatches must be assumed to pack, so the whole chain is capped at one buffer budget --
+    tighter than the retired 2.0 s chain cap, and honest about the mechanism.
+
+    `block_align` rounds range widths DOWN to block multiples (the mma dK/dV variant passes
+    32 so a split never bisects a query block -- the chained bit-identity contract), except a
+    final tail that reaches n. Raises `LaunchBudgetError` (the 0.1.0 refusal contract) when
+    even one minimal unit cannot fit its modeled buffer -- never returns an over-budget range
+    for the uncatchable GPU watchdog to hit."""
+    ranges: list[tuple[int, int]] = []
+    r0 = 0
+    buf_elems = 0
+    buf_ops = 0
+    buf_time = 0.0
+    while r0 < n:
+        if buf_ops == 0:
+            buf_elems = live_input_elems
+        w = _widest_within(
+            r0=r0, n=n, pair_cost=pair_cost, rate=rate, causal=causal,
+            budget_s=MAX_DISPATCH_SECONDS - buf_time, block_align=block_align,
         )
+        if w == 0:
+            unit = min(n - r0, max(1, block_align))
+            t_unit = range_macs(
+                r0=r0, r1=r0 + unit, n=n, pair_cost=pair_cost, causal=causal
+            ) / rate
+            if buf_ops == 0:
+                raise LaunchBudgetError(
+                    f"projected {t_unit:.2f} s for the minimal {unit}-row range at query "
+                    f"row {r0} exceeds the {MAX_DISPATCH_SECONDS} s per-command-buffer "
+                    f"budget at {rate / 1e9:.1f} G MAC/s. Reduce shape/context, or pass a "
+                    "measured rate."
+                )
+            raise LaunchBudgetError(
+                f"chained dispatches cannot be guaranteed their own command buffers "
+                f"(unique input elements {live_input_elems} < the {_PACK_COMMIT_ELEMS} "
+                f"commit threshold), and a packed buffer would exceed the "
+                f"{MAX_DISPATCH_SECONDS} s budget ({buf_time:.2f} s already modeled across "
+                f"{buf_ops} dispatches at {rate / 1e9:.1f} G MAC/s). Reduce shape/context, "
+                "or pass a measured rate."
+            )
+        r1 = r0 + w
+        buf_time += range_macs(r0=r0, r1=r1, n=n, pair_cost=pair_cost, causal=causal) / rate
+        buf_ops += 1
+        if output_elems_per_range is not None:
+            buf_elems += output_elems_per_range(r0, r1)
+        ranges.append((r0, r1))
+        r0 = r1
+        if buf_elems >= _PACK_COMMIT_ELEMS or buf_ops >= _PACK_COMMIT_OPS:
+            buf_elems = 0
+            buf_ops = 0
+            buf_time = 0.0
+    return ranges
 
 
-def _rows_within_dispatch_budget(*, per_row: int, n: int, rate: float) -> int:
-    """Largest query-row range whose projected dispatch stays within the per-dispatch budget
-    at `rate` for the given per-row MAC cost -- shared by the forward and dQ splits. Floors at
-    1 row (refusing an over-budget single row is `_check_launch_budget`'s job, not this sizing
-    heuristic's); never exceeds `n`."""
-    rows = int(MAX_DISPATCH_SECONDS * rate / per_row)
-    return max(1, min(n, rows))
-
-
-def check_fwd_budget(*, n: int, d: int, b: int, hq: int, rows: int, rate: float) -> None:
-    """Refuse-before-launch for the forward (see `_check_launch_budget`)."""
-    _check_launch_budget(
-        per_row=_fwd_macs_per_row(n=n, d=d, b=b, hq=hq), n=n, rows=rows, rate=rate
+def plan_fwd_dispatches(
+    *, n: int, d: int, b: int, hq: int, hkv: int, rate: float, causal: bool,
+) -> list[tuple[int, int]]:
+    """The forward's query-range plan: 2*D per pair; live inputs q + k + v; O/L chunk
+    outputs credited (all chunks stay live until the reassembling concatenate)."""
+    return plan_budgeted_ranges(
+        n=n, pair_cost=2 * d * b * hq, rate=rate, causal=causal,
+        live_input_elems=b * hq * n * d + 2 * b * hkv * n * d,
+        output_elems_per_range=lambda r0, r1: b * hq * (r1 - r0) * (d + 1),
     )
+
+
+def check_fwd_budget(
+    *, n: int, d: int, b: int, hq: int, hkv: int, rate: float, causal: bool,
+) -> None:
+    """Refuse-before-launch for the forward: raises `LaunchBudgetError` iff the shape cannot
+    be planned within the per-command-buffer budget (see `plan_budgeted_ranges`)."""
+    plan_fwd_dispatches(n=n, d=d, b=b, hq=hq, hkv=hkv, rate=rate, causal=causal)
 
 
 @functools.cache
@@ -217,48 +339,49 @@ def _fwd_kernel(
     return cast(_MetalKernel, kernel)
 
 
-def _rows_per_dispatch(*, n: int, d: int, b: int, hq: int, rate: float) -> int:
-    """Largest forward query-row range within the per-dispatch budget (see
-    `_rows_within_dispatch_budget`)."""
-    return _rows_within_dispatch_budget(
-        per_row=_fwd_macs_per_row(n=n, d=d, b=b, hq=hq), n=n, rate=rate
-    )
-
-
 def launch_flash_fwd(
     q: mx.array, k: mx.array, v: mx.array, *,
     scale: float, causal: bool, tile: TileShape,
     rate_macs_per_s: float | None = None,
     _flip_causal: bool = False,
+    _force_ranges: list[tuple[int, int]] | None = None,
 ) -> tuple[mx.array, mx.array]:
     """v0 flash-attention forward -> (O, L). O has q's shape/dtype; L is (B, Hq, N) fp32.
 
     `rate_macs_per_s`: when None, a single dispatch over all rows with no budget check
-    (safe only at small N -- the direct/test path); when given, the launcher sizes the
-    query-row split from it and refuses (`LaunchBudgetError`) if even one minimal range or
-    the total over-budgets. The API path always passes a calibrated rate (see
-    `calibrated_fwd_rate`), so a flagship call splits instead of tripping the watchdog.
+    (safe only at small N -- the direct/test path); when given, the launcher plans the
+    query-row split via `plan_fwd_dispatches` (exact-causal costs, per-command-buffer
+    budget) and refuses (`LaunchBudgetError`) when the shape cannot be planned. The API
+    path always passes a calibrated rate (see `calibrated_fwd_rate`), so a flagship call
+    splits instead of tripping the watchdog.
 
-    `_flip_causal` is TEST-ONLY (wrong-mask perturbation -- see source.py).
+    `_flip_causal` is TEST-ONLY (wrong-mask perturbation -- see source.py). `_force_ranges`
+    is TEST-ONLY too (the split-forcing seam: the production planner never splits a tiny
+    packed-regime shape, but the split/reassembly contract still needs its own proof).
     """
     b, hq, n, d = q.shape
-    if rate_macs_per_s is None:
-        rows_per = n
+    hkv = k.shape[1]
+    if _force_ranges is not None:
+        ranges = _force_ranges
+    elif rate_macs_per_s is None:
+        ranges = [(0, n)]
     else:
-        rows_per = _rows_per_dispatch(n=n, d=d, b=b, hq=hq, rate=rate_macs_per_s)
-        check_fwd_budget(n=n, d=d, b=b, hq=hq, rows=rows_per, rate=rate_macs_per_s)
+        ranges = plan_fwd_dispatches(
+            n=n, d=d, b=b, hq=hq, hkv=hkv, rate=rate_macs_per_s, causal=causal,
+        )
 
     kernel = _fwd_kernel(d, causal, _flip_causal, tile.variant, tile.d_slab)
     scale_in = mx.array([scale], dtype=mx.float32)
     o_chunks: list[mx.array] = []
     l_chunks: list[mx.array] = []
-    for r0 in range(0, n, rows_per):
-        r1 = min(r0 + rows_per, n)
+    for r0, r1 in ranges:
         o_c, l_c = _dispatch_range(
             kernel, q, k, v, scale_in, r0=r0, r1=r1, tile=tile,
         )
         o_chunks.append(o_c)
         l_chunks.append(l_c)
+    if len(o_chunks) == 1:
+        return o_chunks[0], l_chunks[0]
     return mx.concatenate(o_chunks, axis=2), mx.concatenate(l_chunks, axis=2)
 
 
@@ -372,6 +495,7 @@ def _calibrate_fwd(
     *, measure: Callable[[int, int], float], n: int, d: int, b: int, hq: int,
     start_n: int, max_stages: int = 3,
     macs_per_row: Callable[..., int] = _fwd_macs_per_row,
+    causal: bool,
 ) -> float:
     """Ramp through probe key-counts under real (or, in unit tests, fake) dispatch
     timings, mirroring `core/kernel/launch.calibrate`'s ramp/sustain/median shape exactly
@@ -393,12 +517,25 @@ def _calibrate_fwd(
     per-kernel backward rates (`calibrated_bwd_dq_rate` at `3*D`, `calibrated_bwd_dkv_rate` at
     `4*D`) reuse this exact ramp/canary machinery by passing their own cost (design point 4) -- so
     the ONLY kernel-specific input is this one additive parameter. T6's KV-block tiling changes
-    the cost model: re-validate both budgets then."""
+    the cost model: re-validate both budgets then.
+
+    0.3.0 (backlog 0025): rates are CREDITED with the probe's exact-causal work when
+    `causal=True` (a self-shaped [0, np) probe does np(np+1)/2 pairs, not np^2; the tail
+    canary [n-rows, n) does its own exact triangle slice), so the returned MAC/s means
+    "causal-true MACs per second" -- consistent with `plan_budgeted_ranges`' projection
+    accounting. Probe SIZING (`_next_probe_n`/`_canary_rows`) keeps the nominal full-
+    rectangle cost: with causal-credited rates that over-estimates probe cost and sizes
+    probes smaller, the safe direction."""
+    pair_cost = macs_per_row(n=1, d=d, b=b, hq=hq)
+
+    def _credit(rows: int, keys: int) -> int:
+        return range_macs(r0=keys - rows, r1=keys, n=keys, pair_cost=pair_cost, causal=causal)
+
     np_ = start_n
     per_dispatch_s = 0.0
     for _stage in range(max_stages):
         per_dispatch_s = measure(np_, np_)
-        raw_rate = macs_per_row(n=np_, d=d, b=b, hq=hq) * np_ / max(per_dispatch_s, 1e-9)
+        raw_rate = _credit(np_, np_) / max(per_dispatch_s, 1e-9)
         candidate = _next_probe_n(
             rate_macs_per_s=SAFETY_FACTOR * raw_rate, n=n, d=d, b=b, hq=hq,
             macs_per_row=macs_per_row,
@@ -410,7 +547,7 @@ def _calibrate_fwd(
         measure(np_, np_)
     timings = [measure(np_, np_) for _ in range(3)]
     median_s = statistics.median(timings)
-    ramp_rate = macs_per_row(n=np_, d=d, b=b, hq=hq) * np_ / max(median_s, 1e-9)
+    ramp_rate = _credit(np_, np_) / max(median_s, 1e-9)
     if np_ >= n:
         return ramp_rate
     rows = _canary_rows(
@@ -418,7 +555,7 @@ def _calibrate_fwd(
     )
     canary_timings = [measure(rows, n) for _ in range(3)]
     canary_median = statistics.median(canary_timings)
-    return macs_per_row(n=n, d=d, b=b, hq=hq) * rows / max(canary_median, 1e-9)
+    return _credit(rows, n) / max(canary_median, 1e-9)
 
 
 def calibrated_fwd_rate(
@@ -482,7 +619,7 @@ def calibrated_fwd_rate(
 
     start_n = _start_probe_n(n)
     raw_rate = _calibrate_fwd(
-        measure=measure, n=n, d=head_dim, b=b, hq=hq, start_n=start_n,
+        measure=measure, n=n, d=head_dim, b=b, hq=hq, start_n=start_n, causal=causal,
     )
     rate = SAFETY_FACTOR * raw_rate
     _FWD_RATE_CACHE[key] = rate
@@ -551,11 +688,11 @@ def launch_bwd_D(  # noqa: N802 -- D is the paper's name
 # ---------------------------------------------------------------------------------------
 # Backward: dQ launcher -- T8. One owner per query row (see source.py's block comment above
 # `_BWD_DQ_TEMPLATE`). dQ rows are DISJOINT across query blocks -- no accumulator chaining --
-# so this reuses the FORWARD's query-range multi-dispatch split machinery (`_check_launch_
-# budget` / `_rows_within_dispatch_budget`, the same watchdog budgets), differing only in the
-# per-row MAC cost (3*D vs the forward's 2*D: a QK dot + a dO.V dot + a dq accumulate per key)
-# and the single dQ output. It SPLITS rather than refuses; `LaunchBudgetError` is raised only
-# when even one minimal range (or the whole dQ pass's total) over-budgets.
+# so this reuses the FORWARD's query-range planning machinery (`plan_budgeted_ranges`, the
+# same per-command-buffer budget), differing only in the per-pair MAC cost (3*D vs the
+# forward's 2*D: a QK dot + a dO.V dot + a dq accumulate per key) and the single dQ output.
+# It SPLITS rather than refuses; `LaunchBudgetError` is raised only when the shape cannot be
+# planned within the per-buffer budget (see `plan_dq_dispatches`).
 #
 # The BACKWARD-specific calibrated rate is NOT wired here: T8 accepts `rate_macs_per_s=None`
 # (single dispatch, the tiny-shape/test path) or a caller-passed rate; the calibrated-rate
@@ -708,12 +845,25 @@ def _dispatch_bwd_dq_range(
     return dq_c
 
 
+def plan_dq_dispatches(
+    *, n: int, d: int, b: int, hq: int, hkv: int, rate: float, causal: bool,
+) -> list[tuple[int, int]]:
+    """The dQ backward's query-range plan: 3*D per pair; live inputs q/k/v/dO/L/D; dQ chunk
+    outputs credited (all chunks stay live until the reassembling concatenate)."""
+    return plan_budgeted_ranges(
+        n=n, pair_cost=3 * d * b * hq, rate=rate, causal=causal,
+        live_input_elems=2 * b * hq * n * d + 2 * b * hkv * n * d + 2 * b * hq * n,
+        output_elems_per_range=lambda r0, r1: b * hq * (r1 - r0) * d,
+    )
+
+
 def launch_bwd_dq(
     q: mx.array, k: mx.array, v: mx.array, d_o: mx.array,
     lse: mx.array, d_arr: mx.array, *,
     scale: float, causal: bool, rate_macs_per_s: float | None = None,
     variant: str = "scalar", d_slab: int | None = None,
     _flip_causal: bool = False,
+    _force_ranges: list[tuple[int, int]] | None = None,
 ) -> mx.array:
     """dQ backward -> the query gradient, with q's shape/dtype. Consumes the forward's saved
     L (`lse`, fp32 (B, Hq, N)) and T7's D (`d_arr`, fp32 (B, Hq, N)); recomputes S/P from
@@ -727,32 +877,39 @@ def launch_bwd_dq(
     the calibrated-rate path (graduation + the saturation d_slab sweep are a later rung).
 
     `rate_macs_per_s`: when None, a single dispatch over all rows with no budget check (safe
-    only at small N -- the tiny-shape/test path); when given, the launcher sizes the query-row
-    split from it and refuses (`LaunchBudgetError`) if even one minimal range or the total
-    over-budgets. dQ rows are disjoint across query blocks, so the reassembly (a plain
-    `mx.concatenate` over the row axis) needs no accumulator chaining, and this holds for the
-    mma variant too (each 32-row query block's dQ depends only on its own absolute rows).
+    only at small N -- the tiny-shape/test path); when given, the launcher plans the query-row
+    split via `plan_dq_dispatches` (exact-causal costs, per-command-buffer budget) and refuses
+    (`LaunchBudgetError`) when the shape cannot be planned. dQ rows are disjoint across query
+    blocks, so the reassembly (a plain `mx.concatenate` over the row axis) needs no accumulator
+    chaining, and this holds for the mma variant too (each 32-row query block's dQ depends only
+    on its own absolute rows).
 
-    `_flip_causal` is TEST-ONLY (wrong-triangle causal-skip perturbation -- see source.py)."""
+    `_flip_causal` is TEST-ONLY (wrong-triangle causal-skip perturbation -- see source.py);
+    `_force_ranges` is TEST-ONLY too (the split-forcing seam -- the production planner never
+    splits a tiny packed-regime shape)."""
     _validate_bwd_dq_shapes(q, k, v, d_o, lse, d_arr)
     b, hq, n, d = q.shape
-    if rate_macs_per_s is None:
-        rows_per = n
+    hkv = k.shape[1]
+    if _force_ranges is not None:
+        ranges = _force_ranges
+    elif rate_macs_per_s is None:
+        ranges = [(0, n)]
     else:
-        per_row = _bwd_dq_macs_per_row(n=n, d=d, b=b, hq=hq)
-        rows_per = _rows_within_dispatch_budget(per_row=per_row, n=n, rate=rate_macs_per_s)
-        _check_launch_budget(per_row=per_row, n=n, rows=rows_per, rate=rate_macs_per_s)
+        ranges = plan_dq_dispatches(
+            n=n, d=d, b=b, hq=hq, hkv=hkv, rate=rate_macs_per_s, causal=causal,
+        )
 
     kernel = _bwd_dq_kernel(d, causal, _flip_causal, variant, d_slab)
     scale_in = mx.array([scale], dtype=mx.float32)
     dq_chunks: list[mx.array] = []
-    for r0 in range(0, n, rows_per):
-        r1 = min(r0 + rows_per, n)
+    for r0, r1 in ranges:
         dq_chunks.append(
             _dispatch_bwd_dq_range(
                 kernel, q, k, v, d_o, lse, d_arr, scale_in, r0=r0, r1=r1, variant=variant,
             )
         )
+    if len(dq_chunks) == 1:
+        return dq_chunks[0]
     return mx.concatenate(dq_chunks, axis=2)
 
 
@@ -765,9 +922,9 @@ def launch_bwd_dq(
 # seeded from the prior dispatch's output (`dk_in`/`dv_in`), full buffers + in-kernel offsets
 # (never a Python-side slice -- the CE kernel's 1.22 GB retained-copy lesson). The fp32
 # accumulator is cast down to k/v dtype exactly once, after the last dispatch. `plan_dkv_
-# dispatches` sizes the ascending contiguous query-range split from the calibrated backward
-# rate and refuses (`LaunchBudgetError`) if even one minimal range -- or the whole pass's
-# total wall -- over-budgets (the shared `_check_launch_budget` math, at the dK/dV 4*D cost).
+# dispatches` plans the ascending contiguous query-range split from the calibrated backward
+# rate (exact-causal costs at the dK/dV 4*D pair cost, per-command-buffer budget) and refuses
+# (`LaunchBudgetError`) when the chain cannot be planned -- see `plan_budgeted_ranges`.
 # ---------------------------------------------------------------------------------------
 
 _BWD_DKV_THREADGROUP = 32   # one thread per key; 32 (SIMD width) groups them for occupancy
@@ -784,30 +941,41 @@ def _bwd_dkv_macs_per_row(*, n: int, d: int, b: int, hq: int) -> int:
 
 
 def plan_dkv_dispatches(
-    *, n: int, d: int, b: int, hq: int, rate: float, block_align: int = 1,
+    *, n: int, d: int, b: int, hq: int, hkv: int, rate: float, causal: bool = True,
+    block_align: int = 1,
 ) -> list[tuple[int, int]]:
     """Ascending contiguous query-range split `[(q_lo, q_hi), ...]` tiling `[0, n)` exactly for
-    the chained dK/dV backward, sized from the calibrated backward `rate` via the shared budget
-    helpers (`_rows_within_dispatch_budget` / `_check_launch_budget`) at the dK/dV `4*D` cost.
-    Pure integer arithmetic -- no GPU, no allocation. Raises `LaunchBudgetError` (the 0.1.0
-    refusal contract) when even one minimal range over-budgets the per-dispatch bound OR the whole
-    pass's total wall exceeds `MAX_TOTAL_SECONDS`, never returns an over-budget range for the
-    uncatchable GPU watchdog to hit.
+    the chained dK/dV backward, planned by `plan_budgeted_ranges` at the dK/dV `4*D` pair cost
+    with exact-causal accounting. Pure integer arithmetic -- no GPU, no allocation. Raises
+    `LaunchBudgetError` (the 0.1.0 refusal contract) when the chain cannot be planned within
+    the per-command-buffer budget, never returns an over-budget range for the uncatchable GPU
+    watchdog to hit.
 
-    `block_align` (default 1 == the scalar body's per-key owner, BYTE-UNCHANGED behaviour) rounds
-    the per-dispatch row count DOWN to a multiple of `block_align`, floored at one block: the mma
-    body (which the T9b rung B2 launcher passes 32 for) owns a 32-KEY block per simdgroup and loops
-    the query range in 32-row query blocks, so a mid-block range split would merge different partial
-    products inside one hardware MMA and break chained==single bit-identity -- 32-alignment restores
-    the scalar accumulation-order argument at block granularity. The minimal unit becomes one query
-    block; refusal semantics are unchanged (the budget is checked at that floored size, so a rate
-    where even one 32-row block over-budgets still raises)."""
-    per_row = _bwd_dkv_macs_per_row(n=n, d=d, b=b, hq=hq)
-    rows_per = _rows_within_dispatch_budget(per_row=per_row, n=n, rate=rate)
-    if block_align > 1:
-        rows_per = min(n, max(block_align, (rows_per // block_align) * block_align))
-    _check_launch_budget(per_row=per_row, n=n, rows=rows_per, rate=rate)
-    return [(q_lo, min(q_lo + rows_per, n)) for q_lo in range(0, n, rows_per)]
+    Live inputs (q/k/v/dO/L/D plus the chained dk_in/dv_in partials) are what mlx counts once
+    per command buffer; the chain's INTERMEDIATE outputs are deliberately NOT credited (freed
+    mid-chain, allocator-recyclable -- crediting them could model a commit reality skips). At
+    flagship shapes the live inputs alone exceed the commit threshold, so every dispatch owns
+    its buffer and the chain's total is unbounded; at small-footprint shapes the whole chain
+    must fit one buffer budget (see `plan_budgeted_ranges`).
+
+    `block_align` (default 1 == the scalar body's per-key owner) rounds range widths DOWN to
+    a multiple of `block_align`: the mma body (the launcher passes 32) owns a 32-KEY block per
+    simdgroup and loops the query range in 32-row query blocks, so a mid-block range split
+    would merge different partial products inside one hardware MMA and break chained==single
+    bit-identity -- 32-alignment restores the scalar accumulation-order argument at block
+    granularity. The minimal unit becomes one query block; a rate where even one block cannot
+    fit its modeled buffer still raises."""
+    return plan_budgeted_ranges(
+        n=n, pair_cost=4 * d * b * hq, rate=rate, causal=causal,
+        live_input_elems=(
+            2 * b * hq * n * d          # q, dO
+            + 2 * b * hkv * n * d       # k, v
+            + 2 * b * hq * n            # lse, D
+            + 2 * b * hkv * n * d       # dk_in, dv_in (fp32 -- data_size counts ELEMENTS)
+        ),
+        output_elems_per_range=None,
+        block_align=block_align,
+    )
 
 
 def _validate_bwd_dkv_shapes(
@@ -902,6 +1070,7 @@ def launch_bwd_dkv(
     scale: float, causal: bool, rate_macs_per_s: float | None = None,
     variant: str = "scalar", d_slab: int | None = None,
     _flip_causal: bool = False,
+    _force_ranges: list[tuple[int, int]] | None = None,
 ) -> tuple[mx.array, mx.array]:
     """dK/dV backward -> (dK, dV), with k/v's shape/dtype. Consumes the forward's saved L
     (`lse`, fp32 (B, Hq, N)) and T7's D (`d_arr`, fp32 (B, Hq, N)); recomputes S/P from q/k and
@@ -916,25 +1085,32 @@ def launch_bwd_dkv(
     calibrated-rate path (graduation + the saturation d_slab sweep are a later rung).
 
     `rate_macs_per_s`: when None, a single dispatch over all query rows with no budget check
-    (safe only at small N -- the tiny-shape/test path); when given, the launcher sizes the
-    ascending query-range split via `plan_dkv_dispatches` and refuses (`LaunchBudgetError`) if
-    even one minimal range or the total over-budgets. The fp32 accumulators are chained across
-    dispatches (seeded from the prior's output), so a range split is bit-identical to a single
-    dispatch, and cast to k/v dtype exactly once after the last dispatch. The mma variant sizes its
-    split with a 32-row query-BLOCK alignment (`plan_dkv_dispatches(block_align=32)`) so a split
-    never bisects a query block (a mid-block split would merge different partial products inside one
-    hardware MMA and break the chained bit-identity).
+    (safe only at small N -- the tiny-shape/test path); when given, the launcher plans the
+    ascending query-range split via `plan_dkv_dispatches` (exact-causal costs, per-command-
+    buffer budget) and refuses (`LaunchBudgetError`) when the chain cannot be planned. The
+    fp32 accumulators are chained across dispatches (seeded from the prior's output), so a
+    range split is bit-identical to a single dispatch, and cast to k/v dtype exactly once
+    after the last dispatch. The mma variant plans with a 32-row query-BLOCK alignment
+    (`plan_dkv_dispatches(block_align=32)`) so a split never bisects a query block (a
+    mid-block split would merge different partial products inside one hardware MMA and break
+    the chained bit-identity).
 
-    `_flip_causal` is TEST-ONLY (wrong-triangle causal-skip perturbation -- see source.py)."""
+    `_flip_causal` is TEST-ONLY (wrong-triangle causal-skip perturbation -- see source.py);
+    `_force_ranges` is TEST-ONLY too (the split-forcing seam -- the production planner never
+    splits a tiny packed-regime shape; forced ranges for the mma variant must stay 32-aligned
+    per the block contract above)."""
     _validate_bwd_dkv_shapes(q, k, v, d_o, lse, d_arr)
     b, hq, n, d = q.shape
     hkv = k.shape[1]
-    if rate_macs_per_s is None:
+    if _force_ranges is not None:
+        ranges = _force_ranges
+    elif rate_macs_per_s is None:
         ranges = [(0, n)]
     else:
         block_align = 32 if variant == "mma" else 1
         ranges = plan_dkv_dispatches(
-            n=n, d=d, b=b, hq=hq, rate=rate_macs_per_s, block_align=block_align,
+            n=n, d=d, b=b, hq=hq, hkv=hkv, rate=rate_macs_per_s, causal=causal,
+            block_align=block_align,
         )
 
     kernel = _bwd_dkv_kernel(d, causal, _flip_causal, variant, d_slab)
@@ -1023,7 +1199,7 @@ def calibrated_bwd_dq_rate(
     start_n = _start_probe_n(n)
     raw_rate = _calibrate_fwd(
         measure=measure, n=n, d=head_dim, b=b, hq=hq, start_n=start_n,
-        macs_per_row=_bwd_dq_macs_per_row,
+        macs_per_row=_bwd_dq_macs_per_row, causal=causal,
     )
     rate = SAFETY_FACTOR * raw_rate
     _BWD_DQ_RATE_CACHE[key] = rate
@@ -1085,7 +1261,7 @@ def calibrated_bwd_dkv_rate(
     start_n = _start_probe_n(n)
     raw_rate = _calibrate_fwd(
         measure=measure, n=n, d=head_dim, b=b, hq=hq, start_n=start_n,
-        macs_per_row=_bwd_dkv_macs_per_row,
+        macs_per_row=_bwd_dkv_macs_per_row, causal=causal,
     )
     rate = SAFETY_FACTOR * raw_rate
     _BWD_DKV_RATE_CACHE[key] = rate

@@ -20,7 +20,6 @@ via `mx.vjp` with a seeded random cotangent (the exact oracle -- no readout proj
 The causal-skip inequality is the named bug site: a `flip_causal` build (kk >= row) gets
 its own can-fail perturbation proof.
 """
-import itertools
 import math
 
 import mlx.core as mx
@@ -32,14 +31,11 @@ from mlx_train_perf.attention.kernel import launch as bwd_launch
 from mlx_train_perf.attention.kernel.dispatch import select_bwd_tiles
 from mlx_train_perf.attention.kernel.launch import (
     TileShape,
-    _bwd_dkv_macs_per_row,
-    _bwd_dq_macs_per_row,
     calibrated_bwd_dkv_rate,
     calibrated_bwd_dq_rate,
     launch_bwd_D,
     launch_bwd_dkv,
     launch_bwd_dq,
-    plan_dkv_dispatches,
 )
 from mlx_train_perf.attention.kernel.source import (
     build_bwd_D_source,
@@ -49,7 +45,7 @@ from mlx_train_perf.attention.kernel.source import (
     build_bwd_dq_source,
 )
 from mlx_train_perf.attention.reference import flash_attention_reference, math_attention
-from mlx_train_perf.errors import AttentionInputError, LaunchBudgetError
+from mlx_train_perf.errors import AttentionInputError
 
 # ---------------------------------------------------------------------------------------
 # Pure-arithmetic: source templating (DEFAULT lane, no GPU).
@@ -384,16 +380,19 @@ def _dq_kernel(
     q: mx.array, k: mx.array, v: mx.array, cot: mx.array, *, scale: float, causal: bool,
     rate_macs_per_s: float | None = None, flip_causal: bool = False,
     variant: str = "scalar", d_slab: int | None = None,
+    force_ranges: list[tuple[int, int]] | None = None,
 ) -> mx.array:
     """The kernel dQ path: forward reference gives (O, L); T7's `launch_bwd_D` gives D from
     (dO, O); `launch_bwd_dq` consumes q/k/v/dO/L/D. `variant`/`d_slab` default to the scalar
-    body (unchanged for every existing caller); `variant="mma"` selects the T9b rung-B1 body."""
+    body (unchanged for every existing caller); `variant="mma"` selects the T9b rung-B1 body.
+    `force_ranges` is the TEST-ONLY split-forcing seam (`_force_ranges`) -- the production
+    planner never splits these tiny packed-regime shapes."""
     o, lse = flash_attention_reference(q, k, v, scale=scale, causal=causal)
     d_arr = launch_bwd_D(cot, o)
     return launch_bwd_dq(
         q, k, v, cot, lse, d_arr, scale=scale, causal=causal,
         rate_macs_per_s=rate_macs_per_s, _flip_causal=flip_causal,
-        variant=variant, d_slab=d_slab,
+        variant=variant, d_slab=d_slab, _force_ranges=force_ranges,
     )
 
 
@@ -466,11 +465,11 @@ def test_dq_split_matches_single_dispatch() -> None:
     q, k, v, cot = _rand_qkv_do(b=b, hq=hq, hkv=hkv, n=n, d=d, dtype=mx.float32, seed=44)
 
     single = _dq_kernel(q, k, v, cot, scale=scale, causal=True)  # rate=None -> single dispatch
-    # Force ~80 rows/dispatch (4 disjoint dispatches over n=257) via a low rate, keeping the
-    # projected per-dispatch inside MAX_DISPATCH_SECONDS AND the total inside MAX_TOTAL_SECONDS.
-    per_row = _bwd_dq_macs_per_row(n=n, d=d, b=b, hq=hq)
+    # Force 4 disjoint dispatches over n=257 via the TEST-ONLY `_force_ranges` seam -- the
+    # production planner would emit a single range at this tiny packed-regime shape.
     split = _dq_kernel(
-        q, k, v, cot, scale=scale, causal=True, rate_macs_per_s=per_row * 160.0
+        q, k, v, cot, scale=scale, causal=True,
+        force_ranges=[(0, 80), (80, 160), (160, 240), (240, 257)],
     )
     mx.eval(single, split)
     assert mx.array_equal(single, split).item()
@@ -637,17 +636,20 @@ def _dkv_kernel(
     q: mx.array, k: mx.array, v: mx.array, cot: mx.array, *, scale: float, causal: bool,
     rate_macs_per_s: float | None = None, flip_causal: bool = False,
     variant: str = "scalar", d_slab: int | None = None,
+    force_ranges: list[tuple[int, int]] | None = None,
 ) -> tuple[mx.array, mx.array]:
     """The kernel dK/dV path: forward reference gives (O, L); T7's `launch_bwd_D` gives D from
     (dO, O); `launch_bwd_dkv` consumes q/k/v/dO/L/D and returns the chained (dK, dV).
     `variant`/`d_slab` default to the scalar body (unchanged for every existing caller);
-    `variant="mma"` selects the T9b rung-B2 key-major MMA body."""
+    `variant="mma"` selects the T9b rung-B2 key-major MMA body. `force_ranges` is the
+    TEST-ONLY split-forcing seam (`_force_ranges`) -- the production planner never splits
+    these tiny packed-regime shapes."""
     o, lse = flash_attention_reference(q, k, v, scale=scale, causal=causal)
     d_arr = launch_bwd_D(cot, o)
     return launch_bwd_dkv(
         q, k, v, cot, lse, d_arr, scale=scale, causal=causal,
         rate_macs_per_s=rate_macs_per_s, _flip_causal=flip_causal,
-        variant=variant, d_slab=d_slab,
+        variant=variant, d_slab=d_slab, _force_ranges=force_ranges,
     )
 
 
@@ -686,11 +688,11 @@ def test_chained_dkv_matches_oracle_when_chaining_is_forced() -> None:
     scale = 1.0 / math.sqrt(d)
     q, k, v, cot = _rand_qkv_do(b=b, hq=hq, hkv=hkv, n=n, d=d, dtype=mx.float32, seed=52)
 
-    per_row = _bwd_dkv_macs_per_row(n=n, d=d, b=b, hq=hq)
-    forced_rate = per_row * 60.0  # rows/dispatch = int(0.5*60) = 30 -> ceil(96/30) = 4 ranges
-    assert len(plan_dkv_dispatches(n=n, d=d, b=b, hq=hq, rate=forced_rate)) >= 3
+    # A 4-range chained plan via the TEST-ONLY `_force_ranges` seam (the production planner
+    # never splits this tiny packed-regime shape -- see test_attention_launch_plan.py).
+    forced = [(0, 30), (30, 60), (60, 90), (90, 96)]
 
-    dk_k, dv_k = _dkv_kernel(q, k, v, cot, scale=scale, causal=True, rate_macs_per_s=forced_rate)
+    dk_k, dv_k = _dkv_kernel(q, k, v, cot, scale=scale, causal=True, force_ranges=forced)
     dk_ref, dv_ref = _dkv_oracle(q, k, v, cot, scale=scale, causal=True)
     mx.eval(dk_k, dv_k, dk_ref, dv_ref)
 
@@ -746,11 +748,11 @@ def test_chained_dispatches_equal_single_dispatch() -> None:
     q, k, v, cot = _rand_qkv_do(b=b, hq=hq, hkv=hkv, n=n, d=d, dtype=mx.float32, seed=54)
 
     single_dk, single_dv = _dkv_kernel(q, k, v, cot, scale=scale, causal=True)  # rate=None
-    per_row = _bwd_dkv_macs_per_row(n=n, d=d, b=b, hq=hq)
-    forced_rate = per_row * 60.0  # 4 ranges over n=96
-    assert len(plan_dkv_dispatches(n=n, d=d, b=b, hq=hq, rate=forced_rate)) >= 3
+    # A 4-range chained plan via the TEST-ONLY `_force_ranges` seam (the production planner
+    # never splits this tiny packed-regime shape).
     split_dk, split_dv = _dkv_kernel(
-        q, k, v, cot, scale=scale, causal=True, rate_macs_per_s=forced_rate
+        q, k, v, cot, scale=scale, causal=True,
+        force_ranges=[(0, 30), (30, 60), (60, 90), (90, 96)],
     )
     mx.eval(single_dk, single_dv, split_dk, split_dv)
     assert mx.array_equal(single_dk, split_dk).item()
@@ -1107,11 +1109,11 @@ def test_dq_mma_split_matches_single_dispatch() -> None:
     q, k, v, cot = _rand_qkv_do(b=b, hq=hq, hkv=hkv, n=n, d=d, dtype=mx.float32, seed=44)
 
     single = _dq_kernel(q, k, v, cot, scale=scale, causal=True, variant="mma")  # rate=None
-    per_row = _bwd_dq_macs_per_row(n=n, d=d, b=b, hq=hq)
-    # Force ~80 rows/dispatch (several disjoint mma dispatches over n=257) via a low rate, inside
-    # MAX_DISPATCH_SECONDS AND MAX_TOTAL_SECONDS.
+    # Force several disjoint mma dispatches over n=257 (boundaries deliberately NOT
+    # 32-aligned -- per-row independence) via the TEST-ONLY `_force_ranges` seam.
     split = _dq_kernel(
-        q, k, v, cot, scale=scale, causal=True, variant="mma", rate_macs_per_s=per_row * 160.0
+        q, k, v, cot, scale=scale, causal=True, variant="mma",
+        force_ranges=[(0, 80), (80, 160), (160, 240), (240, 257)],
     )
     mx.eval(single, split)
     assert mx.array_equal(single, split).item()
@@ -1238,57 +1240,8 @@ def test_build_bwd_dkv_mma_source_slab_widths_all_template() -> None:
         assert "HEAD_DIM" not in s
 
 
-# ---------------------------------------------------------------------------------------
-# plan_dkv_dispatches block-alignment (DEFAULT lane, pure integer arithmetic -- no GPU).
-# The mma dK/dV variant needs its chained query-range split to land on 32-row query-block
-# boundaries (a mid-block split would merge different partial products inside one hardware
-# MMA and break chained==single bit-identity); the scalar path (block_align=1, the default)
-# is byte-unchanged.
-# ---------------------------------------------------------------------------------------
-
-
-def test_plan_dkv_dispatches_default_alignment_byte_unchanged() -> None:
-    n, d, b, hq = 96, 64, 2, 4
-    per_row = _bwd_dkv_macs_per_row(n=n, d=d, b=b, hq=hq)
-    rate = per_row * 60.0  # rows_per = int(0.5*60) = 30 (un-aligned)
-    default = plan_dkv_dispatches(n=n, d=d, b=b, hq=hq, rate=rate)
-    explicit = plan_dkv_dispatches(n=n, d=d, b=b, hq=hq, rate=rate, block_align=1)
-    assert default == explicit                                   # default IS block_align=1
-    assert default == [(0, 30), (30, 60), (60, 90), (90, 96)]    # scalar behaviour, unchanged
-
-
-def test_plan_dkv_dispatches_block_aligned_to_32() -> None:
-    n, d, b, hq = 96, 64, 2, 4
-    per_row = _bwd_dkv_macs_per_row(n=n, d=d, b=b, hq=hq)
-    rate = per_row * 80.0  # un-aligned rows_per = int(0.5*80)=40 -> aligned DOWN to 32 (1 block)
-    ranges = plan_dkv_dispatches(n=n, d=d, b=b, hq=hq, rate=rate, block_align=32)
-    assert ranges == [(0, 32), (32, 64), (64, 96)]
-    # every q_lo is a 32-multiple; ranges tile [0, n) exactly (contiguous, cover [0, n)).
-    assert ranges[0][0] == 0
-    assert ranges[-1][1] == n
-    for lo, _hi in ranges:
-        assert lo % 32 == 0
-    for (_lo0, hi0), (lo1, _hi1) in itertools.pairwise(ranges):
-        assert hi0 == lo1
-
-
-def test_plan_dkv_dispatches_block_align_rounds_down_to_multiple() -> None:
-    n, d, b, hq = 200, 64, 1, 4
-    per_row = _bwd_dkv_macs_per_row(n=n, d=d, b=b, hq=hq)
-    rate = per_row * 140.0  # rows_per = int(0.5*140) = 70 -> aligned DOWN to 64 (2 blocks)
-    ranges = plan_dkv_dispatches(n=n, d=d, b=b, hq=hq, rate=rate, block_align=32)
-    assert ranges == [(0, 64), (64, 128), (128, 192), (192, 200)]
-
-
-def test_plan_dkv_dispatches_block_align_refusal_unchanged() -> None:
-    """Refusal semantics unchanged: when even one minimal aligned unit (a single 32-row query
-    block) over-budgets the per-dispatch bound, plan_dkv_dispatches still raises rather than
-    return an over-budget range for the uncatchable GPU watchdog to hit."""
-    n, d, b, hq = 96, 64, 2, 4
-    per_row = _bwd_dkv_macs_per_row(n=n, d=d, b=b, hq=hq)
-    rate = per_row * 20.0  # un-aligned rows_per=10; floored to 32 -> 32*per_row/rate = 1.6 s > 0.5
-    with pytest.raises(LaunchBudgetError):
-        plan_dkv_dispatches(n=n, d=d, b=b, hq=hq, rate=rate, block_align=32)
+# plan_dkv_dispatches semantics (0.3.0 buffer-model planner, incl. the 32-row block
+# alignment the mma variant needs) are covered in tests/test_attention_launch_plan.py.
 
 
 # ---------------------------------------------------------------------------------------
@@ -1449,17 +1402,15 @@ def test_dkv_mma_chained_matches_oracle_when_chaining_is_forced() -> None:
     scale = 1.0 / math.sqrt(d)
     q, k, v, cot = _rand_qkv_do(b=b, hq=hq, hkv=hkv, n=n, d=d, dtype=mx.float32, seed=52)
 
-    per_row = _bwd_dkv_macs_per_row(n=n, d=d, b=b, hq=hq)
-    forced_rate = per_row * 130.0  # rows_per = int(0.5*130) = 65 -> aligned to 64 -> 2 ranges? no:
-    # 64 rows/dispatch over n=96 -> [(0,64),(64,96)] = 2 ranges; bump lower for >=3 aligned ranges.
-    forced_rate = per_row * 70.0   # rows_per = int(0.5*70)=35 -> aligned to 32 -> 3 ranges over 96
-    ranges = plan_dkv_dispatches(n=n, d=d, b=b, hq=hq, rate=forced_rate, block_align=32)
+    # A 3-range 32-ALIGNED chained plan via the TEST-ONLY `_force_ranges` seam (the
+    # production planner never splits this tiny packed-regime shape).
+    ranges = [(0, 32), (32, 64), (64, 96)]
     assert len(ranges) >= 3
     for lo, _hi in ranges:
         assert lo % 32 == 0                       # every range starts on a 32-row query block
 
     dk_k, dv_k = _dkv_kernel(
-        q, k, v, cot, scale=scale, causal=True, variant="mma", rate_macs_per_s=forced_rate
+        q, k, v, cot, scale=scale, causal=True, variant="mma", force_ranges=ranges
     )
     dk_ref, dv_ref = _dkv_oracle(q, k, v, cot, scale=scale, causal=True)
     mx.eval(dk_k, dv_k, dk_ref, dv_ref)
@@ -1484,12 +1435,11 @@ def test_dkv_mma_chained_dispatches_equal_single_dispatch() -> None:
     q, k, v, cot = _rand_qkv_do(b=b, hq=hq, hkv=hkv, n=n, d=d, dtype=mx.float32, seed=54)
 
     single_dk, single_dv = _dkv_kernel(q, k, v, cot, scale=scale, causal=True, variant="mma")
-    per_row = _bwd_dkv_macs_per_row(n=n, d=d, b=b, hq=hq)
-    forced_rate = per_row * 70.0  # 32-aligned rows_per = 32 -> 3 ranges over n=96
-    ranges = plan_dkv_dispatches(n=n, d=d, b=b, hq=hq, rate=forced_rate, block_align=32)
-    assert len(ranges) >= 3
+    # A 3-range 32-ALIGNED chained plan via the TEST-ONLY `_force_ranges` seam (the
+    # production planner never splits this tiny packed-regime shape).
     split_dk, split_dv = _dkv_kernel(
-        q, k, v, cot, scale=scale, causal=True, variant="mma", rate_macs_per_s=forced_rate
+        q, k, v, cot, scale=scale, causal=True, variant="mma",
+        force_ranges=[(0, 32), (32, 64), (64, 96)],
     )
     mx.eval(single_dk, single_dv, split_dk, split_dv)
     assert mx.array_equal(single_dk, split_dk).item()
