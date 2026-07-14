@@ -37,12 +37,17 @@ def expected_dist_names(tag: str) -> tuple[str, str]:
 def check_dist_dir(tag: str, dist_dir: Path) -> list[str]:
     """The gate decision: an empty list means pass; otherwise each entry is one
     human-readable problem (bad tag, missing artifact, or a stowaway file such as a
-    dev-versioned build from a checkout not exactly at the tag)."""
+    dev-versioned build from a checkout not exactly at the tag). Only
+    distribution-shaped files (`.whl` / `.tar.gz`) are judged: `uv build` drops a
+    `.gitignore` marker into dist/, which is neither uploadable nor a stowaway."""
     try:
         expected = set(expected_dist_names(tag))
     except ValueError as exc:
         return [str(exc)]
-    actual = {p.name for p in dist_dir.iterdir() if p.is_file()}
+    actual = {
+        p.name for p in dist_dir.iterdir()
+        if p.is_file() and (p.name.endswith(".whl") or p.name.endswith(".tar.gz"))
+    }
     problems = [f"missing from {dist_dir}: {name}" for name in sorted(expected - actual)]
     problems += [
         f"unexpected in {dist_dir} (a stale or dev-versioned build?): {name}"

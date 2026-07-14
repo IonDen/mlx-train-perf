@@ -78,6 +78,19 @@ def test_check_dist_dir_reports_a_missing_artifact(tmp_path: Path) -> None:
     assert "mlx_train_perf-0.2.0-py3-none-any.whl" in problems[0]
 
 
+def test_check_dist_dir_ignores_non_artifact_files(tmp_path: Path) -> None:
+    # `uv build` drops a `.gitignore` marker into dist/ -- it is not a distribution
+    # artifact and the publish action does not upload it, so the gate must not treat it
+    # as a stowaway (this exact false positive blocked the first v0.2.0 publish run).
+    dist = _make_dist(
+        tmp_path,
+        "mlx_train_perf-0.2.0.tar.gz",
+        "mlx_train_perf-0.2.0-py3-none-any.whl",
+        ".gitignore",
+    )
+    assert check_dist_dir("v0.2.0", dist) == []
+
+
 def test_check_dist_dir_reports_a_dev_versioned_stowaway(tmp_path: Path) -> None:
     # hatch-vcs builds a dev version when the checkout is not exactly at the tag --
     # that build must never reach PyPI.
