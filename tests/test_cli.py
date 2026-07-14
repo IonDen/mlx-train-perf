@@ -31,8 +31,33 @@ from mlx_train_perf.cli import (
     main,
 )
 from mlx_train_perf.contribute import ContributionResult, MachineInfo, Preflight
-from mlx_train_perf.errors import BenchInputError, MachineDetectionError, PlanInputError
+from mlx_train_perf.core.guards import effective_memory_ceiling
+from mlx_train_perf.errors import (
+    BenchInputError,
+    MachineDetectionError,
+    MemoryBudgetError,
+    PlanInputError,
+)
 from mlx_train_perf.plan.estimate import FitReport, ModelShape, TrainConfig
+
+
+def _machine_refuses_worker_start() -> bool:
+    """True when THIS machine's real availability trips guards' safe-start floor. The
+    bench tests marked with `_needs_room_for_real_worker` spawn real worker subprocesses
+    (subprocess-per-condition), and the child computes the real ceiling, out of any
+    monkeypatch's reach -- on such a machine (e.g. a 7 GB CI runner) the honest outcome
+    is a skip."""
+    try:
+        effective_memory_ceiling()
+    except MemoryBudgetError:
+        return True
+    return False
+
+
+_needs_room_for_real_worker = pytest.mark.skipif(
+    _machine_refuses_worker_start(),
+    reason="machine trips guards' safe-start floor; a real worker subprocess would refuse",
+)
 
 # --- brief's mandated Step 1 tests (verbatim) --------------------------------------
 
@@ -304,11 +329,14 @@ def test_render_bench_summary_lists_conditions(tmp_path: Path) -> None:
     assert "cross_session_excluded" in summary
 
 
+@_needs_room_for_real_worker
 def test_bench_subcommand_in_process_tiny_scale(
     tmp_path: Path, capsys: pytest.CaptureFixture[str],
 ) -> None:
     """Drives `_cmd_bench` in-process (not via subprocess) at tiny/stub scale --
-    `impl="naive"` needs no Metal JIT, so this stays in the default (non-metal) lane."""
+    `impl="naive"` needs no Metal JIT, so this stays in the default (non-metal) lane.
+    Still needs machine room: `run_conditions` spawns one real worker child per
+    condition, and that child computes the real memory ceiling."""
     out_dir = tmp_path / "results"
     rc = main(["bench", "--suite", "loss-layer", "--out", str(out_dir), "--n", "64",
                "--d", "8", "--v", "16", "--dtype", "float32", "--impl", "naive",
@@ -336,6 +364,7 @@ def test_plan_end_to_end_subprocess(tmp_path: Path) -> None:
     assert out["fits"] is True
 
 
+@_needs_room_for_real_worker
 def test_bench_end_to_end_subprocess(tmp_path: Path) -> None:
     out_dir = tmp_path / "results"
     proc = subprocess.run(
