@@ -122,11 +122,23 @@ def test_checkpoint_recomputes_instead_of_storing_under_compile() -> None:
     mx.eval(x)
 
     def compiled_grad_peak(fn) -> int:  # type: ignore[no-untyped-def]
+        # Gotcha-15 measurement discipline (backlog 0023 -- this comparison flaked
+        # INVERTED once on a 7 GB CI runner): the warmup output stays ALIVE through the
+        # measured window (a deferred release mid-window perturbs the peak
+        # nondeterministically), and every snapshot boundary gets mx.synchronize() +
+        # mx.clear_cache() so both windows start from the same allocator state.
         g_fn = mx.compile(mx.grad(fn))
-        mx.eval(g_fn(x))  # warmup/trace OUTSIDE the measurement window
+        warm = g_fn(x)
+        mx.eval(warm)     # warmup/trace OUTSIDE the measurement window
+        mx.synchronize()  # no in-flight frees racing the reset
+        mx.clear_cache()
         mx.reset_peak_memory()
-        mx.eval(g_fn(x))
-        return int(mx.get_peak_memory())
+        out = g_fn(x)
+        mx.eval(out)
+        mx.synchronize()
+        peak = int(mx.get_peak_memory())
+        del warm, out     # released only after the snapshot
+        return peak
 
     plain_peak = compiled_grad_peak(plain)
     ckpt_peak = compiled_grad_peak(checkpointed)

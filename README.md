@@ -4,7 +4,7 @@ A fused, logit-free linear-cross-entropy loss for training on Apple Silicon with
 
 The idea is the same one behind [Cut Cross-Entropy](https://arxiv.org/abs/2411.09009) and [Liger-Kernel](https://github.com/linkedin/Liger-Kernel) on the CUDA side, ported to a Metal kernel: compute the cross-entropy loss and its gradient without ever building the full `(N, V)` logits tensor. For a large vocabulary that tensor is the single biggest allocation in the training step, and it is pure waste. You only need the per-token loss and a gradient back into the hidden states.
 
-Released on PyPI as `mlx-train-perf`. Every number below has a committed script under `scripts/` that reproduces it, all measured on one M1 Max (32 GB, macOS 26.5). The loss-layer figures were taken on mlx 0.31.2 and reproduce on the pinned 0.32.0; the 0.2.0 flash-attention figures were taken on 0.32.0.
+Released on PyPI as `mlx-train-perf`. Every number below has a committed script under `scripts/` that reproduces it, all measured on one M1 Max (32 GB, macOS 26.5). The loss-layer figures were taken on mlx 0.31.2 and reproduce on the pinned 0.32.0; the flash-attention memory figures were taken on 0.32.0 in 0.2.0, and the 0.3.0 context-ceiling figures on 0.32.0.
 
 ## The problem it solves
 
@@ -34,21 +34,28 @@ On Qwen3-8B-4bit (LoRA rank 8, batch 1, gradient checkpointing on, bf16) the two
 | stock attention | 25.68 GiB | 21.31 GiB |
 | flash attention | 12.75 GiB | 8.37 GiB |
 
-(`scripts/bench_train_step.py`; M1 Max 32 GB, macOS 26.5, mlx 0.32.0.)
+(`scripts/bench_train_step.py`; M1 Max 32 GB, macOS 26.5, mlx 0.32.0. These memory and throughput figures are the 0.2.0 measurements, carried into 0.3.0 unchanged: 0.3.0 changed how the backward splits its kernel launches, not what it allocates, and the 0.3.0 context sweep below — measured fresh — confirms the flash path's memory still scales linearly in sequence length.)
 
 The 32 GB machine that peaked near its ceiling with stock attention now runs the same step at half the memory. That is real headroom: a longer sequence, or a second job on the GPU.
 
-The attention op itself, timed alone at the flagship shape (batch 1, 32 query / 8 KV heads, 8192 tokens, head_dim 128), is 0.186 s on the forward and 0.576 s on the full backward, 3.1× the forward (`scripts/bench_attention_op.py`). As the sequence doubles, the flash op's peak grows about 2.00× (2048→4096) and about 3.06× (4096→8192). The second step is above 2× because the chained backward split adds a small, budget-bounded constant of at most ~0.3 GB, not because the O(N) growth law changed. Stock attention over the same doublings grows 3.76× then 3.05×, and that last figure is flattered by paging: at 8192 the stock op allocates about 32.4 GB on a 32 GB machine and its wall time degrades roughly 41× as it pages, which puts the single flash op about 45× below stock there. Those stock figures are a pre-net measurement of the exact hazard the safety net now prevents. They were taken before the memory watchdog shipped, and on a 32 GB machine `scripts/bench_attention_op.py` now aborts that condition by design (`aborted_memory_ceiling`) rather than paging into it. The flash-side numbers all reproduce. Flash is not universally cheaper, though — below about 2100 tokens the stock op's simpler bookkeeping wins, and the two curves cross there. The win is at real training context, not tiny shapes. (At 16384 the flash op refuses on its launch-safety budget; that refusal is recorded rather than run.)
+The attention op itself, timed alone at the flagship shape (batch 1, 32 query / 8 KV heads, 8192 tokens, head_dim 128), is 0.186 s on the forward and 0.576 s on the full backward, 3.1× the forward (`scripts/bench_attention_op.py`). As the sequence doubles, the flash op's peak grows about 2.00× (2048→4096) and about 3.06× (4096→8192). The second step is above 2× because the chained backward split adds a small, budget-bounded constant of at most ~0.3 GB, not because the O(N) growth law changed. Stock attention over the same doublings grows 3.76× then 3.05×, and that last figure is flattered by paging: at 8192 the stock op allocates about 32.4 GB on a 32 GB machine and its wall time degrades roughly 41× as it pages, which puts the single flash op about 45× below stock there. Those stock figures are a pre-net measurement of the exact hazard the safety net now prevents. They were taken before the memory watchdog shipped, and on a 32 GB machine `scripts/bench_attention_op.py` now aborts that condition by design (`aborted_memory_ceiling`) rather than paging into it. The flash-side numbers all reproduce. Flash is not universally cheaper, though — below about 2100 tokens the stock op's simpler bookkeeping wins, and the two curves cross there. The win is at real training context, not tiny shapes. (At 16384 the flash op now runs rather than refusing, since the launch guard no longer caps the chain; stock attention still cannot reach that context on 32 GB.)
 
 ### What it costs in throughput
 
 Turning flash attention on is not free. On the stock-loss path at 8192 it costs 5.3% of tokens/sec (74.0 vs 78.1); at 2048 the cost is 5.5% on the fused-loss path (86.4 vs 91.5) and 5.9% on the stock-loss path (92.1 vs 97.8). The fused-loss comparison at 8192 has no stock-attention number to pair with: on this 32 GB machine that baseline condition crosses the memory safety net's ceiling and records an abort instead of a number. That baseline running out of room is the problem flash attention exists to remove. Under flash attention the fused cross-entropy and mlx-lm's stock cross-entropy stay close: 0.94× at 2048 (86.4 vs 92.1 tok/s) and 0.99× at 8192 on Qwen3-8B, 0.92× and 0.97× on Llama-3.2-3B. The loss values match to bf16 tolerance throughout — the worst per-step difference across every measured pair is 2.4e-3. The worst attention-arm throughput ratio measured is 0.94× stock; 0.85× is the maintainer's release acceptance bar for that path, provisional and pinned at the PR.
 
-### What it does not change: the context ceiling on 32 GB
+### What it changes: the context ceiling on 32 GB
 
-Here is the honest part. On a 32 GB machine the longest sequence that still trains is about the same either way: 10,240 tokens on our path (flash plus fused loss) against 9,728 for stock, measured the same day with the same search (`scripts/northstar_context_sweep.py`). Near-tied — but the two ceilings are set by different things, and that difference matters on bigger machines.
+0.2.0 shipped this path with a caveat — it halved the memory but did not extend the longest sequence you could train, because a launch-safety budget capped it before memory did. That cap turned out to be guarding the wrong thing. Re-reading how mlx schedules Metal work, and re-running the crash that motivated the budget, showed the GPU watchdog acts on a single command buffer, not on a chain of them, and at training shapes each backward dispatch already runs in its own buffer. 0.3.0 replaces the per-chain budget with a per-buffer one that models what the scheduler actually commits. No safety margin moved; what changed is what the margin is measured against. (`scripts/probe_command_buffer_packing.py` reproduces the evidence.)
 
-Stock attention hits the ceiling because it runs out of memory. Our path does not: at its 10,240-token ceiling its peak is about 14.8 GiB, well under the budget. What stops us is a 2-second GPU-safety budget on the kernel launch, a guard against a single kernel running long enough to trip the watchdog. That budget comes from kernel throughput and does not depend on RAM. So on a 64 GB or larger machine the stock ceiling climbs with the extra memory while ours stays near 10k until faster backward kernels raise the cap. Lifting it is on the [roadmap](ROADMAP.md). (These ceiling figures belong to this release's measurement and are not comparable to the numbers 0.1.0 reported.)
+With that cap gone, the flash path is bound by memory, the same thing that bounds stock attention — and it needs far less of it. Measured the same day with the same search (`scripts/northstar_context_sweep.py`, Qwen3-8B-4bit QLoRA, gradient checkpointing, bf16):
+
+| max trainable context, 32 GB | tokens | peak at the ceiling |
+|---|---|---|
+| stock attention | 7,936 | 24.5 GiB |
+| flash attention | 23,040 | 24.5 GiB |
+
+Both arms stop at the same ~24.5 GiB, the effective memory ceiling on this machine at run time. Under that one budget the flash path trains 2.9× the context, because it holds O(N) saved state where stock holds the O(N²) score matrix. The ratio is the part that travels: raise the available memory and both ceilings rise together (a freshly booted or larger machine lets both climb toward the 28 GiB static ceiling), but the flash path keeps its roughly threefold reach. On the same machine in 0.2.0 this path was launch-capped near 10k tokens; removing that cap is what moved it. (These figures are this release's measurement; the two arms are comparable to each other, taken together, not to 0.2.0's numbers.)
 
 ### When it refuses
 
@@ -134,7 +141,7 @@ The flash model is an analytic saved-state term plus one measured linear coeffic
 
 ## Supported models
 
-- Architectures: Llama and Qwen3. The adapter's model splitter handles these; others raise a typed error.
+- Architectures: Llama, Qwen2 (the Qwen2.5 family), and Qwen3 for the loss adapter; the flash-attention wrapper covers Llama and Qwen3. The adapter's model splitter handles these; others raise a typed error.
 - Quantization: 4-bit group-size-64 (the mlx-community QLoRA default), or a dense fp32/bf16 head.
 - Training: LoRA / QLoRA. Full fine-tuning is estimated by the planner but is not the case this is tuned for.
 - Hardware: Apple Silicon.

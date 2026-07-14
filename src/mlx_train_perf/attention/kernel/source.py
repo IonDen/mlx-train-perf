@@ -100,7 +100,10 @@ _FWD_TEMPLATE = """
 """
 
 
-def build_fwd_source(head_dim: int, *, causal: bool = True, flip_causal: bool = False) -> str:
+def build_fwd_source(
+    head_dim: int, *, causal: bool = True, flip_causal: bool = False,
+    drop_diagonal: bool = False,
+) -> str:
     """MSL function body for the v0 flash-attention forward kernel (O + L).
 
     `head_dim` in {64, 96, 128} (the kernel's supported head dims) is baked in as a
@@ -114,10 +117,16 @@ def build_fwd_source(head_dim: int, *, causal: bool = True, flip_causal: bool = 
         )
     if flip_causal and not causal:
         raise ValueError("flip_causal is only meaningful with causal=True")
+    if drop_diagonal and not causal:
+        raise ValueError("drop_diagonal is only meaningful with causal=True")
+    if drop_diagonal and flip_causal:
+        raise ValueError("drop_diagonal and flip_causal are mutually exclusive perturbations")
     if not causal:
         keep = "true"
     elif flip_causal:
         keep = "kk >= row"
+    elif drop_diagonal:
+        keep = "kk < row"
     else:
         keep = "kk <= row"
     return _FWD_TEMPLATE.replace("HEAD_DIM", str(head_dim)).replace("KEEP_CMP", keep)
@@ -425,6 +434,7 @@ _FWD_MMA_TEMPLATE = """
 
 def build_fwd_mma_source(
     head_dim: int, *, causal: bool = True, flip_causal: bool = False,
+    drop_diagonal: bool = False,
     d_slab: int | None = None,
 ) -> str:
     """MSL function body for the 4x4 simdgroup-matrix (MMA) flash-attention forward (O + L).
@@ -448,6 +458,10 @@ def build_fwd_mma_source(
         )
     if flip_causal and not causal:
         raise ValueError("flip_causal is only meaningful with causal=True")
+    if drop_diagonal and not causal:
+        raise ValueError("drop_diagonal is only meaningful with causal=True")
+    if drop_diagonal and flip_causal:
+        raise ValueError("drop_diagonal and flip_causal are mutually exclusive perturbations")
     slab = _FWD_MMA_D_SLAB if d_slab is None else d_slab
     if slab <= 0 or slab % 8 != 0 or head_dim % slab != 0:
         raise ValueError(
@@ -458,6 +472,9 @@ def build_fwd_mma_source(
         kv_limit = "n"
     elif flip_causal:
         keep = "kk >= row"
+        kv_limit = "metal::min(n, r0 + block_base + 32u)"
+    elif drop_diagonal:
+        keep = "kk < row"
         kv_limit = "metal::min(n, r0 + block_base + 32u)"
     else:
         keep = "kk <= row"
@@ -638,7 +655,9 @@ _BWD_DQ_TEMPLATE = """
 """
 
 
-def build_bwd_dq_source(head_dim: int, *, causal: bool, flip_causal: bool = False) -> str:
+def build_bwd_dq_source(
+    head_dim: int, *, causal: bool, flip_causal: bool = False, drop_diagonal: bool = False,
+) -> str:
     """MSL function body for the v1 one-owner-per-query-row dQ backward kernel.
 
     `head_dim` in {64, 96, 128} is baked in as a compile-time constant (fixing the per-thread
@@ -652,10 +671,16 @@ def build_bwd_dq_source(head_dim: int, *, causal: bool, flip_causal: bool = Fals
         )
     if flip_causal and not causal:
         raise ValueError("flip_causal is only meaningful with causal=True")
+    if drop_diagonal and not causal:
+        raise ValueError("drop_diagonal is only meaningful with causal=True")
+    if drop_diagonal and flip_causal:
+        raise ValueError("drop_diagonal and flip_causal are mutually exclusive perturbations")
     if not causal:
         keep = "true"
     elif flip_causal:
         keep = "kk >= row"
+    elif drop_diagonal:
+        keep = "kk < row"
     else:
         keep = "kk <= row"
     return _BWD_DQ_TEMPLATE.replace("HEAD_DIM", str(head_dim)).replace("KEEP_CMP", keep)
@@ -942,7 +967,8 @@ _BWD_DQ_MMA_TEMPLATE = """
 
 
 def build_bwd_dq_mma_source(
-    head_dim: int, *, causal: bool, flip_causal: bool = False, d_slab: int | None = None,
+    head_dim: int, *, causal: bool, flip_causal: bool = False,
+    drop_diagonal: bool = False, d_slab: int | None = None,
 ) -> str:
     """MSL function body for the 4x4 simdgroup-matrix (MMA) dQ backward kernel -- the
     throughput restructure of the v1 scalar one-owner-per-row dQ body.
@@ -968,6 +994,10 @@ def build_bwd_dq_mma_source(
         )
     if flip_causal and not causal:
         raise ValueError("flip_causal is only meaningful with causal=True")
+    if drop_diagonal and not causal:
+        raise ValueError("drop_diagonal is only meaningful with causal=True")
+    if drop_diagonal and flip_causal:
+        raise ValueError("drop_diagonal and flip_causal are mutually exclusive perturbations")
     slab = _BWD_DQ_MMA_D_SLAB if d_slab is None else d_slab
     if slab <= 0 or slab % 8 != 0 or head_dim % slab != 0:
         raise ValueError(
@@ -978,6 +1008,9 @@ def build_bwd_dq_mma_source(
         kv_limit = "n"
     elif flip_causal:
         keep = "kk >= row"
+        kv_limit = "metal::min(n, r0 + block_base + 32u)"
+    elif drop_diagonal:
+        keep = "kk < row"
         kv_limit = "metal::min(n, r0 + block_base + 32u)"
     else:
         keep = "kk <= row"
@@ -1099,7 +1132,9 @@ _BWD_DKV_TEMPLATE = """
 """
 
 
-def build_bwd_dkv_source(head_dim: int, *, causal: bool, flip_causal: bool = False) -> str:
+def build_bwd_dkv_source(
+    head_dim: int, *, causal: bool, flip_causal: bool = False, drop_diagonal: bool = False,
+) -> str:
     """MSL function body for the v1 one-owner-per-key chained dK/dV backward kernel.
 
     `head_dim` in {64, 96, 128} is baked in as a compile-time constant (fixing the per-thread
@@ -1114,10 +1149,16 @@ def build_bwd_dkv_source(head_dim: int, *, causal: bool, flip_causal: bool = Fal
         )
     if flip_causal and not causal:
         raise ValueError("flip_causal is only meaningful with causal=True")
+    if drop_diagonal and not causal:
+        raise ValueError("drop_diagonal is only meaningful with causal=True")
+    if drop_diagonal and flip_causal:
+        raise ValueError("drop_diagonal and flip_causal are mutually exclusive perturbations")
     if not causal:
         keep = "true"
     elif flip_causal:
         keep = "i <= key"
+    elif drop_diagonal:
+        keep = "i > key"
     else:
         keep = "i >= key"
     return _BWD_DKV_TEMPLATE.replace("HEAD_DIM", str(head_dim)).replace("KEEP_CMP", keep)
@@ -1474,7 +1515,8 @@ _BWD_DKV_MMA_TEMPLATE = """
 
 
 def build_bwd_dkv_mma_source(
-    head_dim: int, *, causal: bool, flip_causal: bool = False, d_slab: int | None = None,
+    head_dim: int, *, causal: bool, flip_causal: bool = False,
+    drop_diagonal: bool = False, d_slab: int | None = None,
 ) -> str:
     """MSL function body for the 4x4 simdgroup-matrix (MMA) dK/dV backward kernel -- the key-major,
     register-resident D-slabbed, CHAINED throughput restructure of the v1 scalar one-owner-per-key
@@ -1505,6 +1547,10 @@ def build_bwd_dkv_mma_source(
         )
     if flip_causal and not causal:
         raise ValueError("flip_causal is only meaningful with causal=True")
+    if drop_diagonal and not causal:
+        raise ValueError("drop_diagonal is only meaningful with causal=True")
+    if drop_diagonal and flip_causal:
+        raise ValueError("drop_diagonal and flip_causal are mutually exclusive perturbations")
     slab = _BWD_DKV_MMA_D_SLAB if d_slab is None else d_slab
     if slab <= 0 or slab % 8 != 0 or head_dim % slab != 0:
         raise ValueError(
@@ -1515,6 +1561,9 @@ def build_bwd_dkv_mma_source(
         q_start = "q_lo"
     elif flip_causal:
         keep = "i <= key"
+        q_start = "metal::max(q_lo, key_base)"
+    elif drop_diagonal:
+        keep = "i > key"
         q_start = "metal::max(q_lo, key_base)"
     else:
         keep = "i >= key"

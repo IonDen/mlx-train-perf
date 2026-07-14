@@ -10,6 +10,7 @@ oracle function (no MLX, no subprocess, no model), and `_recipe_session_id`/
 logic. `sweep_arm`/`main` (which call `run_conditions` and would spawn a real
 subprocess trying to load the flagship model) are exercised only via `--help`.
 """
+import json
 import subprocess
 import sys
 from collections.abc import Callable
@@ -30,10 +31,13 @@ from northstar_context_sweep import (  # noqa: E402 -- follows the sys.path inse
     build_parser,
     build_probe,
     find_max_context,
+    make_probe,
     model_slug,
     probe_condition_name,
     script_sha,
 )
+
+from mlx_train_perf.errors import MemoryBudgetError  # noqa: E402
 
 _SCRIPT_PATH = _SCRIPTS_DIR / "northstar_context_sweep.py"
 
@@ -338,3 +342,91 @@ def test_default_model_is_the_flagship() -> None:
     args = build_parser().parse_args([])
     assert args.model == FLAGSHIP_MODEL
     assert args.arm == "both"
+
+
+# ---------------------------------------------------------------------------
+# 0.3.0: environment refusals are NOT fit verdicts. The first 0.3.0 sweep converged both
+# arms on `refused_environment` probes (the machine got crowded mid-sweep) and published
+# them as ceilings -- the probe must retry a transiently crowded start and, if the
+# crowding persists, fail the arm LOUDLY instead of converging on an artifact.
+# ---------------------------------------------------------------------------
+
+
+def _fake_run_conditions_with_statuses(tmp_path: Path, statuses: list[str]):  # type: ignore[no-untyped-def]
+    it = iter(statuses)
+
+    def fake_run_conditions(conditions, out_dir, *, session_id):  # type: ignore[no-untyped-def]  # noqa: ARG001 -- runner signature
+        p = tmp_path / f"{conditions[0].name}.json"
+        p.write_text(json.dumps({"identity": {}, "status": next(it)}))
+        return [p]
+
+    return fake_run_conditions
+
+
+def test_probe_retries_a_transient_environment_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        northstar_context_sweep, "run_conditions",
+        _fake_run_conditions_with_statuses(
+            tmp_path, ["refused_environment", "refused_environment", "ok"],
+        ),
+    )
+    sleeps: list[float] = []
+    probe = make_probe(
+        model="m", revision=None, batch=1, lora_rank=8, lora_layers=-1, seed=0,
+        arm="ours", out_dir=tmp_path, session_id="s", _sleep=sleeps.append,
+    )
+    assert probe(1024) is True
+    assert sleeps == [northstar_context_sweep._ENV_REFUSAL_WAIT_S] * 2
+
+
+def test_probe_raises_after_persistent_environment_refusals(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        northstar_context_sweep, "run_conditions",
+        _fake_run_conditions_with_statuses(tmp_path, ["refused_environment"] * 10),
+    )
+    sleeps: list[float] = []
+    probe = make_probe(
+        model="m", revision=None, batch=1, lora_rank=8, lora_layers=-1, seed=0,
+        arm="ours", out_dir=tmp_path, session_id="s", _sleep=sleeps.append,
+    )
+    with pytest.raises(MemoryBudgetError, match="crowded"):
+        probe(1024)
+    # initial attempt + retries, a sleep between consecutive attempts only
+    assert len(sleeps) == northstar_context_sweep._ENV_REFUSAL_ATTEMPTS - 1
+
+
+def test_probe_still_reads_a_crash_as_does_not_fit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A crash envelope (status "error") keeps its historical does-not-fit reading; only
+    # the environment refusal is a non-verdict.
+    monkeypatch.setattr(
+        northstar_context_sweep, "run_conditions",
+        _fake_run_conditions_with_statuses(tmp_path, ["error"]),
+    )
+    probe = make_probe(
+        model="m", revision=None, batch=1, lora_rank=8, lora_layers=-1, seed=0,
+        arm="ours", out_dir=tmp_path, session_id="s", _sleep=lambda _s: None,
+    )
+    assert probe(1024) is False
+
+
+def test_sweep_arm_records_unconverged_on_persistent_environment_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        northstar_context_sweep, "run_conditions",
+        _fake_run_conditions_with_statuses(tmp_path, ["refused_environment"] * 50),
+    )
+    monkeypatch.setattr(northstar_context_sweep, "_ENV_REFUSAL_WAIT_S", 0.0)
+    result = northstar_context_sweep.sweep_arm(
+        model="m", revision=None, batch=1, lora_rank=8, lora_layers=-1, seed=0,
+        arm="ours", start=1024, granularity=256, out_dir=tmp_path, session_id="s",
+    )
+    assert result["converged"] is False
+    assert "crowded" in str(result["environment_refusal"])
+    assert "max_fitting_seq_len" not in result   # no polluted ceiling number published

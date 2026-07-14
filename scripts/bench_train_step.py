@@ -73,8 +73,12 @@ def model_slug(model: str) -> str:
     return model.replace("/", "__").replace(":", "_").replace(" ", "_")
 
 
-def condition_name(*, model: str, seq_len: int, arm: str) -> str:
-    return f"train_step_{model_slug(model)}_seq{seq_len}_{arm}"
+def condition_name(*, model: str, seq_len: int, arm: str, attention_impl: str) -> str:
+    # The attention arm is part of the FILENAME, not just the artifact identity (repo
+    # gotcha 18 / backlog 0022): two invocations differing only by --attention against one
+    # shared --out dir silently overwrote each other's artifacts once (identity differed,
+    # filename did not) -- the pair had to be re-run.
+    return f"train_step_{model_slug(model)}_seq{seq_len}_attn-{attention_impl}_{arm}"
 
 
 def build_conditions(
@@ -112,7 +116,10 @@ def build_conditions(
                 # layer at one attention implementation. A stock vs flash INVOCATION then
                 # gets a different artifact identity (the field is in the identity).
                 conditions.append(Condition(
-                    name=condition_name(model=model, seq_len=seq_len, arm=arm),
+                    name=condition_name(
+                        model=model, seq_len=seq_len, arm=arm,
+                        attention_impl=attention_impl,
+                    ),
                     kind="train_step", params=params, attention_impl=attention_impl,
                 ))
     return conditions
@@ -135,7 +142,7 @@ def _session_id_of(result: dict[str, object]) -> str | None:
 
 
 def compare_ours_vs_stock(
-    paths_by_name: dict[str, Path], *, model: str, seq_len: int,
+    paths_by_name: dict[str, Path], *, model: str, seq_len: int, attention_impl: str,
 ) -> dict[str, object]:
     """One (model, seq_len) row of the comparison report. Never raises -- a missing,
     corrupt, incomplete (either side not `"ok"` -- e.g. the flagship's stock arm
@@ -143,8 +150,12 @@ def compare_ours_vs_stock(
     explaining why the comparison fields are absent, rather than crashing the whole
     report over one condition's expected failure."""
     entry: dict[str, object] = {"model": model, "seq_len": seq_len}
-    ours_path = paths_by_name.get(condition_name(model=model, seq_len=seq_len, arm="ours"))
-    stock_path = paths_by_name.get(condition_name(model=model, seq_len=seq_len, arm="stock"))
+    ours_path = paths_by_name.get(condition_name(
+        model=model, seq_len=seq_len, arm="ours", attention_impl=attention_impl,
+    ))
+    stock_path = paths_by_name.get(condition_name(
+        model=model, seq_len=seq_len, arm="stock", attention_impl=attention_impl,
+    ))
     if ours_path is None or stock_path is None:
         entry["status"] = "missing"
         return entry
@@ -182,11 +193,13 @@ def compare_ours_vs_stock(
 
 
 def build_report(
-    paths: list[Path], *, models: list[str], seq_lens: list[int],
+    paths: list[Path], *, models: list[str], seq_lens: list[int], attention_impl: str,
 ) -> list[dict[str, object]]:
     paths_by_name = {p.stem: p for p in paths}
     return [
-        compare_ours_vs_stock(paths_by_name, model=model, seq_len=seq_len)
+        compare_ours_vs_stock(
+            paths_by_name, model=model, seq_len=seq_len, attention_impl=attention_impl,
+        )
         for model in models for seq_len in seq_lens
     ]
 
@@ -265,7 +278,9 @@ def main(argv: list[str] | None = None) -> int:
         conditions = matches
 
     paths = run_conditions(conditions, out_dir, session_id=new_session_id())
-    comparison = build_report(paths, models=models, seq_lens=seq_lens)
+    comparison = build_report(
+        paths, models=models, seq_lens=seq_lens, attention_impl=attention_impl,
+    )
     print(json.dumps(comparison, indent=2))
     return 0
 

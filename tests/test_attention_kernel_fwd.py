@@ -30,6 +30,7 @@ from mlx_train_perf.attention.kernel.launch import (
     _next_probe_n,
     _start_probe_n,
     calibrated_fwd_rate,
+    causal_pairs,
     check_fwd_budget,
     launch_flash_fwd,
 )
@@ -175,25 +176,68 @@ def test_build_fwd_mma_source_rejects_flip_without_causal() -> None:
         build_fwd_mma_source(64, causal=False, flip_causal=True)
 
 
+def test_build_fwd_source_drop_diagonal_perturbation() -> None:
+    # 0022f: the off-by-one discriminator -- the diagonal itself is dropped (kk < row),
+    # a subtler perturbation than the flipped triangle.
+    s = build_fwd_source(64, causal=True, drop_diagonal=True)
+    assert "kk < row" in s
+    assert "kk <= row" not in s
+
+
+def test_build_fwd_source_rejects_drop_diagonal_misuse() -> None:
+    with pytest.raises(ValueError, match="drop_diagonal"):
+        build_fwd_source(64, causal=False, drop_diagonal=True)
+    with pytest.raises(ValueError, match="drop_diagonal"):
+        build_fwd_source(64, causal=True, flip_causal=True, drop_diagonal=True)
+
+
+def test_build_fwd_mma_source_drop_diagonal_perturbation() -> None:
+    s = build_fwd_mma_source(64, causal=True, drop_diagonal=True)
+    assert "kk < row" in s
+    assert "kk <= row" not in s
+
+
+def test_build_fwd_mma_source_rejects_drop_diagonal_misuse() -> None:
+    with pytest.raises(ValueError, match="drop_diagonal"):
+        build_fwd_mma_source(64, causal=False, drop_diagonal=True)
+    with pytest.raises(ValueError, match="drop_diagonal"):
+        build_fwd_mma_source(64, causal=True, flip_causal=True, drop_diagonal=True)
+
+
 def test_check_fwd_budget_passes_a_cheap_dispatch() -> None:
-    # tiny per-row cost at a real rate: nowhere near the 1 s / 60 s bounds
-    check_fwd_budget(n=64, d=64, b=1, hq=4, rows=64, rate=1e12)
+    # tiny per-row cost at a real rate: nowhere near the per-buffer bound
+    check_fwd_budget(n=64, d=64, b=1, hq=4, hkv=2, rate=1e12, causal=True)
 
 
 def test_check_fwd_budget_refuses_when_one_row_over_budgets() -> None:
-    # a single query row projected over 1 s at this (deliberately low) rate -> refuse
+    # a single TAIL query row projected over the per-buffer budget at this (deliberately
+    # low) rate -> refuse; under exact-causal costing the tail row is the expensive one.
     per_row = _fwd_macs_per_row(n=16384, d=128, b=1, hq=32)
-    slow_rate = per_row / 2.0  # 1 row projects to 2 s > the 1 s per-dispatch bound
+    slow_rate = per_row / 2.0  # the last row alone projects ~2 s > the 0.5 s bound
     with pytest.raises(LaunchBudgetError):
-        check_fwd_budget(n=16384, d=128, b=1, hq=32, rows=1, rate=slow_rate)
+        check_fwd_budget(n=16384, d=128, b=1, hq=32, hkv=8, rate=slow_rate, causal=True)
 
 
-def test_check_fwd_budget_refuses_over_total_budget() -> None:
-    # per-dispatch fine (1 row), but the whole forward over all rows blows the 60 s total
-    per_row = _fwd_macs_per_row(n=16384, d=128, b=1, hq=32)
-    rate = per_row * 100.0  # 1 row ~ 0.01 s (ok), all 16384 rows ~ 164 s (> 60 s)
+def test_check_fwd_budget_allows_an_unbounded_chain_of_own_buffer_dispatches() -> None:
+    # 0.3.0 (backlog 0025): the retired chain-total cap refused a forward whose total
+    # projected wall was large even though every dispatch was individually safe. At the
+    # flagship-class shape each mma range dispatch (inputs + its live O/L chunks) crosses
+    # the mlx commit threshold, so dispatches own their buffers and the chain may project
+    # an unbounded total.
+    pair = 2 * 128 * 1 * 32                              # 2*D per pair across (b, hq)
+    total = causal_pairs(0, 16384) * pair
+    rate = total / 8.0                                   # whole causal pass ~8 s
+    check_fwd_budget(n=16384, d=128, b=1, hq=32, hkv=8, rate=rate, causal=True)
+
+
+def test_check_fwd_budget_caps_a_packed_small_footprint_chain() -> None:
+    # At a small shape the fwd's unique elements never reach the commit threshold, so
+    # consecutive dispatches are assumed to PACK into one command buffer: a chain whose
+    # summed projection exceeds one buffer budget refuses.
+    pair = 2 * 64 * 1 * 4
+    total = causal_pairs(0, 2048) * pair
     with pytest.raises(LaunchBudgetError):
-        check_fwd_budget(n=16384, d=128, b=1, hq=32, rows=1, rate=rate)
+        check_fwd_budget(n=2048, d=64, b=1, hq=4, hkv=2, rate=total / 1.5, causal=True)
 
 
 # ---------------------------------------------------------------------------------------
@@ -263,7 +307,10 @@ def test_calibrate_fwd_ramps_past_the_old_fixed_probe_despite_underestimating_it
         macs = _fwd_macs_per_row(n=keys, d=d, b=b, hq=hq) * rows
         return macs / rate
 
-    result = _calibrate_fwd(measure=fake_measure, n=n, d=d, b=b, hq=hq, start_n=128, max_stages=3)
+    result = _calibrate_fwd(
+        measure=fake_measure, n=n, d=d, b=b, hq=hq, start_n=128, max_stages=3,
+        causal=False,   # rectangle credit -- the causal-triangle credit has its own test
+    )
 
     assert calls[0] == (128, 128)                  # the ramp STARTS at the old fixed probe
     assert calls[-1][1] > 128                       # ... but does not STOP there
@@ -282,7 +329,9 @@ def test_calibrate_fwd_stops_ramping_once_the_probe_stops_growing() -> None:
         macs = _fwd_macs_per_row(n=keys, d=d, b=b, hq=hq) * rows
         return macs / 1e12   # constant rate: the projected probe size never grows
 
-    _calibrate_fwd(measure=fake_measure, n=n, d=d, b=b, hq=hq, start_n=512, max_stages=5)
+    _calibrate_fwd(
+        measure=fake_measure, n=n, d=d, b=b, hq=hq, start_n=512, max_stages=5, causal=False,
+    )
 
     per_dispatch_s = (_fwd_macs_per_row(n=512, d=d, b=b, hq=hq) * 512) / 1e12
     # 1 ramp stage + sustain + median -- and NO canary: the ramp already measured the
@@ -302,7 +351,9 @@ def test_calibrate_fwd_returns_raw_unhalved_rate() -> None:
         macs = _fwd_macs_per_row(n=keys, d=d, b=b, hq=hq) * rows
         return macs / rate
 
-    result = _calibrate_fwd(measure=fake_measure, n=n, d=d, b=b, hq=hq, start_n=8192, max_stages=1)
+    result = _calibrate_fwd(
+        measure=fake_measure, n=n, d=d, b=b, hq=hq, start_n=8192, max_stages=1, causal=False,
+    )
     assert result == pytest.approx(rate, rel=1e-6)
 
 
@@ -330,7 +381,10 @@ def test_calibrate_fwd_final_canary_measures_small_rows_against_full_n_keys() ->
         macs = _fwd_macs_per_row(n=keys, d=d, b=b, hq=hq) * rows
         return macs / rate
 
-    result = _calibrate_fwd(measure=fake_measure, n=n, d=d, b=b, hq=hq, start_n=128, max_stages=3)
+    result = _calibrate_fwd(
+        measure=fake_measure, n=n, d=d, b=b, hq=hq, start_n=128, max_stages=3,
+        causal=False,   # rectangle credit -- the causal-triangle credit has its own test
+    )
 
     last_rows, last_keys = calls[-1]
     assert last_keys == n            # the canary sees the FULL key working set
@@ -360,13 +414,13 @@ def test_max_dispatch_budget_is_pinned_to_the_interactivity_kill_evidence() -> N
     projected (x SAFETY margin 2 => ~0.25s real) sits in the proven-safe class. Raising
     this constant requires NEW kill-threshold evidence, not convenience."""
     assert fwd_launch.MAX_DISPATCH_SECONDS == 0.5
-    # The second half of the same evidence: 35 honest ~0.25s-real dispatches PACKED INTO
-    # ONE EVAL (~8.7s cumulative GPU work) were ALSO killed -- the OS kill is per command
-    # buffer / cumulative, not per dispatch, and MLX packs consecutive custom dispatches.
-    # The CE kernel's ~2.2s evals have never been killed, so ~2s is the proven-safe class
-    # for the TOTAL cap too (a flagship v0 scalar forward now refuses honestly instead of
-    # dying; MMA-class rates fit a full forward well inside it).
-    assert fwd_launch.MAX_TOTAL_SECONDS == 2.0
+    # 0.3.0 (backlog 0025): the kill unit is the individual COMMAND BUFFER, and mlx 0.32.0
+    # commits a buffer at >50 ops or >50 M unique input+output ELEMENTS -- the planner
+    # models that composition, so these constants are load-bearing safety pins too. The
+    # rung-0 "35 packed dispatches killed" evidence was ~4-6-dispatch ~1.0-1.5 s packed
+    # BUFFERS dying on a kill-active day; per-buffer ~0.25 s real has never been killed.
+    assert fwd_launch._PACK_COMMIT_ELEMS == 51 << 20
+    assert fwd_launch._PACK_COMMIT_OPS == 51
 
 
 # ---------------------------------------------------------------------------------------
@@ -526,14 +580,13 @@ def test_fwd_split_matches_single_dispatch(variant: str) -> None:
         q, k, v, scale=scale, causal=True, tile=TileShape(bq=32, variant=variant),
         rate_macs_per_s=GENEROUS_RATE,   # one dispatch over all rows
     )
-    # Force ~80 rows/dispatch (4 disjoint dispatches over n=257) via a low rate, keeping
-    # the projected per-dispatch inside MAX_DISPATCH_SECONDS (0.5 s) AND the projected
-    # total (257/160 = 1.6 s) inside the 2.0 s per-eval cap.
-    per_row = _fwd_macs_per_row(n=n, d=d, b=b, hq=hq)
-    split_rate = per_row * 160.0
+    # Force 4 disjoint dispatches over n=257, with a boundary that is not 32-aligned.
+    # `_force_ranges` is the TEST-ONLY forcing seam (like `_flip_causal`): the production
+    # planner would emit a single range here -- a tiny packed-regime shape whose whole
+    # chain fits one per-buffer budget is never split (see test_attention_launch_plan.py).
     split_o, split_l = launch_flash_fwd(
         q, k, v, scale=scale, causal=True, tile=TileShape(bq=32, variant=variant),
-        rate_macs_per_s=split_rate,
+        _force_ranges=[(0, 80), (80, 160), (160, 240), (240, 257)],
     )
     mx.eval(single_o, single_l, split_o, split_l)
     assert mx.array_equal(single_o, split_o).item()
@@ -562,8 +615,55 @@ def test_fwd_wrong_mask_perturbation_fails_parity(variant: str) -> None:
     d_o = mx.abs(o_wrong.astype(mx.float32) - o_ref.astype(mx.float32)).max().item()
     d_l = mx.abs(l_wrong - l_ref).max().item()
     assert d_o > 1e-2 or d_l > 1e-2, (
-        f"flipped-mask kernel matched the causal reference (O={d_o:.3e}, L={d_l:.3e}) -- "
-        "the parity suite cannot detect a mask bug"
+        f"flipped-mask kernel matched the causal reference (dO={d_o:.3e}, dL={d_l:.3e})"
+    )
+
+
+@pytest.mark.metal
+@pytest.mark.parametrize("variant", ["scalar", "mma"])
+def test_fwd_drop_diagonal_perturbation_fails_parity(variant: str) -> None:
+    """0022f: the OFF-BY-ONE discriminator. A kernel whose causal keep drops the diagonal
+    itself (`kk < row`) must DIVERGE from the causal reference -- the flipped-triangle
+    perturbation is gross, and a diagonal off-by-one could in principle slip past it. The
+    perturbed kernel is built directly from the source builder (a test-only flag; the
+    production launchers never expose it)."""
+    b, hq, hkv, n, d = 2, 4, 2, 16, 64
+    scale = 1.0 / math.sqrt(d)
+    q, k, v = _rand_qkv(b=b, hq=hq, hkv=hkv, n=n, d=d, dtype=mx.float32, seed=4)
+
+    builder = build_fwd_mma_source if variant == "mma" else build_fwd_source
+    kernel = mx.fast.metal_kernel(
+        name=f"mtp_test_dropdiag_fwd_{variant}",
+        input_names=["q", "k", "v", "qoffs", "scale_in"],
+        output_names=["o_out", "l_out"],
+        source=builder(d, causal=True, drop_diagonal=True),
+    )
+    scale_in = mx.array([scale], dtype=mx.float32)
+    o_bad, l_bad = fwd_launch._dispatch_range(
+        kernel, q, k, v, scale_in, r0=0, r1=n, tile=TileShape(bq=32, variant=variant),
+    )
+    o_ref, l_ref = _reference_o_l(q, k, v, scale=scale)
+    mx.eval(o_bad, l_bad, o_ref, l_ref)
+
+    # Row 0's keep-set is EMPTY under kk < row (0/0 -> NaN) for ANY kernel that even reads
+    # the comparison, so a whole-tensor check passes trivially on row 0 alone. Prove the
+    # perturbation on rows >= 1 instead: their keep-sets stay non-empty (finite) but drop
+    # the diagonal key, so they MUST diverge from the causal reference -- this catches a
+    # future mma tile-boundary bug that broke rows 1..n-1 while leaving row 0 empty.
+    o_rest = o_bad[:, :, 1:, :].astype(mx.float32)
+    l_rest = l_bad[:, :, 1:]
+    rows_finite = bool(mx.isfinite(o_rest).all().item()) and bool(
+        mx.isfinite(l_rest).all().item()
+    )
+    assert rows_finite, (
+        "drop-diagonal rows >= 1 went non-finite -- the divergence proof needs finite rows "
+        "there (only row 0's empty keep-set should NaN)"
+    )
+    d_o = mx.abs(o_rest - o_ref[:, :, 1:, :].astype(mx.float32)).max().item()
+    d_l = mx.abs(l_rest - l_ref[:, :, 1:]).max().item()
+    assert d_o > 1e-2 or d_l > 1e-2, (
+        f"drop-diagonal kernel matched the causal reference on rows>=1 (dO={d_o:.3e}, "
+        f"dL={d_l:.3e}) -- the parity grid cannot detect a diagonal off-by-one"
     )
 
 

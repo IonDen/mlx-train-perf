@@ -386,7 +386,13 @@ def test_run_conditions_skips_fresh_without_spawning_a_subprocess(
     assert json.loads(out_path.read_text())["wall_s"] == 0.01  # untouched
 
 
+@_needs_room_for_real_worker
 def test_run_conditions_records_error_envelope_on_worker_crash(tmp_path: Path) -> None:
+    # Spawns a REAL worker (unsupported kind -> crash -> WorkerCrashed envelope). On a
+    # machine that trips guards' safe-start floor (small CI runner) the worker refuses at
+    # `effective_memory_ceiling()` with `refused_environment` BEFORE it reaches the kind
+    # crash, so the "error" assertion only holds where the worker has room to run -- hence
+    # the skipif its sibling real-worker tests carry.
     session_id = new_session_id()
     bad = Condition(name="bad_kind", kind="not_a_real_kind", params={"n": 8, "d": 4, "v": 16})
     paths = run_conditions([bad], tmp_path, session_id=session_id)
@@ -529,6 +535,32 @@ def test_worker_main_records_refusal_not_a_crash(
     data = json.loads(out.read_text())
     assert data["status"] == "refused"
     assert "watchdog" in data["error"]
+
+
+def test_worker_main_records_environment_refusal_distinctly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """0022d: a too-crowded-at-start refusal (guards' `MemoryBudgetError` out of
+    `effective_memory_ceiling`) is ENVIRONMENT-transient -- a distinct
+    `refused_environment` status, never a `WorkerCrashed` envelope and never the
+    condition-intrinsic `refused`. Only `"ok"` is fresh on resume, so a later, quieter
+    invocation re-runs it automatically."""
+    out = tmp_path / "r.json"
+    cfg = tmp_path / "config.json"
+    cfg.write_text(json.dumps({
+        "kind": "loss_layer", "params": {"n": 8, "d": 4, "v": 16}, "session_id": "s1",
+        "out": str(out),
+    }))
+
+    def _too_crowded() -> EffectiveCeiling:
+        raise MemoryBudgetError("machine too crowded to start safely")
+
+    monkeypatch.setattr(worker, "effective_memory_ceiling", _too_crowded)
+    rc = worker.main(["--config", str(cfg)])
+    assert rc == 0                    # transient environment refusal IS a result
+    data = json.loads(out.read_text())
+    assert data["status"] == "refused_environment"
+    assert "crowded" in data["error"]
 
 
 def test_worker_main_crashes_on_unsupported_kind(tmp_path: Path) -> None:

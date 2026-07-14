@@ -4,6 +4,50 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-07-14
+
+Removes the launch-safety cap that held the flash-attention path's trainable context below
+its memory limit, and adds Qwen2 to the loss adapter. Measured on an M1 Max (32 GB, macOS
+26.5, mlx 0.32.0), Qwen3-8B-4bit unless noted.
+
+### Changed
+- The attention launch guard is now per command buffer, not per chain. 0.2.0 capped the
+  flash path with a 2-second budget on a whole launch chain, on the theory that macOS could
+  kill a chain of Metal dispatches that ran too long. Re-reading mlx 0.32.0's scheduler and
+  re-testing the crash that motivated the budget showed the watchdog acts on a single
+  command buffer that starves display compositing, never a chain or an eval total — and at
+  training shapes each backward dispatch already runs in its own buffer
+  (`scripts/probe_command_buffer_packing.py` reproduces this). The guard now models that
+  composition and projects each buffer against the unchanged 0.5-second worst-day budget,
+  using exact causal work counts. No safety budget was raised; what changed is what the
+  budget applies to.
+- Maximum trainable context on 32 GB (Qwen3-8B-4bit QLoRA, gradient checkpointing, bf16),
+  measured the same day with the same search (`scripts/northstar_context_sweep.py`): 23,040
+  tokens with flash attention against 7,936 with stock attention, both bound by the same
+  ~24.5 GiB effective memory ceiling on this machine. Under one memory budget the flash path
+  reaches 2.9x the context, because it keeps O(N) saved state instead of the O(N²) score
+  matrix. In 0.2.0 this path was launch-capped near 10k tokens on the same machine; that cap
+  is gone. Both ceilings scale with available memory, so the ratio is the portable figure —
+  a machine with more free memory lets both climb together.
+- The single flash attention op runs at 16,384 tokens instead of refusing on the retired
+  launch budget (`scripts/bench_attention_op.py`). Stock attention still cannot reach that
+  context on 32 GB; it aborts on the memory ceiling well before it.
+
+### Added
+- Qwen2 architecture support in the mlx-lm loss adapter (the Qwen2.5 family, tied and untied
+  heads), with loss parity against the stock trainer verified on a real Qwen2.5-0.5B
+  checkpoint (worst per-step difference 2.1e-3). `enable_flash_attention` still covers Llama
+  and Qwen3; wrapping Qwen2 attention is future work.
+- Benchmark hygiene for the community kit and the internal harness: train-step artifact
+  filenames carry the attention arm, so two runs that differ only in `--attention` no longer
+  overwrite each other in one output directory; a machine too crowded to start a run safely
+  records its own status and re-runs on a quieter machine instead of reading as a crash; the
+  quick-tier time estimate is re-anchored to a measured run.
+
+### Fixed
+- A flaky peak-memory comparison in the test suite on small shared-GPU CI runners: the
+  measurement now pins the allocator state at every snapshot boundary.
+
 ## [0.2.0] - 2026-07-14
 
 Adds an opt-in flash-attention training path (Metal forward and backward) that halves the
