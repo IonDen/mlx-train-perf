@@ -1730,3 +1730,118 @@ def test_kernel_backward_routes_the_table_selected_variants(
     )
     assert r_dkv is not None, "dK/dV rate is None -- not the construction-time calibrated float"
     assert r_dkv > 0.0
+
+
+# ---------------------------------------------------------------------------------------
+# 0022f: drop-diagonal flip-perturbation hardening. The flipped-triangle perturbations
+# above are GROSS (wrong half-plane); a diagonal OFF-BY-ONE (`kk < row` for the row-major
+# dQ bodies, `i > key` for the key-major dK/dV bodies) is the subtler named-bug-site the
+# suite must also provably detect. The perturbed kernels are built directly from the
+# source builders (a test-only flag; the production launchers never expose it).
+# ---------------------------------------------------------------------------------------
+
+
+def test_build_bwd_dq_source_drop_diagonal_perturbation() -> None:
+    s = build_bwd_dq_source(64, causal=True, drop_diagonal=True)
+    assert "kk < row" in s
+    assert "kk <= row" not in s
+    s_mma = build_bwd_dq_mma_source(64, causal=True, drop_diagonal=True)
+    assert "kk < row" in s_mma
+    assert "kk <= row" not in s_mma
+
+
+def test_build_bwd_dkv_source_drop_diagonal_perturbation() -> None:
+    # KEY-major bodies: causal keep is `i >= key`, so dropping the diagonal is `i > key`.
+    s = build_bwd_dkv_source(64, causal=True, drop_diagonal=True)
+    assert "i > key" in s
+    assert "i >= key" not in s
+    s_mma = build_bwd_dkv_mma_source(64, causal=True, drop_diagonal=True)
+    assert "i > key" in s_mma
+    assert "i >= key" not in s_mma
+
+
+def test_build_bwd_sources_reject_drop_diagonal_misuse() -> None:
+    for builder in (
+        build_bwd_dq_source, build_bwd_dq_mma_source,
+        build_bwd_dkv_source, build_bwd_dkv_mma_source,
+    ):
+        with pytest.raises(ValueError, match="drop_diagonal"):
+            builder(64, causal=False, drop_diagonal=True)
+        with pytest.raises(ValueError, match="drop_diagonal"):
+            builder(64, causal=True, flip_causal=True, drop_diagonal=True)
+
+
+def _o_lse_darr(
+    q: mx.array, k: mx.array, v: mx.array, cot: mx.array, *, scale: float
+) -> tuple[mx.array, mx.array]:
+    o, lse = flash_attention_reference(q, k, v, scale=scale, causal=True)
+    return lse, launch_bwd_D(cot, o)
+
+
+@pytest.mark.metal
+@pytest.mark.parametrize("variant", ["scalar", "mma"])
+def test_dq_drop_diagonal_perturbation_fails_parity(variant: str) -> None:
+    b, hq, hkv, n, d = 2, 4, 2, 16, 64
+    scale = 1.0 / math.sqrt(d)
+    q, k, v, cot = _rand_qkv_do(b=b, hq=hq, hkv=hkv, n=n, d=d, dtype=mx.float32, seed=43)
+    lse, darr = _o_lse_darr(q, k, v, cot, scale=scale)
+
+    builder = build_bwd_dq_mma_source if variant == "mma" else build_bwd_dq_source
+    kernel = mx.fast.metal_kernel(
+        name=f"mtp_test_dropdiag_dq_{variant}",
+        input_names=["q", "k", "v", "d_o", "lse", "d_arr", "qoffs", "scale_in"],
+        output_names=["dq_out"],
+        source=builder(d, causal=True, drop_diagonal=True),
+    )
+    scale_in = mx.array([scale], dtype=mx.float32)
+    dq_bad = bwd_launch._dispatch_bwd_dq_range(
+        kernel, q, k, v, cot, lse, darr, scale_in, r0=0, r1=n, variant=variant,
+    )
+    dq_ref = _dq_oracle(q, k, v, cot, scale=scale, causal=True)
+    mx.eval(dq_bad, dq_ref)
+
+    # A non-finite dQ (an empty keep-set fingerprint) counts as divergence too.
+    finite = bool(mx.isfinite(dq_bad).all().item())
+    diff = mx.abs(dq_bad.astype(mx.float32) - dq_ref.astype(mx.float32)).max().item()
+    assert (not finite) or diff > 1e-2, (
+        f"drop-diagonal dQ ({variant}) matched the causal oracle (diff={diff:.3e}) -- "
+        "the parity grid cannot detect a diagonal off-by-one"
+    )
+
+
+@pytest.mark.metal
+@pytest.mark.parametrize("variant", ["scalar", "mma"])
+def test_dkv_drop_diagonal_perturbation_fails_parity(variant: str) -> None:
+    b, hq, hkv, n, d = 2, 4, 2, 16, 64
+    scale = 1.0 / math.sqrt(d)
+    q, k, v, cot = _rand_qkv_do(b=b, hq=hq, hkv=hkv, n=n, d=d, dtype=mx.float32, seed=53)
+    lse, darr = _o_lse_darr(q, k, v, cot, scale=scale)
+
+    builder = build_bwd_dkv_mma_source if variant == "mma" else build_bwd_dkv_source
+    kernel = mx.fast.metal_kernel(
+        name=f"mtp_test_dropdiag_dkv_{variant}",
+        input_names=[
+            "q", "k", "v", "d_o", "lse", "d_arr", "dk_in", "dv_in", "qoffs", "scale_in",
+        ],
+        output_names=["dk_out", "dv_out"],
+        source=builder(d, causal=True, drop_diagonal=True),
+    )
+    scale_in = mx.array([scale], dtype=mx.float32)
+    dk0 = mx.zeros((b, hkv, n, d), dtype=mx.float32)
+    dv0 = mx.zeros((b, hkv, n, d), dtype=mx.float32)
+    dk_bad, dv_bad = bwd_launch._dispatch_bwd_dkv_range(
+        kernel, q, k, v, cot, lse, darr, dk0, dv0, scale_in, q_lo=0, q_hi=n,
+        variant=variant,
+    )
+    dk_ref, dv_ref = _dkv_oracle(q, k, v, cot, scale=scale, causal=True)
+    mx.eval(dk_bad, dv_bad, dk_ref, dv_ref)
+
+    finite = bool(mx.isfinite(dk_bad).all().item() and mx.isfinite(dv_bad).all().item())
+    diff = max(
+        mx.abs(dk_bad.astype(mx.float32) - dk_ref.astype(mx.float32)).max().item(),
+        mx.abs(dv_bad.astype(mx.float32) - dv_ref.astype(mx.float32)).max().item(),
+    )
+    assert (not finite) or diff > 1e-2, (
+        f"drop-diagonal dK/dV ({variant}) matched the causal oracle (diff={diff:.3e}) -- "
+        "the parity grid cannot detect a diagonal off-by-one"
+    )

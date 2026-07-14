@@ -12,7 +12,7 @@ from mlx import nn
 pytest.importorskip("mlx_lm")
 
 import mlx_lm
-from mlx_lm.models import llama, qwen3
+from mlx_lm.models import llama, qwen2, qwen3
 from mlx_lm.tuner import trainer as t
 
 from mlx_train_perf.adapters.mlx_lm import (
@@ -33,6 +33,15 @@ def _tiny_llama(*, tie_word_embeddings: bool = False) -> llama.Model:
         rope_theta=10000.0, tie_word_embeddings=tie_word_embeddings,
     )
     return llama.Model(args)
+
+
+def _tiny_qwen2(*, tie_word_embeddings: bool = False) -> qwen2.Model:
+    args = qwen2.ModelArgs(
+        model_type="qwen2", hidden_size=64, num_hidden_layers=2, intermediate_size=128,
+        num_attention_heads=4, num_key_value_heads=2, vocab_size=256, rms_norm_eps=1e-5,
+        rope_theta=10000.0, tie_word_embeddings=tie_word_embeddings,
+    )
+    return qwen2.Model(args)
 
 
 def _tiny_qwen3(*, tie_word_embeddings: bool = False) -> qwen3.Model:
@@ -67,6 +76,27 @@ def test_split_yields_qwen3_trunk_and_head() -> None:
     hidden = trunk(x)
     assert hidden.shape == (2, 8, 64)
     assert isinstance(head, DenseHead)
+    assert head.weight.shape == (256, 64)
+
+
+def test_split_yields_qwen2_trunk_and_head() -> None:
+    # 0016: the Qwen2.5 family (qwen2 architecture) -- module layout matches llama's
+    # (inner .model trunk; lm_head only when untied).
+    model = _tiny_qwen2()
+    trunk, head = split_model(model)
+    x = mx.random.randint(0, 256, (2, 8))
+    hidden = trunk(x)
+    assert hidden.shape == (2, 8, 64)
+    assert isinstance(head, DenseHead)
+    assert head.weight.shape == (256, 64)
+
+
+def test_split_qwen2_tied_head_reuses_embedding_weight() -> None:
+    # Qwen2.5's small checkpoints (0.5B/1.5B) ship tied -- the tied arm is the common one.
+    model = _tiny_qwen2(tie_word_embeddings=True)
+    _trunk, head = split_model(model)
+    assert isinstance(head, DenseHead)
+    assert head.weight is model.model.embed_tokens.weight
     assert head.weight.shape == (256, 64)
 
 
@@ -148,6 +178,7 @@ def test_unsupported_architecture_is_typed_error() -> None:
         split_model(NotAModel())
     message = str(ei.value).lower()
     assert "llama" in message
+    assert "qwen2" in message
     assert "qwen3" in message
 
 
@@ -180,6 +211,22 @@ def test_loss_and_ntoks_match_stock_on_same_batch() -> None:
     assert int(ntoks_ours.item()) == int(ntoks_stock.item())
     # Measured exactly 0.0 on this seed/shape (fp32, single chunk); 1e-5 leaves headroom
     # for floating-point noise on other shapes/hardware without padding past "tight".
+    assert abs(ours.item() - stock.item()) < 1e-5
+
+
+def test_loss_and_ntoks_match_stock_on_qwen2() -> None:
+    # 0016: the qwen2 masking/loss parity vs stock default_loss (mirrors the llama/qwen3
+    # parity tests -- same trainer two-column (offset, length) contract).
+    model = _tiny_qwen2()
+    mx.random.seed(1)
+    batch = mx.random.randint(0, 256, (2, 12))
+    lengths = mx.array([[3, 12], [0, 7]])
+
+    loss_fn = make_loss_fn(model, impl="chunked")
+    ours, ntoks_ours = loss_fn(model, batch, lengths)
+    stock, ntoks_stock = t.default_loss(model, batch, lengths)
+
+    assert int(ntoks_ours.item()) == int(ntoks_stock.item())
     assert abs(ours.item() - stock.item()) < 1e-5
 
 
@@ -343,3 +390,26 @@ def test_real_model_one_train_step() -> None:
 
     assert mx.isfinite(loss).item()
     assert mx.get_peak_memory() < 20 * 1024**3  # matches the session wired cap
+
+
+@pytest.mark.smoke
+def test_real_qwen2_model_loss_parity() -> None:
+    """--run-smoke (0016): masking/loss parity vs stock `default_loss` on a REAL Qwen2.5
+    checkpoint (tied embeddings -- the family's common shipping shape). Model:
+    mlx-community/Qwen2.5-0.5B-Instruct-bf16, expected pre-downloaded (never fetched)."""
+    model, _tokenizer = mlx_lm.load("mlx-community/Qwen2.5-0.5B-Instruct-bf16")
+    assert type(model).__module__ == "mlx_lm.models.qwen2"
+    mx.random.seed(7)
+    batch = mx.random.randint(0, model.args.vocab_size, (2, 32))
+    lengths = mx.array([[5, 32], [0, 20]])   # prompt offset + ragged length
+
+    loss_fn = make_loss_fn(model)
+    ours, ntoks_ours = loss_fn(model, batch, lengths)
+    stock, ntoks_stock = t.default_loss(model, batch, lengths)
+    mx.eval(ours, ntoks_ours, stock, ntoks_stock)
+
+    assert int(ntoks_ours.item()) == int(ntoks_stock.item())
+    # Measured 2.077e-03 on this seed/shape (bf16 checkpoint at untrained-random-token
+    # loss ~15.09 -- bf16-ULP class at that magnitude); pinned at ~2x the measured worst,
+    # the same headroom convention the attention parity pins use.
+    assert abs(ours.item() - stock.item()) < 4e-3

@@ -32,18 +32,21 @@ Verified against the installed mlx-lm==0.31.3 (mlx==0.31.2) source, 2026-07-04:
   therefore calls `split_model(model)` fresh on every invocation rather than once at
   `make_loss_fn` construction time.
 
-- **Model structure** (mlx_lm/models/llama.py, mlx_lm/models/qwen3.py -- identical
-  shape in both families): `Model.__call__` computes hidden states via `self.model(x)`
-  (the inner `LlamaModel` / `Qwen3Model`) and projects with `self.lm_head`
-  (`nn.Linear` or `nn.QuantizedLinear`) unless `args.tie_word_embeddings`, in which case
-  it projects via `self.model.embed_tokens.as_linear(hidden)`
-  (`nn.Embedding` / `nn.QuantizedEmbedding`). Both quantized module types expose
-  `weight, scales, biases, group_size, bits, mode` directly; `biases` is `None` and
-  `mode` is not `"affine"` for the non-affine quantization modes (`mxfp4`/`mxfp8`/
-  `nvfp4`) that this project's kernel and chunked paths do not implement.
+- **Model structure** (mlx_lm/models/llama.py, mlx_lm/models/qwen2.py,
+  mlx_lm/models/qwen3.py -- identical shape in all three families): `Model.__call__`
+  computes hidden states via `self.model(x)` (the inner `LlamaModel` / `Qwen2Model` /
+  `Qwen3Model`) and projects with `self.lm_head` (`nn.Linear` or `nn.QuantizedLinear`)
+  unless `args.tie_word_embeddings` (qwen2's DEFAULT -- the Qwen2.5 0.5B/1.5B
+  checkpoints ship tied; `lm_head` only exists untied), in which case it projects via
+  `self.model.embed_tokens.as_linear(hidden)` (`nn.Embedding` / `nn.QuantizedEmbedding`).
+  Both quantized module types expose `weight, scales, biases, group_size, bits, mode`
+  directly; `biases` is `None` and `mode` is not `"affine"` for the non-affine
+  quantization modes (`mxfp4`/`mxfp8`/`nvfp4`) that this project's kernel and chunked
+  paths do not implement.
 
-Only the Llama and Qwen3 model families are supported (matched by
-`type(model).__module__`); anything else raises `AdapterError` naming the support list.
+Only the Llama, Qwen2 (Qwen2.5 family) and Qwen3 model families are supported (matched
+by `type(model).__module__`); anything else raises `AdapterError` naming the support
+list.
 """
 from collections.abc import Callable
 from typing import Any, Literal
@@ -62,9 +65,10 @@ from mlx_train_perf.core.loss import (
 from mlx_train_perf.errors import AdapterError, MissingDependencyError
 
 # Keyed by the exact `type(model).__module__` mlx-lm uses for each family (verified
-# against the installed mlx_lm.models.llama / mlx_lm.models.qwen3 above).
+# against the installed mlx_lm.models.llama / qwen2 / qwen3 above).
 _SUPPORTED_FAMILIES: dict[str, str] = {
     "llama": "mlx_lm.models.llama",
+    "qwen2": "mlx_lm.models.qwen2",
     "qwen3": "mlx_lm.models.qwen3",
 }
 

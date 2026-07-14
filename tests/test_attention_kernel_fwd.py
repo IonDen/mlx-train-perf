@@ -176,6 +176,34 @@ def test_build_fwd_mma_source_rejects_flip_without_causal() -> None:
         build_fwd_mma_source(64, causal=False, flip_causal=True)
 
 
+def test_build_fwd_source_drop_diagonal_perturbation() -> None:
+    # 0022f: the off-by-one discriminator -- the diagonal itself is dropped (kk < row),
+    # a subtler perturbation than the flipped triangle.
+    s = build_fwd_source(64, causal=True, drop_diagonal=True)
+    assert "kk < row" in s
+    assert "kk <= row" not in s
+
+
+def test_build_fwd_source_rejects_drop_diagonal_misuse() -> None:
+    with pytest.raises(ValueError, match="drop_diagonal"):
+        build_fwd_source(64, causal=False, drop_diagonal=True)
+    with pytest.raises(ValueError, match="drop_diagonal"):
+        build_fwd_source(64, causal=True, flip_causal=True, drop_diagonal=True)
+
+
+def test_build_fwd_mma_source_drop_diagonal_perturbation() -> None:
+    s = build_fwd_mma_source(64, causal=True, drop_diagonal=True)
+    assert "kk < row" in s
+    assert "kk <= row" not in s
+
+
+def test_build_fwd_mma_source_rejects_drop_diagonal_misuse() -> None:
+    with pytest.raises(ValueError, match="drop_diagonal"):
+        build_fwd_mma_source(64, causal=False, drop_diagonal=True)
+    with pytest.raises(ValueError, match="drop_diagonal"):
+        build_fwd_mma_source(64, causal=True, flip_causal=True, drop_diagonal=True)
+
+
 def test_check_fwd_budget_passes_a_cheap_dispatch() -> None:
     # tiny per-row cost at a real rate: nowhere near the per-buffer bound
     check_fwd_budget(n=64, d=64, b=1, hq=4, hkv=2, rate=1e12, causal=True)
@@ -587,8 +615,44 @@ def test_fwd_wrong_mask_perturbation_fails_parity(variant: str) -> None:
     d_o = mx.abs(o_wrong.astype(mx.float32) - o_ref.astype(mx.float32)).max().item()
     d_l = mx.abs(l_wrong - l_ref).max().item()
     assert d_o > 1e-2 or d_l > 1e-2, (
-        f"flipped-mask kernel matched the causal reference (O={d_o:.3e}, L={d_l:.3e}) -- "
-        "the parity suite cannot detect a mask bug"
+        f"flipped-mask kernel matched the causal reference (dO={d_o:.3e}, dL={d_l:.3e})"
+    )
+
+
+@pytest.mark.metal
+@pytest.mark.parametrize("variant", ["scalar", "mma"])
+def test_fwd_drop_diagonal_perturbation_fails_parity(variant: str) -> None:
+    """0022f: the OFF-BY-ONE discriminator. A kernel whose causal keep drops the diagonal
+    itself (`kk < row`) must DIVERGE from the causal reference -- the flipped-triangle
+    perturbation is gross, and a diagonal off-by-one could in principle slip past it. The
+    perturbed kernel is built directly from the source builder (a test-only flag; the
+    production launchers never expose it)."""
+    b, hq, hkv, n, d = 2, 4, 2, 16, 64
+    scale = 1.0 / math.sqrt(d)
+    q, k, v = _rand_qkv(b=b, hq=hq, hkv=hkv, n=n, d=d, dtype=mx.float32, seed=4)
+
+    builder = build_fwd_mma_source if variant == "mma" else build_fwd_source
+    kernel = mx.fast.metal_kernel(
+        name=f"mtp_test_dropdiag_fwd_{variant}",
+        input_names=["q", "k", "v", "qoffs", "scale_in"],
+        output_names=["o_out", "l_out"],
+        source=builder(d, causal=True, drop_diagonal=True),
+    )
+    scale_in = mx.array([scale], dtype=mx.float32)
+    o_bad, l_bad = fwd_launch._dispatch_range(
+        kernel, q, k, v, scale_in, r0=0, r1=n, tile=TileShape(bq=32, variant=variant),
+    )
+    o_ref, l_ref = _reference_o_l(q, k, v, scale=scale)
+    mx.eval(o_bad, l_bad, o_ref, l_ref)
+
+    # Row 0's keep-set is EMPTY under kk < row -- a NaN/inf output is the off-by-one's own
+    # fingerprint and counts as divergence (nan > x is False, so test finiteness first).
+    finite = bool(mx.isfinite(o_bad).all().item() and mx.isfinite(l_bad).all().item())
+    d_o = mx.abs(o_bad.astype(mx.float32) - o_ref.astype(mx.float32)).max().item()
+    d_l = mx.abs(l_bad - l_ref).max().item()
+    assert (not finite) or d_o > 1e-2 or d_l > 1e-2, (
+        f"drop-diagonal kernel matched the causal reference (dO={d_o:.3e}, dL={d_l:.3e}) "
+        "-- the parity grid cannot detect a diagonal off-by-one"
     )
 
 
