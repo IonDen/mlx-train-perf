@@ -114,12 +114,13 @@ def _ids(vocab: int, b: int, length: int, *, seed: int = 0) -> mx.array:
 )
 def test_wrapper_output_matches_stock_attention_module(family: str, impl: str) -> None:
     """Full-model forward through stock SDPA vs the enabled wrapper: identical weights (the
-    wrapper holds the ORIGINAL projections), differing only in the attention call. Measured
-    worst |diff| (mlx 0.32.0, fp32, tiny 1x8, head_dim=64): reference 9.537e-07 (llama) /
-    9.388e-07 (qwen3) / 8.345e-07 (qwen2), kernel 9.537e-07 (all three) -- the kernel's
-    fp32-accumulate flash forward vs mlx's fused SDPA; the reference figure is weight-init
-    dependent at the 1e-7 level, the kernel figure reproduces. Pin 2e-6 (~2.1x over the
-    measured worst)."""
+    wrapper holds the ORIGINAL projections), differing only in the attention call. Weights are
+    seeded below, so the measured worst |diff| reproduces (mlx 0.32.0, fp32, tiny 1x8,
+    head_dim=64): reference 8.345e-07 (llama, qwen2) / 8.941e-07 (qwen3); kernel 9.537e-07
+    (llama) / 1.073e-06 (qwen2) / 1.013e-06 (qwen3) -- the kernel's fp32-accumulate flash
+    forward vs mlx's fused SDPA. Pin 2e-6 (~1.86x over the measured worst, qwen2 kernel
+    1.073e-06)."""
+    mx.random.seed(0)  # deterministic weights, so the measured worst-diff below reproduces
     model = _FAMILIES[family]()
     ids = _ids(model.args.vocab_size, 1, 8)
     out_stock = model(ids)
@@ -261,13 +262,16 @@ def test_enable_prewarms_rate_caches_no_calibration_in_compiled_trace() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_lora_attaches_to_wrapped_projections() -> None:
+@pytest.mark.parametrize("family", list(_FAMILIES))
+def test_lora_attaches_to_wrapped_projections(family: str) -> None:
     """`linear_to_lora_layers` discovers `self_attn.q_proj` INSIDE the wrapper (by module-tree
     path) and replaces it, and the wrapper's attribute-lookup `__call__` runs the injected
     adapter -- proven by a nonzero grad on the LoRA `lora_b` after one step (base q_proj.weight
     is frozen; lora_a's grad is zero at step 1 by LoRA's zero-init of lora_b, a real property,
-    so the discriminating signal is lora_b)."""
-    model = _tiny_llama_hd64()
+    so the discriminating signal is lora_b). Parametrized across families so qwen2's
+    bias-carrying q_proj (llama/qwen3 have none) flows through LoRA attach + backward -- the
+    one integration path qwen2 does not share with the llama representative."""
+    model = _FAMILIES[family]()
     enable_flash_attention(model, impl="reference")
     mx.random.seed(0)
     model.freeze()

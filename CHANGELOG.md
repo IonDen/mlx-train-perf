@@ -14,8 +14,8 @@ fine-tune can turn on both memory levers.
 - `enable_flash_attention` supports the Qwen2 (Qwen2.5) family, alongside Llama and Qwen3.
   Qwen2's attention has the shape the wrapper already reproduces; its one difference is a bias
   on the query, key, and value projections, which the wrapper applies unchanged because it
-  holds those projections directly. Forward output matches stock attention exactly in fp32,
-  under 2e-6 on both the reference and kernel paths (`tests/test_attention_wrapper.py`).
+  holds those projections directly. Forward output matches stock attention within 2e-6 in
+  fp32 on both the reference and kernel paths (`tests/test_attention_wrapper.py`).
 
 ## [0.3.0] - 2026-07-14
 
