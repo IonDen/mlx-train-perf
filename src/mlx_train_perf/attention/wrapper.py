@@ -4,14 +4,17 @@ Replaces each decoder layer's `self_attn` with a `FlashAttentionWrapper` that ro
 post-RoPE attention through `flash_attention` (kernel forward + kernel backward) --
 the training-only path this whole 0.2.0 release exists to switch on.
 
-Verified against the installed mlx-lm==0.31.3 (mlx==0.32.0) source, 2026-07-09:
+Verified against the installed mlx-lm==0.31.3 (mlx==0.32.0) source (llama/qwen3 2026-07-09,
+qwen2 2026-07-15):
 
 - **Stock attention surface** (`mlx_lm/models/llama.py::Attention`,
-  `mlx_lm/models/qwen3.py::Attention` -- identical shape, qwen3 adds per-head q/k RMSNorm):
+  `mlx_lm/models/qwen2.py::Attention`, `mlx_lm/models/qwen3.py::Attention` -- identical shape;
+  qwen3 adds per-head q/k RMSNorm, qwen2 gives q/k/v a `bias=True` linear):
   `q_proj`/`k_proj`/`v_proj`/`o_proj` (`nn.Linear`), `rope`, the ints `n_heads`/`n_kv_heads`
   and float `scale`, plus (qwen3 only) `q_norm`/`k_norm`. `__call__(x, mask=None, cache=None)`
   projects, reshapes to `(B, H, L, head_dim)`, applies RoPE, calls SDPA, then `o_proj`. The
-  wrapper reproduces that EXACTLY, swapping the single SDPA call for `flash_attention`.
+  wrapper reproduces that EXACTLY, swapping the single SDPA call for `flash_attention` (holding
+  the projections as direct submodules means qwen2's q/k/v bias is applied transparently).
 
 - **Two load-bearing reasons the original submodules are held as DIRECT attributes with
   their ORIGINAL names** (`self.q_proj = original.q_proj`, ...), never closed over:
@@ -40,9 +43,10 @@ Verified against the installed mlx-lm==0.31.3 (mlx==0.32.0) source, 2026-07-09:
   calibrate before the compiled `train()`). Callers targeting compiled training MUST pass
   `seq_len` (and `batch_size`) matching their training shape.
 
-Only the Llama and Qwen3 model families are supported (matched by `type(model).__module__`,
-mirroring `adapters/mlx_lm.py`); sliding-window / mixed `layer_types`, unsupported head_dim,
-and configured dropout all refuse at enable time (`UnsupportedAttentionError`).
+Only the Llama, Qwen2 and Qwen3 model families are supported (matched by
+`type(model).__module__`, mirroring `adapters/mlx_lm.py`); sliding-window / mixed
+`layer_types`, unsupported head_dim, and configured dropout all refuse at enable time
+(`UnsupportedAttentionError`).
 """
 from typing import Any, Literal, cast
 
@@ -56,7 +60,9 @@ _Impl = Literal["auto", "kernel", "reference"]
 
 # Keyed by the exact `type(model).__module__` mlx-lm uses for each family (mirrors
 # `adapters/mlx_lm.py::_SUPPORTED_FAMILIES`).
-_SUPPORTED_FAMILIES: tuple[str, ...] = ("mlx_lm.models.llama", "mlx_lm.models.qwen3")
+_SUPPORTED_FAMILIES: tuple[str, ...] = (
+    "mlx_lm.models.llama", "mlx_lm.models.qwen2", "mlx_lm.models.qwen3"
+)
 
 # The kernel's supported head dims (mirrors `attention/api.py::_KERNEL_HEAD_DIMS`).
 _KERNEL_HEAD_DIMS: tuple[int, ...] = (64, 96, 128)
@@ -187,8 +193,8 @@ def enable_flash_attention(
     """Enable the flash-attention training path on an mlx-lm model IN PLACE.
 
     Replaces every decoder layer's `self_attn` with a `FlashAttentionWrapper` routing the
-    post-RoPE attention through `flash_attention(impl=...)`. Only the Llama and Qwen3 families
-    (full attention) are supported; everything else refuses at enable time
+    post-RoPE attention through `flash_attention(impl=...)`. Only the Llama, Qwen2 and Qwen3
+    families (full attention) are supported; everything else refuses at enable time
     (`UnsupportedAttentionError`) rather than failing mid-training-run.
 
     `impl`: forwarded to `flash_attention` per call (`"auto"`/`"kernel"` -> the Metal kernel;

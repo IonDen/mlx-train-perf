@@ -4,6 +4,19 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] - 2026-07-15
+
+Adds the Qwen2 (Qwen2.5) family to the flash-attention training path. Qwen2 already worked
+with the fused loss adapter; now `enable_flash_attention` accepts it too, so a Qwen2.5
+fine-tune can turn on both memory levers.
+
+### Added
+- `enable_flash_attention` supports the Qwen2 (Qwen2.5) family, alongside Llama and Qwen3.
+  Qwen2's attention has the shape the wrapper already reproduces; its one difference is a bias
+  on the query, key, and value projections, which the wrapper applies unchanged because it
+  holds those projections directly. Forward output matches stock attention exactly in fp32,
+  under 2e-6 on both the reference and kernel paths (`tests/test_attention_wrapper.py`).
+
 ## [0.3.0] - 2026-07-14
 
 Removes the launch-safety cap that held the flash-attention path's trainable context below
@@ -151,5 +164,7 @@ Silicon, with an mlx-lm adapter, a RAM-fit planner, and a benchmark harness.
   `ROADMAP.md`).
 - Architectures: Llama and Qwen3 only. Training: LoRA / QLoRA. Apple Silicon only.
 
+[0.3.1]: https://github.com/IonDen/mlx-train-perf/releases/tag/v0.3.1
+[0.3.0]: https://github.com/IonDen/mlx-train-perf/releases/tag/v0.3.0
 [0.2.0]: https://github.com/IonDen/mlx-train-perf/releases/tag/v0.2.0
 [0.1.0]: https://github.com/IonDen/mlx-train-perf/releases/tag/v0.1.0

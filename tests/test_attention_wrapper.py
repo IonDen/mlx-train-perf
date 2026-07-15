@@ -26,7 +26,7 @@ from mlx.utils import tree_flatten
 
 pytest.importorskip("mlx_lm")
 
-from mlx_lm.models import llama, qwen3
+from mlx_lm.models import llama, qwen2, qwen3
 from mlx_lm.models.base import create_attention_mask
 from mlx_lm.tuner.lora import LoRALinear
 from mlx_lm.tuner.trainer import default_loss
@@ -80,7 +80,22 @@ def _tiny_qwen3_hd64() -> qwen3.Model:
     return qwen3.Model(args)
 
 
-_FAMILIES = {"llama": _tiny_llama_hd64, "qwen3": _tiny_qwen3_hd64}
+def _tiny_qwen2_hd64() -> qwen2.Model:
+    # qwen2 derives head_dim = hidden_size // num_attention_heads (no head_dim field), so
+    # 128 / 2 = 64 lands in the kernel's {64, 96, 128}. qwen2's q/k/v carry bias=True
+    # (llama/qwen3 do not); the wrapper holds the nn.Linear submodules directly, so the bias
+    # is applied transparently.
+    args = qwen2.ModelArgs(
+        model_type="qwen2", hidden_size=128, num_hidden_layers=2, intermediate_size=256,
+        num_attention_heads=2, num_key_value_heads=1, vocab_size=256, rms_norm_eps=1e-5,
+        rope_theta=1000000.0, max_position_embeddings=2048, tie_word_embeddings=False,
+    )
+    return qwen2.Model(args)
+
+
+_FAMILIES = {
+    "llama": _tiny_llama_hd64, "qwen2": _tiny_qwen2_hd64, "qwen3": _tiny_qwen3_hd64
+}
 
 
 def _ids(vocab: int, b: int, length: int, *, seed: int = 0) -> mx.array:
@@ -101,8 +116,10 @@ def test_wrapper_output_matches_stock_attention_module(family: str, impl: str) -
     """Full-model forward through stock SDPA vs the enabled wrapper: identical weights (the
     wrapper holds the ORIGINAL projections), differing only in the attention call. Measured
     worst |diff| (mlx 0.32.0, fp32, tiny 1x8, head_dim=64): reference 9.537e-07 (llama) /
-    9.388e-07 (qwen3), kernel 9.537e-07 (both) -- the kernel's fp32-accumulate flash forward
-    vs mlx's fused SDPA. Pin 2e-6 (~2.1x over the measured worst)."""
+    9.388e-07 (qwen3) / 8.345e-07 (qwen2), kernel 9.537e-07 (all three) -- the kernel's
+    fp32-accumulate flash forward vs mlx's fused SDPA; the reference figure is weight-init
+    dependent at the 1e-7 level, the kernel figure reproduces. Pin 2e-6 (~2.1x over the
+    measured worst)."""
     model = _FAMILIES[family]()
     ids = _ids(model.args.vocab_size, 1, 8)
     out_stock = model(ids)
@@ -304,7 +321,7 @@ def test_wrapper_composes_with_make_loss_fn() -> None:
 def test_mlx_lm_attention_shape_drift_pin() -> None:
     """Pins the installed mlx-lm attention-module surface the wrapper depends on -- so an
     mlx-lm refactor fails loudly HERE, not inside a training run."""
-    for build in (_tiny_llama_hd64, _tiny_qwen3_hd64):
+    for build in (_tiny_llama_hd64, _tiny_qwen2_hd64, _tiny_qwen3_hd64):
         attn = build().model.layers[0].self_attn
         for name in ("q_proj", "k_proj", "v_proj", "o_proj", "rope"):
             assert hasattr(attn, name), f"{type(attn).__module__} attn missing {name}"
@@ -312,12 +329,14 @@ def test_mlx_lm_attention_shape_drift_pin() -> None:
         assert hasattr(attn, "n_kv_heads")
         assert isinstance(attn.scale, float)
 
-    # qwen3 adds per-head q/k RMSNorm; llama does not.
+    # qwen3 adds per-head q/k RMSNorm; llama and qwen2 do not (both take the wrapper's
+    # `_has_qk_norm == False` branch).
     assert hasattr(_tiny_qwen3_hd64().model.layers[0].self_attn, "q_norm")
     assert not hasattr(_tiny_llama_hd64().model.layers[0].self_attn, "q_norm")
+    assert not hasattr(_tiny_qwen2_hd64().model.layers[0].self_attn, "q_norm")
 
-    # __call__ arity: (self, x, mask, cache) in both families.
-    for attn_cls in (llama.Attention, qwen3.Attention):
+    # __call__ arity: (self, x, mask, cache) in all three families.
+    for attn_cls in (llama.Attention, qwen2.Attention, qwen3.Attention):
         params = list(inspect.signature(attn_cls.__call__).parameters)
         assert params == ["self", "x", "mask", "cache"], (attn_cls, params)
 
