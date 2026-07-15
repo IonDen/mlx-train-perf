@@ -1,5 +1,9 @@
 # mlx-train-perf
 
+[![PyPI version](https://img.shields.io/pypi/v/mlx-train-perf.svg)](https://pypi.org/project/mlx-train-perf/)
+[![Python versions](https://img.shields.io/pypi/pyversions/mlx-train-perf.svg)](https://pypi.org/project/mlx-train-perf/)
+[![License: MIT](https://img.shields.io/pypi/l/mlx-train-perf.svg)](https://github.com/IonDen/mlx-train-perf/blob/main/LICENSE)
+
 A fused, logit-free linear-cross-entropy loss for training on Apple Silicon with [MLX](https://github.com/ml-explore/mlx), plus a RAM-fit planner and an honest benchmark harness. It drops into an `mlx-lm` LoRA/QLoRA fine-tune as the loss function.
 
 The idea is the same one behind [Cut Cross-Entropy](https://arxiv.org/abs/2411.09009) and [Liger-Kernel](https://github.com/linkedin/Liger-Kernel) on the CUDA side, ported to a Metal kernel: compute the cross-entropy loss and its gradient without ever building the full `(N, V)` logits tensor. For a large vocabulary that tensor is the single biggest allocation in the training step, and it is pure waste. You only need the per-token loss and a gradient back into the hidden states.
