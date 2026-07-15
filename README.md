@@ -63,7 +63,7 @@ Both arms stop at the same ~24.5 GiB, the effective memory ceiling on this machi
 
 | Condition | When | Error |
 |---|---|---|
-| Model family other than Llama or Qwen3 | at enable | `UnsupportedAttentionError` |
+| Model family other than Llama, Qwen2, or Qwen3 | at enable | `UnsupportedAttentionError` |
 | Sliding-window or mixed attention (`layer_types` not all `full_attention`) | at enable | `UnsupportedAttentionError` |
 | `head_dim` outside {64, 96, 128} | at enable | `UnsupportedAttentionError` |
 | Non-zero attention dropout | at enable | `UnsupportedAttentionError` |
@@ -141,7 +141,7 @@ The flash model is an analytic saved-state term plus one measured linear coeffic
 
 ## Supported models
 
-- Architectures: Llama, Qwen2 (the Qwen2.5 family), and Qwen3 for the loss adapter; the flash-attention wrapper covers Llama and Qwen3. The adapter's model splitter handles these; others raise a typed error.
+- Architectures: Llama, Qwen2 (the Qwen2.5 family), and Qwen3, for both the loss adapter and the flash-attention wrapper. The adapter's model splitter handles these; others raise a typed error.
 - Quantization: 4-bit group-size-64 (the mlx-community QLoRA default), or a dense fp32/bf16 head.
 - Training: LoRA / QLoRA. Full fine-tuning is estimated by the planner but is not the case this is tuned for.
 - Hardware: Apple Silicon.

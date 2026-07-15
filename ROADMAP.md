@@ -2,6 +2,12 @@
 
 ## Released
 
+### 0.3.1 - 2026-07-15
+- Qwen2 (Qwen2.5 family) support in the flash-attention wrapper. `enable_flash_attention` now
+  accepts Qwen2 alongside Llama and Qwen3, so a Qwen2.5 fine-tune can use the flash path as
+  well as the fused loss adapter it already supported. Forward output matches stock attention
+  within 2e-6 in fp32 on both the reference and kernel paths.
+
 ### 0.3.0 - 2026-07-14
 - Removed the launch-safety cap that held the flash-attention path's trainable context below
   its memory limit. The 2-second per-chain budget guarded a misread of how macOS kills Metal
