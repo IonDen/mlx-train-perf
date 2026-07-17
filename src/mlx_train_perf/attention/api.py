@@ -34,6 +34,7 @@ from mlx_train_perf.attention.kernel.launch import (
     launch_flash_fwd,
 )
 from mlx_train_perf.attention.reference import flash_attention_reference, kv_head_for
+from mlx_train_perf.attention.segments import PackedMask, segment_allowed
 from mlx_train_perf.errors import AttentionInputError, UnsupportedAttentionError
 
 # The kernel (T5+) will template on one MSL type T -- fp32 or bf16 only, mirroring the
@@ -126,7 +127,7 @@ def _kv_gather(x: mx.array, *, hq: int, hkv: int) -> mx.array:
 
 def _flash_attention_backward(
     q: mx.array, k: mx.array, v: mx.array, o: mx.array, lse: mx.array, d_o: mx.array,
-    *, scale: float, causal: bool,
+    *, scale: float, causal: bool, segments: PackedMask | None = None,
 ) -> tuple[mx.array, mx.array, mx.array]:
     """Hand-written flash-attention backward, pure MLX over FULL (un-tiled) tensors.
     This is the oracle path (impl='reference'): materializing S and P is BY DESIGN,
@@ -137,6 +138,10 @@ def _flash_attention_backward(
     `P = exp(S - L)`; `dV = P^T @ dO` (accumulated per kv head over its q-head group);
     `dP = dO @ v^T`; `dS = P * (dP - D)`; `dQ = scale * dS @ k`;
     `dK = scale * dS^T @ q` (grouped like dV).
+
+    `segments` (requires `causal=True`) masks S with `segment_allowed`, the SAME helper
+    the forward oracle uses, so forward and backward see identical masking -- see
+    `mlx_train_perf.attention.segments.PackedMask`.
     """
     b = q.shape[0]
     hq, hkv = q.shape[1], k.shape[1]
@@ -154,7 +159,10 @@ def _flash_attention_backward(
     d = _bwd_D(do32, o32)  # (B, Hq, N)
 
     s = (q32 @ k_g.swapaxes(-1, -2)) * scale  # (B, Hq, N, N)
-    if causal:
+    if segments is not None:
+        assert causal, "segments requires causal=True"
+        s = mx.where(segment_allowed(segments.seg_id), s, -mx.inf)
+    elif causal:
         neg_inf = mx.full((n, n), -mx.inf, dtype=mx.float32)
         s = s + mx.triu(neg_inf, k=1)  # additive -inf where j > i, matching the forward
     p = mx.exp(s - lse32[..., None])  # (B, Hq, N, N)
