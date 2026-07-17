@@ -45,6 +45,7 @@ from mlx_train_perf.attention.kernel.source import (
     build_bwd_dq_source,
 )
 from mlx_train_perf.attention.reference import flash_attention_reference, math_attention
+from mlx_train_perf.attention.segments import PackedMask
 from mlx_train_perf.errors import AttentionInputError
 
 # ---------------------------------------------------------------------------------------
@@ -364,14 +365,43 @@ def _rand_qkv_do(
     return q, k, v, cot
 
 
+def _packed_layout(seg_lens: list[int], b: int) -> tuple[mx.array, mx.array]:
+    """Build the (B, N) int32 seg_id/seg_start buffers for a fixed list of segment lengths,
+    shared across every batch row (mirrors test_attention_kernel_fwd.py::_packed_layout).
+    seg_id is contiguous ascending ids (0,0,..,1,1,..); seg_start is each position's
+    segment-start index (non-decreasing) -- the PackedMask contract."""
+    seg_id_row: list[int] = []
+    seg_start_row: list[int] = []
+    start = 0
+    for sid, ln in enumerate(seg_lens):
+        seg_id_row += [sid] * ln
+        seg_start_row += [start] * ln
+        start += ln
+    seg_id = mx.array([seg_id_row] * b, dtype=mx.int32)        # (b, n) contiguous
+    seg_start = mx.array([seg_start_row] * b, dtype=mx.int32)
+    return seg_id, seg_start
+
+
+def _packed_mask(
+    seg_id: mx.array | None, seg_start: mx.array | None
+) -> PackedMask | None:
+    """PackedMask from an optional both-or-neither seg pair (None -> pure causal)."""
+    if seg_id is None or seg_start is None:
+        return None
+    return PackedMask(seg_id=seg_id, seg_start=seg_start)
+
+
 def _dq_oracle(
-    q: mx.array, k: mx.array, v: mx.array, cot: mx.array, *, scale: float, causal: bool
+    q: mx.array, k: mx.array, v: mx.array, cot: mx.array, *, scale: float, causal: bool,
+    segments: PackedMask | None = None,
 ) -> mx.array:
     """Exact dQ oracle: the vector-Jacobian product of `math_attention` w.r.t. q ONLY,
     with the same random cotangent `cot` the kernel path consumes as dO. No readout
-    projection -- `mx.vjp` gives the exact autodiff dQ."""
+    projection -- `mx.vjp` gives the exact autodiff dQ. `segments` (0.4.0) makes it the
+    block-diagonal-causal packed dQ oracle."""
     _, vjps = mx.vjp(
-        lambda q_: math_attention(q_, k, v, scale=scale, causal=causal), [q], [cot]
+        lambda q_: math_attention(q_, k, v, scale=scale, causal=causal, segments=segments),
+        [q], [cot],
     )
     return vjps[0]
 
@@ -381,18 +411,23 @@ def _dq_kernel(
     rate_macs_per_s: float | None = None, flip_causal: bool = False,
     variant: str = "scalar", d_slab: int | None = None,
     force_ranges: list[tuple[int, int]] | None = None,
+    seg_id: mx.array | None = None, seg_start: mx.array | None = None,
 ) -> mx.array:
     """The kernel dQ path: forward reference gives (O, L); T7's `launch_bwd_D` gives D from
     (dO, O); `launch_bwd_dq` consumes q/k/v/dO/L/D. `variant`/`d_slab` default to the scalar
     body (unchanged for every existing caller); `variant="mma"` selects the T9b rung-B1 body.
     `force_ranges` is the TEST-ONLY split-forcing seam (`_force_ranges`) -- the production
-    planner never splits these tiny packed-regime shapes."""
-    o, lse = flash_attention_reference(q, k, v, scale=scale, causal=causal)
+    planner never splits these tiny packed-regime shapes. `seg_id`/`seg_start` (0.4.0, both or
+    neither) switch on PACKED block-diagonal-causal attention: the forward reference and the
+    kernel both isolate to same-segment causal keys."""
+    segments = _packed_mask(seg_id, seg_start)
+    o, lse = flash_attention_reference(q, k, v, scale=scale, causal=causal, segments=segments)
     d_arr = launch_bwd_D(cot, o)
     return launch_bwd_dq(
         q, k, v, cot, lse, d_arr, scale=scale, causal=causal,
         rate_macs_per_s=rate_macs_per_s, _flip_causal=flip_causal,
         variant=variant, d_slab=d_slab, _force_ranges=force_ranges,
+        seg_id=seg_id, seg_start=seg_start,
     )
 
 
@@ -620,14 +655,17 @@ _TOL_DKV = {mx.float32: 2.5e-5, mx.bfloat16: 1e-1}
 
 
 def _dkv_oracle(
-    q: mx.array, k: mx.array, v: mx.array, cot: mx.array, *, scale: float, causal: bool
+    q: mx.array, k: mx.array, v: mx.array, cot: mx.array, *, scale: float, causal: bool,
+    segments: PackedMask | None = None,
 ) -> tuple[mx.array, mx.array]:
     """Exact dK, dV oracle: the vector-Jacobian product of `math_attention` w.r.t. (k, v)
     with the same random cotangent `cot` the kernel path consumes as dO. No readout projection
     -- `mx.vjp` gives the exact autodiff dK/dV, grouped over the GQA q-head groups by autodiff
-    (matching the kernel's in-owner whole-group accumulation)."""
+    (matching the kernel's in-owner whole-group accumulation). `segments` (0.4.0) makes it the
+    block-diagonal-causal packed dK/dV oracle."""
     _, vjps = mx.vjp(
-        lambda k_, v_: math_attention(q, k_, v_, scale=scale, causal=causal), [k, v], [cot]
+        lambda k_, v_: math_attention(q, k_, v_, scale=scale, causal=causal, segments=segments),
+        [k, v], [cot],
     )
     return vjps[0], vjps[1]  # dK, dV
 
@@ -637,19 +675,24 @@ def _dkv_kernel(
     rate_macs_per_s: float | None = None, flip_causal: bool = False,
     variant: str = "scalar", d_slab: int | None = None,
     force_ranges: list[tuple[int, int]] | None = None,
+    seg_id: mx.array | None = None, seg_start: mx.array | None = None,
 ) -> tuple[mx.array, mx.array]:
     """The kernel dK/dV path: forward reference gives (O, L); T7's `launch_bwd_D` gives D from
     (dO, O); `launch_bwd_dkv` consumes q/k/v/dO/L/D and returns the chained (dK, dV).
     `variant`/`d_slab` default to the scalar body (unchanged for every existing caller);
     `variant="mma"` selects the T9b rung-B2 key-major MMA body. `force_ranges` is the
     TEST-ONLY split-forcing seam (`_force_ranges`) -- the production planner never splits
-    these tiny packed-regime shapes."""
-    o, lse = flash_attention_reference(q, k, v, scale=scale, causal=causal)
+    these tiny packed-regime shapes. `seg_id`/`seg_start` (0.4.0, both or neither) switch on
+    PACKED block-diagonal-causal attention: the forward reference and the kernel both isolate
+    to same-segment causal (query, key) pairs."""
+    segments = _packed_mask(seg_id, seg_start)
+    o, lse = flash_attention_reference(q, k, v, scale=scale, causal=causal, segments=segments)
     d_arr = launch_bwd_D(cot, o)
     return launch_bwd_dkv(
         q, k, v, cot, lse, d_arr, scale=scale, causal=causal,
         rate_macs_per_s=rate_macs_per_s, _flip_causal=flip_causal,
         variant=variant, d_slab=d_slab, _force_ranges=force_ranges,
+        seg_id=seg_id, seg_start=seg_start,
     )
 
 
@@ -1850,3 +1893,313 @@ def test_dkv_drop_diagonal_perturbation_fails_parity(variant: str) -> None:
         f"drop-diagonal dK/dV ({variant}) matched the causal oracle (diff={diff:.3e}) -- "
         "the parity grid cannot detect a diagonal off-by-one"
     )
+
+
+# =======================================================================================
+# 0.4.0 T3 -- PACKED backward parity (block-diagonal-causal segments). Each packed backward
+# body's keep predicate (dQ scalar/mma, dK/dV scalar/mma) must reproduce the autodiff gradient
+# of the block-diagonal oracle (`math_attention(..., segments=PackedMask(...))`, the Task-1
+# packed gradient oracle). The forward reference the kernel path consumes is the packed
+# `flash_attention_reference(..., segments=...)`; D and the launcher take the seg buffers. The
+# `packed=False` default is untouched (every causal test above still runs the unchanged body).
+# =======================================================================================
+
+# (n, seg_lens): 2-seg and 5-seg layouts with mid-block boundaries (NOT aligned to the mma
+# 32-row query-block size), mirroring test_attention_kernel_fwd.py::_PACKED_CASES exactly --
+# the case kv_lo (dQ) + the per-element predicate (dK/dV) must isolate segments exactly.
+_PACKED_CASES = [
+    (256, [100, 156]),                       # 2-seg, boundary at 100 (mid-block)
+    (256, [40, 60, 50, 66, 40]),             # 5-seg, several mid-block boundaries
+    (1024, [500, 524]),                      # 2-seg at n=1024
+    (1024, [200, 312, 130, 198, 184]),       # 5-seg at n=1024
+]
+
+# Measured worsts over the packed backward grid (mlx 0.32.0, M1 Max, seed 61 dQ / 62 dK/dV,
+# variants scalar AND mma x _PACKED_CASES x head_dim {64,128} x dtype {fp32,bf16}). The packed
+# bodies mask MORE (query, key) pairs than the causal bodies but reuse the identical fp32
+# in-register reduction structure, so an fp32 diff is pure reduction-order noise; bf16 carries a
+# single common-mode store-ULP rounding (the forward O and dK/dV each cast down once). Pins are
+# set INDEPENDENTLY (measure-first), never by widening or inheriting the causal _TOL_DQ/_TOL_DKV:
+#   dQ fp32:  worst 3.734404e-06 (n256 segs5 d128; scalar == mma at the worst element) -> 8e-6
+#             (~2.1x). Slightly HOTTER than the causal dQ fp32 worst 2.46e-6 -- the packed grid
+#             runs a larger reduction (n up to 1024, 5-segment layouts) -- so honestly a touch
+#             looser than the causal 5e-6 pin, not padded.
+#   dQ bf16:  worst 1.562500e-02 == one bf16 ULP (2^-6) at a dQ magnitude near 2-4 (quantized
+#             rounding, not accumulation drift) -> 3e-2, the SAME ULP-aware ceiling as the causal
+#             dQ bf16 pin (bounded below the 2-ULP value 3.125e-2; widen toward 2 ULP with a note,
+#             never past it).
+#   dKV fp32: worst dV 1.287460e-05 / dK 7.867813e-06 (dV harsher -- it sums P over EVERY
+#             causally-allowed query) -> 3e-5 (~2.3x the dV worst), both variants (the mma dV worst
+#             1.2875e-5 matches the scalar's, and both exceed the causal mma worst 9.06e-6, so the
+#             packed pin is honestly above the causal mma 2e-5 pin).
+#   dKV bf16: worst dV/dK 3.125000e-02 == one bf16 ULP (2^-5) -> 1e-1, the SAME ULP-aware ceiling
+#             as the causal dK/dV bf16 pin (bounded below the 2-ULP value 0.125).
+_TOL_PACKED_DQ = {
+    "scalar": {mx.float32: 8e-6, mx.bfloat16: 3e-2},
+    "mma": {mx.float32: 8e-6, mx.bfloat16: 3e-2},
+}
+_TOL_PACKED_DKV = {
+    "scalar": {mx.float32: 3e-5, mx.bfloat16: 1e-1},
+    "mma": {mx.float32: 3e-5, mx.bfloat16: 1e-1},
+}
+
+
+@pytest.mark.metal
+@pytest.mark.parametrize("variant", ["scalar", "mma"])
+@pytest.mark.parametrize(("n", "seg_lens"), _PACKED_CASES)
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16], ids=["fp32", "bf16"])
+def test_dq_packed_parity_vs_block_diagonal_oracle(
+    variant: str, n: int, seg_lens: list[int], head_dim: int, dtype: mx.Dtype
+) -> None:
+    b, hq, hkv = 2, 4, 2                                        # GQA group_size 2
+    scale = 1.0 / math.sqrt(head_dim)
+    q, k, v, cot = _rand_qkv_do(b=b, hq=hq, hkv=hkv, n=n, d=head_dim, dtype=dtype, seed=61)
+    seg_id, seg_start = _packed_layout(seg_lens, b)
+    pm = PackedMask(seg_id=seg_id, seg_start=seg_start)
+
+    dq_k = _dq_kernel(
+        q, k, v, cot, scale=scale, causal=True, variant=variant,
+        seg_id=seg_id, seg_start=seg_start,
+    )
+    dq_ref = _dq_oracle(q, k, v, cot, scale=scale, causal=True, segments=pm)
+    mx.eval(dq_k, dq_ref)
+
+    diff = mx.abs(dq_k.astype(mx.float32) - dq_ref.astype(mx.float32)).max().item()
+    print(
+        f"[dQ-packed {variant} {['fp32','bf16'][dtype==mx.bfloat16]} n{n} "
+        f"segs{len(seg_lens)} d{head_dim}] diff={diff:.6e}"
+    )
+    assert diff < _TOL_PACKED_DQ[variant][dtype], f"packed dQ ({variant}) diff {diff}"
+
+
+@pytest.mark.metal
+@pytest.mark.parametrize("variant", ["scalar", "mma"])
+@pytest.mark.parametrize(("n", "seg_lens"), _PACKED_CASES)
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16], ids=["fp32", "bf16"])
+def test_dkv_packed_parity_vs_block_diagonal_oracle(
+    variant: str, n: int, seg_lens: list[int], head_dim: int, dtype: mx.Dtype
+) -> None:
+    b, hq, hkv = 2, 4, 2                                        # GQA group_size 2
+    scale = 1.0 / math.sqrt(head_dim)
+    q, k, v, cot = _rand_qkv_do(b=b, hq=hq, hkv=hkv, n=n, d=head_dim, dtype=dtype, seed=62)
+    seg_id, seg_start = _packed_layout(seg_lens, b)
+    pm = PackedMask(seg_id=seg_id, seg_start=seg_start)
+
+    dk_k, dv_k = _dkv_kernel(
+        q, k, v, cot, scale=scale, causal=True, variant=variant,
+        seg_id=seg_id, seg_start=seg_start,
+    )
+    dk_ref, dv_ref = _dkv_oracle(q, k, v, cot, scale=scale, causal=True, segments=pm)
+    mx.eval(dk_k, dv_k, dk_ref, dv_ref)
+
+    d_dk = mx.abs(dk_k.astype(mx.float32) - dk_ref.astype(mx.float32)).max().item()
+    d_dv = mx.abs(dv_k.astype(mx.float32) - dv_ref.astype(mx.float32)).max().item()
+    print(
+        f"[dKV-packed {variant} {['fp32','bf16'][dtype==mx.bfloat16]} n{n} "
+        f"segs{len(seg_lens)} d{head_dim}] dK={d_dk:.6e} dV={d_dv:.6e}"
+    )
+    assert d_dk < _TOL_PACKED_DKV[variant][dtype], f"packed dK ({variant}) diff {d_dk}"
+    assert d_dv < _TOL_PACKED_DKV[variant][dtype], f"packed dV ({variant}) diff {d_dv}"
+
+
+@pytest.mark.metal
+@pytest.mark.parametrize("variant", ["scalar", "mma"])
+def test_dq_single_segment_packed_matches_causal_bitwise(variant: str) -> None:
+    """One segment spanning the whole row (seg_id/seg_start all 0) makes the same-segment term
+    uniformly true and kv_lo == 0, so the packed dQ kernel loops the IDENTICAL key set in the
+    IDENTICAL order as the pure-causal kernel -> BIT-IDENTICAL dQ. N=129 exercises a tail block
+    that is not 32-aligned (the mma over-hang path)."""
+    b, hq, hkv, n, d = 2, 4, 2, 129, 64
+    scale = 1.0 / math.sqrt(d)
+    q, k, v, cot = _rand_qkv_do(b=b, hq=hq, hkv=hkv, n=n, d=d, dtype=mx.float32, seed=63)
+    seg_id = mx.zeros((b, n), dtype=mx.int32)
+    seg_start = mx.zeros((b, n), dtype=mx.int32)
+
+    dq_c = _dq_kernel(q, k, v, cot, scale=scale, causal=True, variant=variant)
+    dq_p = _dq_kernel(
+        q, k, v, cot, scale=scale, causal=True, variant=variant,
+        seg_id=seg_id, seg_start=seg_start,
+    )
+    mx.eval(dq_c, dq_p)
+    assert mx.array_equal(dq_c, dq_p).item(), f"single-segment packed dQ ({variant}) != causal dQ"
+
+
+@pytest.mark.metal
+@pytest.mark.parametrize("variant", ["scalar", "mma"])
+def test_dkv_single_segment_packed_matches_causal_bitwise(variant: str) -> None:
+    """One segment spanning the whole row (seg_id/seg_start all 0) makes the same-segment term
+    uniformly true, so the packed dK/dV kernel loops the IDENTICAL (query, key) set in the
+    IDENTICAL order as the pure-causal kernel -> BIT-IDENTICAL dK/dV. N=129 exercises a tail key
+    block that is not 32-aligned (the mma over-hang path on the key axis)."""
+    b, hq, hkv, n, d = 2, 4, 2, 129, 64
+    scale = 1.0 / math.sqrt(d)
+    q, k, v, cot = _rand_qkv_do(b=b, hq=hq, hkv=hkv, n=n, d=d, dtype=mx.float32, seed=64)
+    seg_id = mx.zeros((b, n), dtype=mx.int32)
+    seg_start = mx.zeros((b, n), dtype=mx.int32)
+
+    dk_c, dv_c = _dkv_kernel(q, k, v, cot, scale=scale, causal=True, variant=variant)
+    dk_p, dv_p = _dkv_kernel(
+        q, k, v, cot, scale=scale, causal=True, variant=variant,
+        seg_id=seg_id, seg_start=seg_start,
+    )
+    mx.eval(dk_c, dv_c, dk_p, dv_p)
+    assert mx.array_equal(dk_c, dk_p).item(), f"single-segment packed dK ({variant}) != causal dK"
+    assert mx.array_equal(dv_c, dv_p).item(), f"single-segment packed dV ({variant}) != causal dV"
+
+
+@pytest.mark.metal
+def test_dkv_packed_chained_matches_oracle_when_chaining_is_forced() -> None:
+    """review-tests High (the REQUIRED chained proof extended to a PACKED layout): a
+    chained-vs-single self-comparison cannot catch a systematic carry bug present in EVERY split
+    -- so force a >=3-range chained plan (a tiny artificial rate) at a small packed N and run the
+    REAL multi-dispatch mma code path against the packed autodiff oracle. The chained fp32
+    accumulator, not just its own consistency, must meet the ground-truth block-diagonal gradient.
+    The forced ranges are 32-aligned (the mma variant's block-alignment contract), and the segment
+    boundary (48) is mid-block so a range split lands inside a segment."""
+    b, hq, hkv, n, d = 1, 4, 2, 96, 64
+    scale = 1.0 / math.sqrt(d)
+    q, k, v, cot = _rand_qkv_do(b=b, hq=hq, hkv=hkv, n=n, d=d, dtype=mx.float32, seed=65)
+    seg_id, seg_start = _packed_layout([48, 48], b)            # 2-seg, mid-block boundary at 48
+    pm = PackedMask(seg_id=seg_id, seg_start=seg_start)
+
+    ranges = [(0, 32), (32, 64), (64, 96)]
+    assert len(ranges) >= 3
+    for lo, _hi in ranges:
+        assert lo % 32 == 0                            # every range starts on a 32-row block
+
+    dk_k, dv_k = _dkv_kernel(
+        q, k, v, cot, scale=scale, causal=True, variant="mma", force_ranges=ranges,
+        seg_id=seg_id, seg_start=seg_start,
+    )
+    dk_ref, dv_ref = _dkv_oracle(q, k, v, cot, scale=scale, causal=True, segments=pm)
+    mx.eval(dk_k, dv_k, dk_ref, dv_ref)
+
+    d_dk = mx.abs(dk_k - dk_ref).max().item()
+    d_dv = mx.abs(dv_k - dv_ref).max().item()
+    print(f"[dKV-packed-mma forced-chain] ranges={ranges} dK={d_dk:.6e} dV={d_dv:.6e}")
+    assert d_dk < _TOL_PACKED_DKV["mma"][mx.float32], f"chained packed dK-mma vs oracle diff {d_dk}"
+    assert d_dv < _TOL_PACKED_DKV["mma"][mx.float32], f"chained packed dV-mma vs oracle diff {d_dv}"
+
+
+@pytest.mark.metal
+@pytest.mark.parametrize("variant", ["scalar", "mma"])
+def test_dkv_packed_chained_dispatches_equal_single_dispatch(variant: str) -> None:
+    """Chained multi-range PACKED dispatches accumulate dK/dV in a FIXED order, each range seeded
+    from the prior's fp32 output -- so a >=3-range split must be BIT-identical to a single [0, n)
+    dispatch (fp32->fp32 store/reload is lossless). The predicate zeros cross-segment
+    contributions identically regardless of the range split. Ranges are 32-aligned (the mma block
+    contract); the scalar variant is per-key so any split works, but 32-alignment is a valid split
+    for it too."""
+    b, hq, hkv, n, d = 2, 4, 2, 96, 64
+    scale = 1.0 / math.sqrt(d)
+    q, k, v, cot = _rand_qkv_do(b=b, hq=hq, hkv=hkv, n=n, d=d, dtype=mx.float32, seed=66)
+    seg_id, seg_start = _packed_layout([40, 56], b)            # 2-seg, mid-block boundary at 40
+    single_dk, single_dv = _dkv_kernel(
+        q, k, v, cot, scale=scale, causal=True, variant=variant,
+        seg_id=seg_id, seg_start=seg_start,
+    )
+    split_dk, split_dv = _dkv_kernel(
+        q, k, v, cot, scale=scale, causal=True, variant=variant,
+        force_ranges=[(0, 32), (32, 64), (64, 96)],
+        seg_id=seg_id, seg_start=seg_start,
+    )
+    mx.eval(single_dk, single_dv, split_dk, split_dv)
+    assert mx.array_equal(single_dk, split_dk).item(), f"packed dK ({variant}) split != single"
+    assert mx.array_equal(single_dv, split_dv).item(), f"packed dV ({variant}) split != single"
+
+
+@pytest.mark.metal
+@pytest.mark.parametrize("variant", ["scalar", "mma"])
+def test_dq_packed_flip_segments_breaks_parity(variant: str) -> None:
+    """Deliberate cross-segment contamination: build the packed dQ kernel with the segment
+    equality inverted (`flip_segments`, the segment analogue of `flip_causal`). Segment-1 rows
+    attend to earlier segment-0 keys under the flipped predicate, so their dQ MUST diverge from
+    the block-diagonal oracle -- if this ever matched, the packed parity grid could not detect a
+    segment-masking bug. The backward reuses the correct block-diagonal L/D, so dQ stays FINITE
+    (masked keys take the p=0 branch, no exp of -inf) and must diverge outright."""
+    b, hq, hkv, d = 2, 4, 2, 64
+    n1, n2 = 48, 48
+    n = n1 + n2
+    scale = 1.0 / math.sqrt(d)
+    q, k, v, cot = _rand_qkv_do(b=b, hq=hq, hkv=hkv, n=n, d=d, dtype=mx.float32, seed=67)
+    seg_id, seg_start = _packed_layout([n1, n2], b)
+    pm = PackedMask(seg_id=seg_id, seg_start=seg_start)
+    o, lse = flash_attention_reference(q, k, v, scale=scale, causal=True, segments=pm)
+    d_arr = launch_bwd_D(cot, o)
+
+    builder = build_bwd_dq_mma_source if variant == "mma" else build_bwd_dq_source
+    kernel = mx.fast.metal_kernel(
+        name=f"mtp_test_flipseg_dq_{variant}",
+        input_names=["q", "k", "v", "d_o", "lse", "d_arr", "qoffs", "scale_in",
+                     "seg_id", "seg_start"],
+        output_names=["dq_out"],
+        source=builder(d, causal=True, packed=True, flip_segments=True),
+    )
+    scale_in = mx.array([scale], dtype=mx.float32)
+    dq_bad = bwd_launch._dispatch_bwd_dq_range(
+        kernel, q, k, v, cot, lse, d_arr, scale_in, r0=0, r1=n, variant=variant,
+        seg_id=seg_id, seg_start=seg_start,
+    )
+    dq_ref = _dq_oracle(q, k, v, cot, scale=scale, causal=True, segments=pm)
+    mx.eval(dq_bad, dq_ref)
+
+    assert bool(mx.isfinite(dq_bad).all().item()), "flip-segments dQ went non-finite"
+    diff = mx.abs(dq_bad.astype(mx.float32) - dq_ref.astype(mx.float32)).max().item()
+    assert diff > 1e-2, (
+        f"flip-segments dQ ({variant}) matched the block-diagonal oracle (diff={diff:.3e}) -- "
+        "the packed parity grid cannot detect a segment-masking bug"
+    )
+
+
+@pytest.mark.metal
+@pytest.mark.parametrize("variant", ["scalar", "mma"])
+def test_dkv_packed_flip_segments_breaks_parity(variant: str) -> None:
+    """Deliberate cross-segment contamination for dK/dV: build the packed kernel with the segment
+    equality inverted (`flip_segments`). Segment-0 keys accumulate from later segment-1 queries
+    under the flipped predicate, so BOTH dK AND dV must diverge from the block-diagonal oracle --
+    if this ever matched, the packed parity grid could not detect a segment-masking bug. The
+    backward reuses the correct block-diagonal L/D, so dK/dV stay FINITE and must diverge each."""
+    b, hq, hkv, d = 2, 4, 2, 64
+    n1, n2 = 48, 48
+    n = n1 + n2
+    scale = 1.0 / math.sqrt(d)
+    q, k, v, cot = _rand_qkv_do(b=b, hq=hq, hkv=hkv, n=n, d=d, dtype=mx.float32, seed=68)
+    seg_id, seg_start = _packed_layout([n1, n2], b)
+    pm = PackedMask(seg_id=seg_id, seg_start=seg_start)
+    o, lse = flash_attention_reference(q, k, v, scale=scale, causal=True, segments=pm)
+    d_arr = launch_bwd_D(cot, o)
+
+    builder = build_bwd_dkv_mma_source if variant == "mma" else build_bwd_dkv_source
+    kernel = mx.fast.metal_kernel(
+        name=f"mtp_test_flipseg_dkv_{variant}",
+        input_names=["q", "k", "v", "d_o", "lse", "d_arr", "dk_in", "dv_in", "qoffs", "scale_in",
+                     "seg_id", "seg_start"],
+        output_names=["dk_out", "dv_out"],
+        source=builder(d, causal=True, packed=True, flip_segments=True),
+    )
+    scale_in = mx.array([scale], dtype=mx.float32)
+    dk0 = mx.zeros((b, hkv, n, d), dtype=mx.float32)
+    dv0 = mx.zeros((b, hkv, n, d), dtype=mx.float32)
+    dk_bad, dv_bad = bwd_launch._dispatch_bwd_dkv_range(
+        kernel, q, k, v, cot, lse, d_arr, dk0, dv0, scale_in, q_lo=0, q_hi=n,
+        variant=variant, seg_id=seg_id, seg_start=seg_start,
+    )
+    dk_ref, dv_ref = _dkv_oracle(q, k, v, cot, scale=scale, causal=True, segments=pm)
+    mx.eval(dk_bad, dv_bad, dk_ref, dv_ref)
+
+    dkv_finite = bool(mx.isfinite(dk_bad).all().item()) and bool(
+        mx.isfinite(dv_bad).all().item()
+    )
+    assert dkv_finite, "flip-segments dK/dV went non-finite"
+    d_dk = mx.abs(dk_bad.astype(mx.float32) - dk_ref.astype(mx.float32)).max().item()
+    d_dv = mx.abs(dv_bad.astype(mx.float32) - dv_ref.astype(mx.float32)).max().item()
+    # flip_segments must break dK and dV parity SEPARATELY (each gradient independently
+    # diverges -- a shared `or` could hide one gradient's masking bug behind the other).
+    msg = (
+        f"flip-segments dK/dV ({variant}) matched the block-diagonal oracle "
+        f"(dK={d_dk:.3e}, dV={d_dv:.3e}) -- the packed parity grid cannot detect a segment bug"
+    )
+    assert d_dk > 1e-2, msg
+    assert d_dv > 1e-2, msg

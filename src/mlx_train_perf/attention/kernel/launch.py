@@ -840,33 +840,47 @@ def _validate_bwd_residual_dtypes(lse: mx.array, d_arr: mx.array) -> None:
 
 @functools.cache
 def _bwd_dq_kernel(
-    head_dim: int, causal: bool, flip_causal: bool, variant: str, d_slab: int | None
+    head_dim: int, causal: bool, flip_causal: bool, variant: str, d_slab: int | None,
+    packed: bool = False,
 ) -> _MetalKernel:
     """Build (and cache) the dQ kernel for a given (head_dim, causal, flip_causal, variant,
-    d_slab). `variant="scalar"` uses the v1 one-thread-per-query-row body (`d_slab` has no
-    effect on its source, but stays part of the cache key regardless -- a harmless redundant
+    d_slab, packed). `variant="scalar"` uses the v1 one-thread-per-query-row body (`d_slab` has
+    no effect on its source, but stays part of the cache key regardless -- a harmless redundant
     entry, never a correctness issue, if a caller ever varies it for scalar); `"mma"` uses the
     T9b rung-B1 register-resident D-slabbed body, whose source genuinely changes with `d_slab`
     (`d_slab=None` builds with the source builder's own default `_BWD_DQ_MMA_D_SLAB`). Both
     variants share the same (q,k,v,dO,lse,d_arr,qoffs,scale_in)->(dq_out) contract, so
     `_dispatch_bwd_dq_range` swaps only the grid/threadgroup shape between them. `flip_causal`
     is TEST-ONLY (see `build_bwd_dq_source` / `build_bwd_dq_mma_source`); it stays part of the
-    cache key so a perturbed and a correct kernel at the same (head_dim, causal) never collide."""
+    cache key so a perturbed and a correct kernel at the same (head_dim, causal) never collide.
+
+    `packed=True` (0.4.0) builds the block-diagonal-segment variant (see the source builders'
+    packed docstrings): the keep predicate gains a same-segment term and the launcher binds two
+    extra int32 buffers (`seg_id`, `seg_start`) appended to `input_names` LAST so the non-packed
+    order (q,k,v,d_o,lse,d_arr,qoffs,scale_in -> dq_out) is untouched (mlx binds positionally).
+    `packed` is the LAST cache-key component and defaults False, so every pre-0.4.0 caller keeps
+    its existing 5-argument call and cache entry unchanged."""
     if variant == "mma":
         source = build_bwd_dq_mma_source(
-            head_dim, causal=causal, flip_causal=flip_causal, d_slab=d_slab,
+            head_dim, causal=causal, flip_causal=flip_causal, d_slab=d_slab, packed=packed,
         )
     elif variant == "scalar":
-        source = build_bwd_dq_source(head_dim, causal=causal, flip_causal=flip_causal)
+        source = build_bwd_dq_source(
+            head_dim, causal=causal, flip_causal=flip_causal, packed=packed,
+        )
     else:
         raise ValueError(f"unknown dQ kernel variant {variant!r}")
+    input_names = ["q", "k", "v", "d_o", "lse", "d_arr", "qoffs", "scale_in"]
+    if packed:
+        input_names += ["seg_id", "seg_start"]
     kernel = mx.fast.metal_kernel(
         name=(
             f"mtp_flash_bwd_dq_{variant}_d{head_dim}_"
             f"{'c' if causal else 'f'}{'x' if flip_causal else ''}"
             + (f"_s{d_slab}" if variant == "mma" else "")
+            + ("_p" if packed else "")
         ),
-        input_names=["q", "k", "v", "d_o", "lse", "d_arr", "qoffs", "scale_in"],
+        input_names=input_names,
         output_names=["dq_out"],
         source=source,
     )
@@ -877,6 +891,7 @@ def _dispatch_bwd_dq_range(
     kernel: _MetalKernel, q: mx.array, k: mx.array, v: mx.array, d_o: mx.array,
     lse: mx.array, d_arr: mx.array, scale_in: mx.array, *, r0: int, r1: int,
     variant: str = "scalar",
+    seg_id: mx.array | None = None, seg_start: mx.array | None = None,
 ) -> mx.array:
     """One dQ dispatch covering query rows [r0, r1) of the full problem, writing this range's
     own tile-local (b, hq, rows, d) dQ chunk. Full q/k/v/dO/L/D buffers + an in-kernel `qoffs`
@@ -886,7 +901,12 @@ def _dispatch_bwd_dq_range(
     contract, so the reassembly in `launch_bwd_dq` is variant-agnostic, mirroring the forward's
     `_dispatch_range`): `"scalar"` runs one thread per query row (grid.x == rows), while `"mma"`
     runs one 32-lane simdgroup per 32-row query block (grid.x == ceil(rows/32)*32,
-    threadgroup.x == 32)."""
+    threadgroup.x == 32).
+
+    `seg_id`/`seg_start` (both-or-neither) are the packed-attention buffers; when present they
+    are appended to `inputs` LAST, in `input_names` order (the `_bwd_dq_kernel` packed contract),
+    and passed as the FULL (B, N) buffers -- the kernel offsets in with `seg_off = b * n`, so a
+    query-range dispatch never slices them Python-side."""
     b, hq, _, d = q.shape
     rows_this = r1 - r0
     qoffs = mx.array([r0, r1], dtype=mx.uint32)
@@ -897,8 +917,11 @@ def _dispatch_bwd_dq_range(
     else:
         grid = (rows_this, b * hq, 1)
         threadgroup = (min(_BWD_DQ_THREADGROUP, rows_this), 1, 1)
+    inputs = [q, k, v, d_o, lse, d_arr, qoffs, scale_in]
+    if seg_id is not None:
+        inputs += [seg_id, cast(mx.array, seg_start)]
     (dq_c,) = kernel(
-        inputs=[q, k, v, d_o, lse, d_arr, qoffs, scale_in],
+        inputs=inputs,
         template=[("T", q.dtype)],
         grid=grid,
         threadgroup=threadgroup,
@@ -925,6 +948,7 @@ def launch_bwd_dq(
     lse: mx.array, d_arr: mx.array, *,
     scale: float, causal: bool, rate_macs_per_s: float | None = None,
     variant: str = "scalar", d_slab: int | None = None,
+    seg_id: mx.array | None = None, seg_start: mx.array | None = None,
     _flip_causal: bool = False,
     _force_ranges: list[tuple[int, int]] | None = None,
 ) -> mx.array:
@@ -947,12 +971,21 @@ def launch_bwd_dq(
     chaining, and this holds for the mma variant too (each 32-row query block's dQ depends only
     on its own absolute rows).
 
+    `seg_id` / `seg_start` (0.4.0, both-or-neither, int32 (B, N), require `causal=True`) switch
+    on PACKED block-diagonal-causal attention: key `kk` reaches query `row` only when both are
+    in the same segment AND causal. The two buffers are bound LAST (after q/.../scale_in) so the
+    non-packed binding order is untouched, and each query-range dispatch reads the FULL (B, N)
+    buffers with an in-kernel offset (never a Python-side slice). The row-range split/reassembly
+    is segment-agnostic -- a row's dQ depends only on its own absolute position, its segment, and
+    the keys.
+
     `_flip_causal` is TEST-ONLY (wrong-triangle causal-skip perturbation -- see source.py);
     `_force_ranges` is TEST-ONLY too (the split-forcing seam -- the production planner never
     splits a tiny packed-regime shape)."""
     _validate_bwd_dq_shapes(q, k, v, d_o, lse, d_arr)
     b, hq, n, d = q.shape
     hkv = k.shape[1]
+    packed = _validate_segments(seg_id, seg_start, b=b, n=n, causal=causal)
     if _force_ranges is not None:
         ranges = _force_ranges
     elif rate_macs_per_s is None:
@@ -962,13 +995,14 @@ def launch_bwd_dq(
             n=n, d=d, b=b, hq=hq, hkv=hkv, rate=rate_macs_per_s, causal=causal,
         )
 
-    kernel = _bwd_dq_kernel(d, causal, _flip_causal, variant, d_slab)
+    kernel = _bwd_dq_kernel(d, causal, _flip_causal, variant, d_slab, packed)
     scale_in = mx.array([scale], dtype=mx.float32)
     dq_chunks: list[mx.array] = []
     for r0, r1 in ranges:
         dq_chunks.append(
             _dispatch_bwd_dq_range(
                 kernel, q, k, v, d_o, lse, d_arr, scale_in, r0=r0, r1=r1, variant=variant,
+                seg_id=seg_id, seg_start=seg_start,
             )
         )
     if len(dq_chunks) == 1:
@@ -1055,36 +1089,49 @@ def _validate_bwd_dkv_shapes(
 
 @functools.cache
 def _bwd_dkv_kernel(
-    head_dim: int, causal: bool, flip_causal: bool, variant: str, d_slab: int | None
+    head_dim: int, causal: bool, flip_causal: bool, variant: str, d_slab: int | None,
+    packed: bool = False,
 ) -> _MetalKernel:
     """Build (and cache) the dK/dV kernel for a given (head_dim, causal, flip_causal, variant,
-    d_slab). `variant="scalar"` uses the v1 one-thread-per-key body (`d_slab` has no effect on its
-    source, but stays part of the cache key regardless -- a harmless redundant entry, never a
-    correctness issue, if a caller ever varies it for scalar); `"mma"` uses the T9b rung-B2
-    key-major register-resident D-slabbed body, whose source genuinely changes with `d_slab`
-    (`d_slab=None` builds with the source builder's own default `_BWD_DKV_MMA_D_SLAB`). Both
-    variants share the same (q,k,v,dO,lse,d_arr,dk_in,dv_in,qoffs,scale_in)->(dk_out,dv_out) chained
-    contract, so `_dispatch_bwd_dkv_range` swaps only the grid/threadgroup shape between them.
-    `flip_causal` is TEST-ONLY (see `build_bwd_dkv_source` / `build_bwd_dkv_mma_source`); it stays
-    part of the cache key so a perturbed/correct kernel at the same (head_dim, causal, variant)
-    never collide."""
+    d_slab, packed). `variant="scalar"` uses the v1 one-thread-per-key body (`d_slab` has no
+    effect on its source, but stays part of the cache key regardless -- a harmless redundant
+    entry, never a correctness issue, if a caller ever varies it for scalar); `"mma"` uses the
+    T9b rung-B2 key-major register-resident D-slabbed body, whose source genuinely changes with
+    `d_slab` (`d_slab=None` builds with the source builder's own default `_BWD_DKV_MMA_D_SLAB`).
+    Both variants share the same (q,k,v,dO,lse,d_arr,dk_in,dv_in,qoffs,scale_in)->(dk_out,dv_out)
+    chained contract, so `_dispatch_bwd_dkv_range` swaps only the grid/threadgroup shape between
+    them. `flip_causal` is TEST-ONLY (see `build_bwd_dkv_source` / `build_bwd_dkv_mma_source`); it
+    stays part of the cache key so a perturbed/correct kernel at the same (head_dim, causal,
+    variant) never collide.
+
+    `packed=True` (0.4.0) builds the block-diagonal-segment variant (see the source builders'
+    packed docstrings): the keep predicate gains a same-segment term and the launcher binds two
+    extra int32 buffers (`seg_id`, `seg_start`) appended to `input_names` LAST so the non-packed
+    order is untouched (mlx binds positionally). `packed` is the LAST cache-key component and
+    defaults False, so every pre-0.4.0 caller keeps its existing call and cache entry unchanged."""
     if variant == "mma":
         source = build_bwd_dkv_mma_source(
-            head_dim, causal=causal, flip_causal=flip_causal, d_slab=d_slab,
+            head_dim, causal=causal, flip_causal=flip_causal, d_slab=d_slab, packed=packed,
         )
     elif variant == "scalar":
-        source = build_bwd_dkv_source(head_dim, causal=causal, flip_causal=flip_causal)
+        source = build_bwd_dkv_source(
+            head_dim, causal=causal, flip_causal=flip_causal, packed=packed,
+        )
     else:
         raise ValueError(f"unknown dK/dV kernel variant {variant!r}")
+    input_names = [
+        "q", "k", "v", "d_o", "lse", "d_arr", "dk_in", "dv_in", "qoffs", "scale_in",
+    ]
+    if packed:
+        input_names += ["seg_id", "seg_start"]
     kernel = mx.fast.metal_kernel(
         name=(
             f"mtp_flash_bwd_dkv_{variant}_d{head_dim}_"
             f"{'c' if causal else 'f'}{'x' if flip_causal else ''}"
             + (f"_s{d_slab}" if variant == "mma" else "")
+            + ("_p" if packed else "")
         ),
-        input_names=[
-            "q", "k", "v", "d_o", "lse", "d_arr", "dk_in", "dv_in", "qoffs", "scale_in",
-        ],
+        input_names=input_names,
         output_names=["dk_out", "dv_out"],
         source=source,
     )
@@ -1095,6 +1142,7 @@ def _dispatch_bwd_dkv_range(
     kernel: _MetalKernel, q: mx.array, k: mx.array, v: mx.array, d_o: mx.array,
     lse: mx.array, d_arr: mx.array, dk_in: mx.array, dv_in: mx.array, scale_in: mx.array,
     *, q_lo: int, q_hi: int, variant: str = "scalar",
+    seg_id: mx.array | None = None, seg_start: mx.array | None = None,
 ) -> tuple[mx.array, mx.array]:
     """One dK/dV dispatch accumulating query rows [q_lo, q_hi) into the chained fp32 partials.
     Full q/k/v/dO/L/D + `dk_in`/`dv_in` buffers + an in-kernel `qoffs` range offset (never a
@@ -1105,7 +1153,12 @@ def _dispatch_bwd_dkv_range(
     runs one thread per key (grid.x == n; ALL keys are owners, a key with no causally-allowed query
     in the range copies its `dk_in`->`dk_out` slot unchanged), while `"mma"` runs one 32-lane
     simdgroup per 32-KEY block (grid.x == ceil(n/32)*32, threadgroup.x == 32; each simdgroup seeds
-    its key block from `dk_in`/`dv_in` and stores it, carrying the chained accumulator forward)."""
+    its key block from `dk_in`/`dv_in` and stores it, carrying the chained accumulator forward).
+
+    `seg_id`/`seg_start` (both-or-neither) are the packed-attention buffers; when present they are
+    appended to `inputs` LAST, in `input_names` order (the `_bwd_dkv_kernel` packed contract), and
+    passed as the FULL (B, N) buffers -- the kernel offsets in with `seg_off = b * n`, and every
+    chained dispatch receives the SAME full buffers (never sliced)."""
     b, _hq, n, d = q.shape
     hkv = k.shape[1]
     qoffs = mx.array([q_lo, q_hi], dtype=mx.uint32)
@@ -1116,8 +1169,11 @@ def _dispatch_bwd_dkv_range(
     else:
         grid = (n, b * hkv, 1)
         threadgroup = (min(_BWD_DKV_THREADGROUP, n), 1, 1)
+    inputs = [q, k, v, d_o, lse, d_arr, dk_in, dv_in, qoffs, scale_in]
+    if seg_id is not None:
+        inputs += [seg_id, cast(mx.array, seg_start)]
     dk_out, dv_out = kernel(
-        inputs=[q, k, v, d_o, lse, d_arr, dk_in, dv_in, qoffs, scale_in],
+        inputs=inputs,
         template=[("T", q.dtype)],
         grid=grid,
         threadgroup=threadgroup,
@@ -1132,6 +1188,7 @@ def launch_bwd_dkv(
     lse: mx.array, d_arr: mx.array, *,
     scale: float, causal: bool, rate_macs_per_s: float | None = None,
     variant: str = "scalar", d_slab: int | None = None,
+    seg_id: mx.array | None = None, seg_start: mx.array | None = None,
     _flip_causal: bool = False,
     _force_ranges: list[tuple[int, int]] | None = None,
 ) -> tuple[mx.array, mx.array]:
@@ -1158,6 +1215,14 @@ def launch_bwd_dkv(
     mid-block split would merge different partial products inside one hardware MMA and break
     the chained bit-identity).
 
+    `seg_id` / `seg_start` (0.4.0, both-or-neither, int32 (B, N), require `causal=True`) switch
+    on PACKED block-diagonal-causal attention: query `i` contributes to key `key`'s dK/dV only
+    when both are in the same segment AND causal. The two buffers are bound LAST (after
+    q/.../scale_in), and every chained dispatch receives the SAME full (B, N) buffers with an
+    in-kernel offset (never a Python-side slice). The predicate zeros cross-segment contributions
+    identically regardless of the range split, so a chained split stays bit-identical to a single
+    dispatch under packing too.
+
     `_flip_causal` is TEST-ONLY (wrong-triangle causal-skip perturbation -- see source.py);
     `_force_ranges` is TEST-ONLY too (the split-forcing seam -- the production planner never
     splits a tiny packed-regime shape; forced ranges for the mma variant must stay 32-aligned
@@ -1165,6 +1230,7 @@ def launch_bwd_dkv(
     _validate_bwd_dkv_shapes(q, k, v, d_o, lse, d_arr)
     b, hq, n, d = q.shape
     hkv = k.shape[1]
+    packed = _validate_segments(seg_id, seg_start, b=b, n=n, causal=causal)
     if _force_ranges is not None:
         ranges = _force_ranges
     elif rate_macs_per_s is None:
@@ -1176,14 +1242,14 @@ def launch_bwd_dkv(
             block_align=block_align,
         )
 
-    kernel = _bwd_dkv_kernel(d, causal, _flip_causal, variant, d_slab)
+    kernel = _bwd_dkv_kernel(d, causal, _flip_causal, variant, d_slab, packed)
     scale_in = mx.array([scale], dtype=mx.float32)
     dk = mx.zeros((b, hkv, n, d), dtype=mx.float32)
     dv = mx.zeros((b, hkv, n, d), dtype=mx.float32)
     for q_lo, q_hi in ranges:
         dk, dv = _dispatch_bwd_dkv_range(
             kernel, q, k, v, d_o, lse, d_arr, dk, dv, scale_in, q_lo=q_lo, q_hi=q_hi,
-            variant=variant,
+            variant=variant, seg_id=seg_id, seg_start=seg_start,
         )
     return dk.astype(k.dtype), dv.astype(v.dtype)
 

@@ -100,11 +100,12 @@ _FWD_TEMPLATE = """
 """
 
 
-def _validate_fwd_predicate_flags(
+def _validate_predicate_flags(
     *, causal: bool, flip_causal: bool, drop_diagonal: bool,
     packed: bool, flip_segments: bool,
 ) -> None:
-    """Shared keep-predicate flag validation for both forward source builders (scalar + MMA).
+    """Shared keep-predicate flag validation for ALL SIX attention source builders -- the two
+    forward bodies (scalar + MMA) and the four backward bodies (dQ scalar/MMA, dK/dV scalar/MMA).
 
     `flip_causal`/`drop_diagonal` are the causal-mask perturbations (each needs `causal`, and
     they are mutually exclusive); `packed` is block-diagonal-causal segment isolation (needs
@@ -150,7 +151,7 @@ def build_fwd_source(
         raise ValueError(
             f"head_dim must be one of {_KERNEL_HEAD_DIMS}, got {head_dim}"
         )
-    _validate_fwd_predicate_flags(
+    _validate_predicate_flags(
         causal=causal, flip_causal=flip_causal, drop_diagonal=drop_diagonal,
         packed=packed, flip_segments=flip_segments,
     )
@@ -509,7 +510,7 @@ def build_fwd_mma_source(
         raise ValueError(
             f"head_dim must be one of {_KERNEL_HEAD_DIMS}, got {head_dim}"
         )
-    _validate_fwd_predicate_flags(
+    _validate_predicate_flags(
         causal=causal, flip_causal=flip_causal, drop_diagonal=drop_diagonal,
         packed=packed, flip_segments=flip_segments,
     )
@@ -748,6 +749,7 @@ _BWD_DQ_TEMPLATE = """
 
 def build_bwd_dq_source(
     head_dim: int, *, causal: bool, flip_causal: bool = False, drop_diagonal: bool = False,
+    packed: bool = False, flip_segments: bool = False,
 ) -> str:
     """MSL function body for the v1 one-owner-per-query-row dQ backward kernel.
 
@@ -755,17 +757,27 @@ def build_bwd_dq_source(
     `qreg`/`doreg`/`dq` array sizes and the D-loop bounds). `causal=True` loops only keys
     `kk <= row` (the causal skip); `causal=False` loops every key. `flip_causal` is TEST-ONLY
     -- it flips the causal-skip inequality to the WRONG triangle (`kk >= row`) so a parity run
-    against the causal oracle FAILS (the named-bug-site perturbation)."""
+    against the causal oracle FAILS (the named-bug-site perturbation).
+
+    `packed=True` (0.4.0, requires `causal=True`) is the block-diagonal-segment twin of the
+    forward's packed variant (`build_fwd_source`): the keep predicate gains a same-segment term
+    `seg_id[seg_off + kk] == seg_id[seg_off + row]` (`seg_off = b * n`, the row's batch offset
+    into the (B, N) int32 `seg_id` buffer), so key `kk` reaches query `row` only when both are
+    in the same packed segment AND causal. The scalar dQ `row` (= r0 + local_row; local_row <
+    rows_this, r1 <= n) is provably < n, so its seg_id read needs NO clamp -- the scalar body is
+    immune to the MMA over-hang bug. This threads two int32 device buffers (`seg_id`,
+    `seg_start`) the launcher appends to `input_names` LAST. `flip_segments` is TEST-ONLY
+    (requires `packed`) -- it inverts ONLY the equality to `!=` (cross-segment contamination),
+    the segment analogue of `flip_causal`. `packed=False` (the default) leaves the emitted MSL
+    BYTE-IDENTICAL to the pre-0.4.0 causal kernel."""
     if head_dim not in _KERNEL_HEAD_DIMS:
         raise ValueError(
             f"head_dim must be one of {_KERNEL_HEAD_DIMS}, got {head_dim}"
         )
-    if flip_causal and not causal:
-        raise ValueError("flip_causal is only meaningful with causal=True")
-    if drop_diagonal and not causal:
-        raise ValueError("drop_diagonal is only meaningful with causal=True")
-    if drop_diagonal and flip_causal:
-        raise ValueError("drop_diagonal and flip_causal are mutually exclusive perturbations")
+    _validate_predicate_flags(
+        causal=causal, flip_causal=flip_causal, drop_diagonal=drop_diagonal,
+        packed=packed, flip_segments=flip_segments,
+    )
     if not causal:
         keep = "true"
     elif flip_causal:
@@ -774,7 +786,15 @@ def build_bwd_dq_source(
         keep = "kk < row"
     else:
         keep = "kk <= row"
-    return _BWD_DQ_TEMPLATE.replace("HEAD_DIM", str(head_dim)).replace("KEEP_CMP", keep)
+    src = _BWD_DQ_TEMPLATE
+    if packed:
+        eq = "!=" if flip_segments else "=="
+        keep = f"(({keep}) && (seg_id[seg_off + kk] {eq} seg_id[seg_off + row]))"
+        src = src.replace(
+            "    for (uint kk = 0; kk < n; ++kk) {",
+            "    uint seg_off = b * n;\n    for (uint kk = 0; kk < n; ++kk) {",
+        )
+    return src.replace("HEAD_DIM", str(head_dim)).replace("KEEP_CMP", keep)
 
 
 # ---------------------------------------------------------------------------------------
@@ -1060,6 +1080,7 @@ _BWD_DQ_MMA_TEMPLATE = """
 def build_bwd_dq_mma_source(
     head_dim: int, *, causal: bool, flip_causal: bool = False,
     drop_diagonal: bool = False, d_slab: int | None = None,
+    packed: bool = False, flip_segments: bool = False,
 ) -> str:
     """MSL function body for the 4x4 simdgroup-matrix (MMA) dQ backward kernel -- the
     throughput restructure of the v1 scalar one-owner-per-row dQ body.
@@ -1078,17 +1099,30 @@ def build_bwd_dq_mma_source(
     parity run against the causal oracle FAILS (the named-bug-site perturbation). `d_slab` (a
     positive multiple of 8 dividing `head_dim`) overrides the register-safe `_BWD_DQ_MMA_D_SLAB`
     default (32) -- the controller sweeps {16,32,64,128} at saturation; this rung's launcher
-    uses the default and the mma variant is not wired into the API path."""
+    uses the default and the mma variant is not wired into the API path.
+
+    `packed=True` (0.4.0, requires `causal=True`) is the block-diagonal-segment twin of
+    `build_fwd_mma_source`'s packed variant -- dQ is query-major with the SAME `kb0 = 0` KV-loop
+    structure as the forward, so it takes the same two packed modifications: the in-tile keep
+    predicate gains a same-segment equality `seg_id[seg_off + kk] == seg_id[seg_off +
+    metal::min(row, n - 1)]` (`row` clamped -- an MMA over-hang lane's row can be >= n; the clamp
+    is inert for real rows and those over-hang lanes are discarded before the dQ store), AND the
+    KV block loop starts at `kv_lo = floor(seg_start[first row of block] / 32) * 32` instead of 0
+    (blocks below `kv_lo` are entirely earlier segments, masked for every row in the block; later-
+    segment rows sharing the block still mask their own earlier keys via the per-key predicate).
+    NO empty-block NaN guard is needed (unlike the forward MMA's online-softmax alpha rescale):
+    dQ uses the SAVED L directly with `p = exp(...) : 0.0f` (masked keys take the 0 branch, no exp
+    of -inf), so there is no `exp(-inf - -inf)` site. `flip_segments` is TEST-ONLY (requires
+    `packed`) -- inverts ONLY the equality to `!=`. `packed=False` (the default) leaves the
+    emitted MSL BYTE-IDENTICAL to the pre-0.4.0 causal kernel."""
     if head_dim not in _KERNEL_HEAD_DIMS:
         raise ValueError(
             f"head_dim must be one of {_KERNEL_HEAD_DIMS}, got {head_dim}"
         )
-    if flip_causal and not causal:
-        raise ValueError("flip_causal is only meaningful with causal=True")
-    if drop_diagonal and not causal:
-        raise ValueError("drop_diagonal is only meaningful with causal=True")
-    if drop_diagonal and flip_causal:
-        raise ValueError("drop_diagonal and flip_causal are mutually exclusive perturbations")
+    _validate_predicate_flags(
+        causal=causal, flip_causal=flip_causal, drop_diagonal=drop_diagonal,
+        packed=packed, flip_segments=flip_segments,
+    )
     slab = _BWD_DQ_MMA_D_SLAB if d_slab is None else d_slab
     if slab <= 0 or slab % 8 != 0 or head_dim % slab != 0:
         raise ValueError(
@@ -1106,8 +1140,34 @@ def build_bwd_dq_mma_source(
     else:
         keep = "kk <= row"
         kv_limit = "metal::min(n, r0 + block_base + 32u)"
+    src = _BWD_DQ_MMA_TEMPLATE
+    if packed:
+        eq = "!=" if flip_segments else "=="
+        # Clamp the per-key row read (mirrors build_fwd_mma_source): an MMA over-hang lane
+        # (row >= n, a partially-full last query block) would otherwise read seg_id past the
+        # (B, N) buffer's end. The clamp is inert for valid rows and over-hang lanes are
+        # discarded before the dQ store. `kk` needs no clamp: the P-formation reads seg_id only
+        # inside `(kk < kb1) && (...)`, and kb1 <= n short-circuits the read for out-of-range kk.
+        keep = (
+            f"(({keep}) && (seg_id[seg_off + kk] {eq} "
+            "seg_id[seg_off + metal::min(row, n - 1)]))"
+        )
+        # Declare seg_off + the per-block KV lower bound once, right after kv_limit and before
+        # the D-slab OUTER loop (kv_lo is slab-independent), exactly as the forward MMA does. The
+        # block's first row is provably < n but clamp to n-1 anyway (the qh over-hang idiom).
+        src = src.replace(
+            "    uint kv_limit = KV_LIMIT;",
+            "    uint kv_limit = KV_LIMIT;\n"
+            "    uint seg_off = b * n;\n"
+            "    uint kv_lo = "
+            "(seg_start[seg_off + metal::min(r0 + block_base, n - 1)] / 32u) * 32u;",
+        )
+        src = src.replace(
+            "for (uint kb0 = 0; kb0 < kv_limit; kb0 += 32) {",
+            "for (uint kb0 = kv_lo; kb0 < kv_limit; kb0 += 32) {",
+        )
     return (
-        _BWD_DQ_MMA_TEMPLATE.replace("HEAD_DIM", str(head_dim))
+        src.replace("HEAD_DIM", str(head_dim))
         .replace("D_SLAB_TILES", str(slab // 8))
         .replace("D_SLAB", str(slab))
         .replace("KV_LIMIT", kv_limit)
@@ -1225,6 +1285,7 @@ _BWD_DKV_TEMPLATE = """
 
 def build_bwd_dkv_source(
     head_dim: int, *, causal: bool, flip_causal: bool = False, drop_diagonal: bool = False,
+    packed: bool = False, flip_segments: bool = False,
 ) -> str:
     """MSL function body for the v1 one-owner-per-key chained dK/dV backward kernel.
 
@@ -1233,17 +1294,27 @@ def build_bwd_dkv_source(
     `i >= key` (the causal skip); `causal=False` keeps every query. `flip_causal` is TEST-ONLY
     -- it flips the causal-keep inequality to the WRONG triangle (`i <= key`) so a parity run
     against the causal oracle FAILS (the named-bug-site perturbation, the dK/dV analogue of the
-    dQ kernel's `flip_causal`)."""
+    dQ kernel's `flip_causal`).
+
+    `packed=True` (0.4.0, requires `causal=True`) is the block-diagonal-segment twin of the
+    forward's packed variant, KEY-major: the keep predicate gains a same-segment term comparing
+    the QUERY's seg_id vs the owner KEY's, `seg_id[seg_off + i] == seg_id[seg_off + key]`
+    (`seg_off = b * n`), so query `i` contributes to key `key`'s dK/dV only when both are in the
+    same packed segment AND causal. The scalar dK/dV `key` (< n after the `if (key >= n) return;`
+    guard) and query `i` (loop-bound `i < q_hi <= n`) are provably < n, so both seg reads need NO
+    clamp -- the scalar body is immune to the MMA over-hang bug. The query-loop lower bound `q_lo`
+    stays UNCHANGED (correctness is from the per-query predicate; the segment-end upper-bound
+    optimization is explicitly skipped -- YAGNI). `flip_segments` is TEST-ONLY (requires `packed`)
+    -- it inverts ONLY the equality to `!=`. `packed=False` (the default) leaves the emitted MSL
+    BYTE-IDENTICAL to the pre-0.4.0 causal kernel."""
     if head_dim not in _KERNEL_HEAD_DIMS:
         raise ValueError(
             f"head_dim must be one of {_KERNEL_HEAD_DIMS}, got {head_dim}"
         )
-    if flip_causal and not causal:
-        raise ValueError("flip_causal is only meaningful with causal=True")
-    if drop_diagonal and not causal:
-        raise ValueError("drop_diagonal is only meaningful with causal=True")
-    if drop_diagonal and flip_causal:
-        raise ValueError("drop_diagonal and flip_causal are mutually exclusive perturbations")
+    _validate_predicate_flags(
+        causal=causal, flip_causal=flip_causal, drop_diagonal=drop_diagonal,
+        packed=packed, flip_segments=flip_segments,
+    )
     if not causal:
         keep = "true"
     elif flip_causal:
@@ -1252,7 +1323,15 @@ def build_bwd_dkv_source(
         keep = "i > key"
     else:
         keep = "i >= key"
-    return _BWD_DKV_TEMPLATE.replace("HEAD_DIM", str(head_dim)).replace("KEEP_CMP", keep)
+    src = _BWD_DKV_TEMPLATE
+    if packed:
+        eq = "!=" if flip_segments else "=="
+        keep = f"(({keep}) && (seg_id[seg_off + i] {eq} seg_id[seg_off + key]))"
+        src = src.replace(
+            "    for (uint i = q_lo; i < q_hi; ++i) {",
+            "    uint seg_off = b * n;\n    for (uint i = q_lo; i < q_hi; ++i) {",
+        )
+    return src.replace("HEAD_DIM", str(head_dim)).replace("KEEP_CMP", keep)
 
 
 # ---------------------------------------------------------------------------------------
@@ -1608,6 +1687,7 @@ _BWD_DKV_MMA_TEMPLATE = """
 def build_bwd_dkv_mma_source(
     head_dim: int, *, causal: bool, flip_causal: bool = False,
     drop_diagonal: bool = False, d_slab: int | None = None,
+    packed: bool = False, flip_segments: bool = False,
 ) -> str:
     """MSL function body for the 4x4 simdgroup-matrix (MMA) dK/dV backward kernel -- the key-major,
     register-resident D-slabbed, CHAINED throughput restructure of the v1 scalar one-owner-per-key
@@ -1631,17 +1711,30 @@ def build_bwd_dkv_mma_source(
     perturbation). `d_slab` (a positive multiple of 8 dividing `head_dim`) overrides the
     register-safe `_BWD_DKV_MMA_D_SLAB` default (32) -- the controller sweeps {16,32,64,128} at
     saturation; this rung's launcher uses the default and the mma variant is not wired into the API
-    path."""
+    path.
+
+    `packed=True` (0.4.0, requires `causal=True`) is the block-diagonal-segment twin, KEY-major:
+    the per-element P^T-formation keep predicate gains a same-segment term comparing the QUERY's
+    seg_id vs the owner KEY's, `seg_id[seg_off + i] == seg_id[seg_off + metal::min(key, n - 1)]`
+    (`seg_off = b * n`). The owner `key` index can OVER-HANG on the key axis (a partially-full last
+    key block), so its seg_id read is clamped to n-1 (inert for real keys; over-hang keys are
+    discarded by the `if (key < n)` store guard). The query `i` needs NO clamp: the P-formation
+    reads seg_id only inside `(i < q_hi) && (...)`, and q_hi <= n short-circuits the read for
+    out-of-range queries. The query-loop lower bound `Q_START` stays UNCHANGED (correctness is from
+    the per-query predicate; the segment-end upper-bound optimization is explicitly skipped --
+    YAGNI), and there is NO kv_lo lower-bound change (dK/dV is key-major, unlike the query-major
+    dQ). NO empty-block NaN guard is needed: dK/dV use the SAVED L directly with
+    `p = exp(...) : 0.0f` (masked queries take the 0 branch, no exp of -inf). `flip_segments` is
+    TEST-ONLY (requires `packed`) -- inverts ONLY the equality to `!=`. `packed=False` (the
+    default) leaves the emitted MSL BYTE-IDENTICAL to the pre-0.4.0 causal kernel."""
     if head_dim not in _KERNEL_HEAD_DIMS:
         raise ValueError(
             f"head_dim must be one of {_KERNEL_HEAD_DIMS}, got {head_dim}"
         )
-    if flip_causal and not causal:
-        raise ValueError("flip_causal is only meaningful with causal=True")
-    if drop_diagonal and not causal:
-        raise ValueError("drop_diagonal is only meaningful with causal=True")
-    if drop_diagonal and flip_causal:
-        raise ValueError("drop_diagonal and flip_causal are mutually exclusive perturbations")
+    _validate_predicate_flags(
+        causal=causal, flip_causal=flip_causal, drop_diagonal=drop_diagonal,
+        packed=packed, flip_segments=flip_segments,
+    )
     slab = _BWD_DKV_MMA_D_SLAB if d_slab is None else d_slab
     if slab <= 0 or slab % 8 != 0 or head_dim % slab != 0:
         raise ValueError(
@@ -1659,8 +1752,27 @@ def build_bwd_dkv_mma_source(
     else:
         keep = "i >= key"
         q_start = "metal::max(q_lo, key_base)"
+    src = _BWD_DKV_MMA_TEMPLATE
+    if packed:
+        eq = "!=" if flip_segments else "=="
+        # Clamp the owner-KEY seg read: an over-hang lane's key (key >= n, a partially-full last
+        # key block) would otherwise read seg_id past the (B, N) buffer's end. Inert for real keys
+        # and over-hang keys are discarded by the `if (key < n)` store guard. `i` needs no clamp:
+        # the P^T-formation reads seg_id only inside `(i < q_hi) && (...)`, and q_hi <= n
+        # short-circuits the read for out-of-range queries.
+        keep = (
+            f"(({keep}) && (seg_id[seg_off + i] {eq} "
+            "seg_id[seg_off + metal::min(key, n - 1)]))"
+        )
+        # Declare seg_off once, right after q_start and before the D-slab OUTER loop (function-body
+        # scope, so it is visible in the per-slab query loop's P^T-formation). Q_START is UNCHANGED
+        # -- the per-query predicate zeros cross-segment contributions (no key-major kv_lo needed).
+        src = src.replace(
+            "    uint q_start = Q_START;",
+            "    uint q_start = Q_START;\n    uint seg_off = b * n;",
+        )
     return (
-        _BWD_DKV_MMA_TEMPLATE.replace("HEAD_DIM", str(head_dim))
+        src.replace("HEAD_DIM", str(head_dim))
         .replace("D_SLAB_TILES", str(slab // 8))
         .replace("D_SLAB", str(slab))
         .replace("Q_START", q_start)
