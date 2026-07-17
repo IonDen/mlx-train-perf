@@ -533,7 +533,16 @@ def build_fwd_mma_source(
     src = _FWD_MMA_TEMPLATE
     if packed:
         eq = "!=" if flip_segments else "=="
-        keep = f"(({keep}) && (seg_id[seg_off + kk] {eq} seg_id[seg_off + row]))"
+        # Clamp the per-key row read -- unlike the scalar builder's row (provably < n), an
+        # MMA over-hang lane (row >= n, a partially-full last query block) would otherwise
+        # read seg_id past the (B, N) buffer's end (or, on an earlier batch, a neighboring
+        # batch's segment id). The clamp mirrors the kv_lo seg_start read below and is inert
+        # for valid rows (min(row, n - 1) == row when row < n); over-hang lanes read a valid
+        # but irrelevant id, since those lanes are discarded before the O/L store.
+        keep = (
+            f"(({keep}) && (seg_id[seg_off + kk] {eq} "
+            "seg_id[seg_off + metal::min(row, n - 1)]))"
+        )
         # Empty-block NaN guard (packed-only, so the causal MSL stays byte-identical). Segment
         # masking can leave a row's LEADING KV blocks fully masked (bm stays -INFINITY) before
         # its own segment's diagonal key arrives -- and with no prior key m[rt] is also

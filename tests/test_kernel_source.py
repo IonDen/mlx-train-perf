@@ -170,11 +170,30 @@ def test_fwd_scalar_packed_predicate_wraps_causal_with_segment_equality() -> Non
 def test_fwd_mma_packed_predicate_and_kv_lower_bound() -> None:
     s = build_fwd_mma_source(64, packed=True)
     assert "uint seg_off = b * n;" in s
-    assert "seg_id[seg_off + kk] == seg_id[seg_off + row]" in s
+    # row is clamped (unlike the scalar builder) -- an over-hang lane's row can be >= n
+    assert "seg_id[seg_off + kk] == seg_id[seg_off + metal::min(row, n - 1)]" in s
     # the KV-block loop starts at the block's segment-floored lower bound, not 0
     assert "uint kv_lo = " in s
     assert "for (uint kb0 = kv_lo; kb0 < kv_limit; kb0 += 32) {" in s
     assert "for (uint kb0 = 0; kb0 < kv_limit; kb0 += 32) {" not in s
+
+
+def test_fwd_mma_packed_seg_id_row_read_is_clamped_for_over_hang_lanes() -> None:
+    # T14 review finding: a partially-over-hang query block (n not 32-aligned) has lanes with
+    # row >= n; the packed predicate's seg_id[seg_off + row] read must clamp row to n-1 (the
+    # kv_lo seg_start read already does this) so those lanes read a valid, in-bounds id -- its
+    # value is irrelevant since over-hang lanes are discarded before the O/L store.
+    s = build_fwd_mma_source(64, packed=True)
+    assert "seg_id[seg_off + kk] == seg_id[seg_off + metal::min(row, n - 1)]" in s
+    assert "seg_id[seg_off + row]" not in s  # no unclamped row read should remain
+
+
+def test_fwd_scalar_packed_seg_id_row_read_is_not_clamped() -> None:
+    # The scalar builder's row (= r0 + local_row; local_row < rows_this, r1 <= n) is always
+    # < n by construction, so it is immune to the MMA over-hang bug and needs no clamp.
+    s = build_fwd_source(64, packed=True)
+    assert "seg_id[seg_off + kk] == seg_id[seg_off + row]" in s
+    assert "metal::min(row, n - 1)" not in s
 
 
 def test_fwd_scalar_flip_segments_inverts_only_the_equality() -> None:
@@ -186,8 +205,8 @@ def test_fwd_scalar_flip_segments_inverts_only_the_equality() -> None:
 
 def test_fwd_mma_flip_segments_inverts_only_the_equality() -> None:
     s = build_fwd_mma_source(64, packed=True, flip_segments=True)
-    assert "seg_id[seg_off + kk] != seg_id[seg_off + row]" in s
-    assert "seg_id[seg_off + kk] == seg_id[seg_off + row]" not in s
+    assert "seg_id[seg_off + kk] != seg_id[seg_off + metal::min(row, n - 1)]" in s
+    assert "seg_id[seg_off + kk] == seg_id[seg_off + metal::min(row, n - 1)]" not in s
 
 
 def test_fwd_packed_requires_causal() -> None:
