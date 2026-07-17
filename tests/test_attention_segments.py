@@ -117,12 +117,18 @@ def test_flash_attention_backward_matches_per_segment_composition() -> None:
 
     mx.eval(dq_p, dk_p, dv_p, dq_a, dk_a, dv_a, dq_b, dk_b, dv_b)
 
-    assert mx.allclose(dq_p[:, :, :n1], dq_a, atol=1e-5).item()
-    assert mx.allclose(dk_p[:, :, :n1], dk_a, atol=1e-5).item()
-    assert mx.allclose(dv_p[:, :, :n1], dv_a, atol=1e-5).item()
-    assert mx.allclose(dq_p[:, :, n1:], dq_b, atol=1e-5).item()
-    assert mx.allclose(dk_p[:, :, n1:], dk_b, atol=1e-5).item()
-    assert mx.allclose(dv_p[:, :, n1:], dv_b, atol=1e-5).item()
+    # Measured (2026-07-17, mlx 0.32.0, M1 Max): all six dQ/dK/dV comparisons are
+    # bit-identical (max abs diff 0.0e+00) -- the masked-out cross-segment/future
+    # entries are exact fp32 zeros (exp(-inf) == 0.0), so they don't perturb the
+    # accumulated sums. atol=1e-6 matches the sibling forward/gradient composition
+    # tests above in this file rather than pinning to the measured 0.0 floor, which
+    # would be fragile to a harmless future change in reduction order.
+    assert mx.allclose(dq_p[:, :, :n1], dq_a, atol=1e-6).item()
+    assert mx.allclose(dk_p[:, :, :n1], dk_a, atol=1e-6).item()
+    assert mx.allclose(dv_p[:, :, :n1], dv_a, atol=1e-6).item()
+    assert mx.allclose(dq_p[:, :, n1:], dq_b, atol=1e-6).item()
+    assert mx.allclose(dk_p[:, :, n1:], dk_b, atol=1e-6).item()
+    assert mx.allclose(dv_p[:, :, n1:], dv_b, atol=1e-6).item()
 
 
 def test_flash_attention_backward_requires_causal_true() -> None:

@@ -162,7 +162,7 @@ def _flash_attention_backward(
     if segments is not None:
         assert causal, "segments requires causal=True"
         s = mx.where(segment_allowed(segments.seg_id), s, -mx.inf)
-    elif causal:
+    if causal:
         neg_inf = mx.full((n, n), -mx.inf, dtype=mx.float32)
         s = s + mx.triu(neg_inf, k=1)  # additive -inf where j > i, matching the forward
     p = mx.exp(s - lse32[..., None])  # (B, Hq, N, N)
