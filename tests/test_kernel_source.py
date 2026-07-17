@@ -1,3 +1,6 @@
+import pytest
+
+from mlx_train_perf.attention.kernel.source import build_fwd_mma_source, build_fwd_source
 from mlx_train_perf.core.kernel.source import (
     _BACKWARD_DHIDDEN_MMA_TEMPLATE,
     _DENSE_TEMPLATE,
@@ -129,3 +132,81 @@ def test_build_backward_dhidden_mma_source_rejects_bad_row_tiles() -> None:
         except ValueError:
             continue
         raise AssertionError(f"row_tiles={rt} should have been rejected")
+
+
+# ---------------------------------------------------------------------------------------
+# 0.4.0 T2: the PACKED forward variant (scalar + MMA) -- block-diagonal segment-ID keep
+# predicate. `packed=False` (the default) must stay byte-identical to the pre-0.4.0 MSL, so
+# every pre-existing caller (and the whole causal parity grid) is untouched. `packed=True`
+# wraps the causal keep with a same-segment equality; `flip_segments` inverts that equality
+# (the cross-contamination perturbation, the segment analogue of `flip_causal`).
+
+
+def test_fwd_sources_byte_identical_when_not_packed() -> None:
+    # The default (packed off) must equal the explicit packed=False for BOTH fwd builders --
+    # the byte-identity contract that keeps the pre-0.4.0 causal kernels bit-for-bit unchanged.
+    for build in (build_fwd_source, build_fwd_mma_source):
+        assert build(128) == build(128, packed=False)
+
+
+def test_fwd_sources_have_no_segment_text_when_not_packed() -> None:
+    # Stronger byte-identity guard: no packed artifact may leak into the non-packed source
+    # (a stray seg_off/kv_lo would perturb the causal MSL even if the string still "worked").
+    for build in (build_fwd_source, build_fwd_mma_source):
+        s = build(128)
+        assert "seg_id" not in s
+        assert "seg_start" not in s
+        assert "seg_off" not in s
+        assert "kv_lo" not in s
+
+
+def test_fwd_scalar_packed_predicate_wraps_causal_with_segment_equality() -> None:
+    s = build_fwd_source(64, packed=True)
+    assert "uint seg_off = b * n;" in s
+    assert "seg_id[seg_off + kk] == seg_id[seg_off + row]" in s
+    assert "kk <= row" in s  # the base causal predicate is retained inside the wrap
+
+
+def test_fwd_mma_packed_predicate_and_kv_lower_bound() -> None:
+    s = build_fwd_mma_source(64, packed=True)
+    assert "uint seg_off = b * n;" in s
+    assert "seg_id[seg_off + kk] == seg_id[seg_off + row]" in s
+    # the KV-block loop starts at the block's segment-floored lower bound, not 0
+    assert "uint kv_lo = " in s
+    assert "for (uint kb0 = kv_lo; kb0 < kv_limit; kb0 += 32) {" in s
+    assert "for (uint kb0 = 0; kb0 < kv_limit; kb0 += 32) {" not in s
+
+
+def test_fwd_scalar_flip_segments_inverts_only_the_equality() -> None:
+    s = build_fwd_source(64, packed=True, flip_segments=True)
+    assert "seg_id[seg_off + kk] != seg_id[seg_off + row]" in s
+    assert "seg_id[seg_off + kk] == seg_id[seg_off + row]" not in s
+    assert "kk <= row" in s  # the causal half is untouched -- only the equality flips
+
+
+def test_fwd_mma_flip_segments_inverts_only_the_equality() -> None:
+    s = build_fwd_mma_source(64, packed=True, flip_segments=True)
+    assert "seg_id[seg_off + kk] != seg_id[seg_off + row]" in s
+    assert "seg_id[seg_off + kk] == seg_id[seg_off + row]" not in s
+
+
+def test_fwd_packed_requires_causal() -> None:
+    with pytest.raises(ValueError, match="packed"):
+        build_fwd_source(128, causal=False, packed=True)
+    with pytest.raises(ValueError, match="packed"):
+        build_fwd_mma_source(128, causal=False, packed=True)
+
+
+def test_flip_segments_requires_packed() -> None:
+    with pytest.raises(ValueError, match="flip_segments"):
+        build_fwd_source(128, flip_segments=True)
+    with pytest.raises(ValueError, match="flip_segments"):
+        build_fwd_mma_source(128, flip_segments=True)
+
+
+def test_flip_segments_mutually_exclusive_with_the_causal_perturbations() -> None:
+    for build in (build_fwd_source, build_fwd_mma_source):
+        with pytest.raises(ValueError, match="flip_segments"):
+            build(64, packed=True, flip_segments=True, flip_causal=True)
+        with pytest.raises(ValueError, match="flip_segments"):
+            build(64, packed=True, flip_segments=True, drop_diagonal=True)

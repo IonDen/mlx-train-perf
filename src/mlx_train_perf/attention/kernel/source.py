@@ -100,9 +100,33 @@ _FWD_TEMPLATE = """
 """
 
 
+def _validate_fwd_predicate_flags(
+    *, causal: bool, flip_causal: bool, drop_diagonal: bool,
+    packed: bool, flip_segments: bool,
+) -> None:
+    """Shared keep-predicate flag validation for both forward source builders (scalar + MMA).
+
+    `flip_causal`/`drop_diagonal` are the causal-mask perturbations (each needs `causal`, and
+    they are mutually exclusive); `packed` is block-diagonal-causal segment isolation (needs
+    `causal`); `flip_segments` is the packed cross-contamination perturbation (needs `packed`,
+    and is exclusive with the causal perturbations). Raises `ValueError` on any misuse."""
+    if flip_causal and not causal:
+        raise ValueError("flip_causal is only meaningful with causal=True")
+    if drop_diagonal and not causal:
+        raise ValueError("drop_diagonal is only meaningful with causal=True")
+    if drop_diagonal and flip_causal:
+        raise ValueError("drop_diagonal and flip_causal are mutually exclusive perturbations")
+    if packed and not causal:
+        raise ValueError("packed (block-diagonal segments) requires causal=True")
+    if flip_segments and not packed:
+        raise ValueError("flip_segments requires packed=True")
+    if flip_segments and (flip_causal or drop_diagonal):
+        raise ValueError("flip_segments is mutually exclusive with flip_causal/drop_diagonal")
+
+
 def build_fwd_source(
     head_dim: int, *, causal: bool = True, flip_causal: bool = False,
-    drop_diagonal: bool = False,
+    drop_diagonal: bool = False, packed: bool = False, flip_segments: bool = False,
 ) -> str:
     """MSL function body for the v0 flash-attention forward kernel (O + L).
 
@@ -110,17 +134,26 @@ def build_fwd_source(
     compile-time constant. `causal=True` masks each key with `kk <= row` before it enters
     the running max; `causal=False` keeps every key. `flip_causal` is TEST-ONLY -- it flips
     the causal comparison to the wrong triangle (`kk >= row`) so a parity run FAILS.
+
+    `packed=True` (0.4.0, requires `causal=True`) composes block-diagonal-causal segment
+    isolation on top of the causal triangle: the keep predicate gains a same-segment term
+    `seg_id[seg_off + kk] == seg_id[seg_off + row]` (`seg_off = b * n`, the row's batch
+    offset into the (B, N) int32 `seg_id` buffer), so key `kk` reaches query `row` only when
+    both are in the same packed segment AND causal. This threads two int32 device buffers
+    (`seg_id`, `seg_start`) into the kernel -- the launcher appends them to `input_names`
+    LAST so the non-packed signature is untouched. `flip_segments` is TEST-ONLY (requires
+    `packed=True`) -- it inverts ONLY the equality to `!=` (cross-segment contamination), the
+    segment analogue of `flip_causal`, so a packed parity run FAILS. `packed=False` (the
+    default) leaves the emitted MSL BYTE-IDENTICAL to the pre-0.4.0 causal kernel.
     """
     if head_dim not in _KERNEL_HEAD_DIMS:
         raise ValueError(
             f"head_dim must be one of {_KERNEL_HEAD_DIMS}, got {head_dim}"
         )
-    if flip_causal and not causal:
-        raise ValueError("flip_causal is only meaningful with causal=True")
-    if drop_diagonal and not causal:
-        raise ValueError("drop_diagonal is only meaningful with causal=True")
-    if drop_diagonal and flip_causal:
-        raise ValueError("drop_diagonal and flip_causal are mutually exclusive perturbations")
+    _validate_fwd_predicate_flags(
+        causal=causal, flip_causal=flip_causal, drop_diagonal=drop_diagonal,
+        packed=packed, flip_segments=flip_segments,
+    )
     if not causal:
         keep = "true"
     elif flip_causal:
@@ -129,7 +162,15 @@ def build_fwd_source(
         keep = "kk < row"
     else:
         keep = "kk <= row"
-    return _FWD_TEMPLATE.replace("HEAD_DIM", str(head_dim)).replace("KEEP_CMP", keep)
+    src = _FWD_TEMPLATE
+    if packed:
+        eq = "!=" if flip_segments else "=="
+        keep = f"(({keep}) && (seg_id[seg_off + kk] {eq} seg_id[seg_off + row]))"
+        src = src.replace(
+            "    for (uint kk = 0; kk < n; ++kk) {",
+            "    uint seg_off = b * n;\n    for (uint kk = 0; kk < n; ++kk) {",
+        )
+    return src.replace("HEAD_DIM", str(head_dim)).replace("KEEP_CMP", keep)
 
 
 # ---------------------------------------------------------------------------------------
@@ -436,6 +477,7 @@ def build_fwd_mma_source(
     head_dim: int, *, causal: bool = True, flip_causal: bool = False,
     drop_diagonal: bool = False,
     d_slab: int | None = None,
+    packed: bool = False, flip_segments: bool = False,
 ) -> str:
     """MSL function body for the 4x4 simdgroup-matrix (MMA) flash-attention forward (O + L).
 
@@ -451,17 +493,26 @@ def build_fwd_mma_source(
     run FAILS. `d_slab` (a multiple of 8 dividing `head_dim`) overrides the shipped
     `_FWD_MMA_D_SLAB` -- used by the regpressure probe to sweep candidate slab widths; the
     launcher always uses the default.
+
+    `packed=True` (0.4.0, requires `causal=True`) is the block-diagonal-segment twin of
+    `build_fwd_source`'s packed variant: the in-tile keep predicate (all four KEEP_CMP sites)
+    gains a same-segment equality `seg_id[seg_off + kk] == seg_id[seg_off + row]`, AND the KV
+    block loop starts at `kv_lo = floor(seg_start[first row of block] / 32) * 32` instead of 0
+    -- `seg_start` is non-decreasing per row, so the block's first row carries the block's
+    segment-start minimum and every KV block below `kv_lo` is entirely earlier segments (masked
+    for every row in the block); later-segment rows sharing the block still mask their own
+    earlier keys via the per-key predicate. `flip_segments` is TEST-ONLY (requires `packed`) --
+    inverts ONLY the equality to `!=`. `packed=False` (the default) leaves the emitted MSL
+    BYTE-IDENTICAL to the pre-0.4.0 causal kernel.
     """
     if head_dim not in _KERNEL_HEAD_DIMS:
         raise ValueError(
             f"head_dim must be one of {_KERNEL_HEAD_DIMS}, got {head_dim}"
         )
-    if flip_causal and not causal:
-        raise ValueError("flip_causal is only meaningful with causal=True")
-    if drop_diagonal and not causal:
-        raise ValueError("drop_diagonal is only meaningful with causal=True")
-    if drop_diagonal and flip_causal:
-        raise ValueError("drop_diagonal and flip_causal are mutually exclusive perturbations")
+    _validate_fwd_predicate_flags(
+        causal=causal, flip_causal=flip_causal, drop_diagonal=drop_diagonal,
+        packed=packed, flip_segments=flip_segments,
+    )
     slab = _FWD_MMA_D_SLAB if d_slab is None else d_slab
     if slab <= 0 or slab % 8 != 0 or head_dim % slab != 0:
         raise ValueError(
@@ -479,8 +530,39 @@ def build_fwd_mma_source(
     else:
         keep = "kk <= row"
         kv_limit = "metal::min(n, r0 + block_base + 32u)"
+    src = _FWD_MMA_TEMPLATE
+    if packed:
+        eq = "!=" if flip_segments else "=="
+        keep = f"(({keep}) && (seg_id[seg_off + kk] {eq} seg_id[seg_off + row]))"
+        # Empty-block NaN guard (packed-only, so the causal MSL stays byte-identical). Segment
+        # masking can leave a row's LEADING KV blocks fully masked (bm stays -INFINITY) before
+        # its own segment's diagonal key arrives -- and with no prior key m[rt] is also
+        # -INFINITY, so the unguarded `exp(m - m_new)` computes exp(-inf - -inf) = exp(NaN).
+        # When m_new is -INFINITY nothing has been accumulated yet (l == 0, C_o == 0), so a
+        # rescale of 1.0 is the identity; the diagonal key (same segment, kk == row) is always
+        # kept, so a real row's l ends > 0. The scalar body avoids this by `continue`-ing masked
+        # keys (its first kept key does exp(-inf - score) = 0); the MMA reduces whole blocks.
+        src = src.replace(
+            "alpha[rt] = metal::exp(m[rt] - m_new[rt]);",
+            "alpha[rt] = (m_new[rt] == -INFINITY) ? 1.0f : metal::exp(m[rt] - m_new[rt]);",
+        )
+        # Declare seg_off + the per-block KV lower bound once, right after kv_limit and before
+        # the D-slab OUTER loop (kv_lo is slab-independent). The block's first row is provably
+        # < n (the grid never dispatches a block whose first row is past n), but clamp to n-1
+        # anyway, matching the qh over-hang idiom.
+        src = src.replace(
+            "    uint kv_limit = KV_LIMIT;",
+            "    uint kv_limit = KV_LIMIT;\n"
+            "    uint seg_off = b * n;\n"
+            "    uint kv_lo = "
+            "(seg_start[seg_off + metal::min(r0 + block_base, n - 1)] / 32u) * 32u;",
+        )
+        src = src.replace(
+            "for (uint kb0 = 0; kb0 < kv_limit; kb0 += 32) {",
+            "for (uint kb0 = kv_lo; kb0 < kv_limit; kb0 += 32) {",
+        )
     return (
-        _FWD_MMA_TEMPLATE.replace("HEAD_DIM", str(head_dim))
+        src.replace("HEAD_DIM", str(head_dim))
         .replace("D_SLAB_TILES", str(slab // 8))
         .replace("D_SLAB", str(slab))
         .replace("KV_LIMIT", kv_limit)
