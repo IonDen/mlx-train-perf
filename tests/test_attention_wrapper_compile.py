@@ -239,12 +239,29 @@ def test_gc_peak_parity_manual_walk_matches_stock_walk() -> None:
 
     block = model.model.layers[0]
     original_call = type(block).__call__
+    # Guard: this probe must own the ONLY grad_checkpoint patch on TransformerBlock (gotcha
+    # 13 -- the patch mutates the CLASS and never reverts; test_worker_train_step.py's
+    # `_tiny_llama()` builds the same `mlx_lm.models.llama.Model`, so a prior in-process
+    # `grad_checkpoint()` call there patches the SAME shared `llama.TransformerBlock.__call__`
+    # this probe is about to patch). A stacked second patch nests checkpointing and lands the
+    # measured ratio in the ~1.25 nested regime with a confusing cause -- collection order
+    # (this file sorts before test_worker_train_step.py) is not a contract, so assert instead.
+    # Discriminator verified against the installed source: mlx_lm's `grad_checkpoint`
+    # (.venv/lib/python3.13/site-packages/mlx_lm/tuner/trainer.py:25-38) replaces
+    # `type(layer).__call__` with an inner closure named `checkpointed_fn`; the pristine
+    # `llama.TransformerBlock.__call__` (mlx_lm/models/llama.py:138) has `__name__ ==
+    # "__call__"`, so "checkpoint" only ever appears in the patched name.
+    assert "checkpoint" not in original_call.__name__, (
+        "TransformerBlock.__call__ is already grad_checkpoint-patched by an earlier test "
+        f"(current __call__.__name__ = {original_call.__name__!r}); probe 4's peak comparison "
+        "would measure nested checkpointing instead of a single clean patch"
+    )
     grad_checkpoint(block)  # applied ONCE; both arms measured under this single class patch
     mx.eval(model.parameters())
-    saved = tree_map(mx.array,model.parameters())
+    saved = tree_map(mx.array, model.parameters())
 
     def peak_of(fn: object) -> int:
-        model.update(tree_map(mx.array,saved))  # restore concrete params
+        model.update(tree_map(mx.array, saved))  # restore concrete params
         mx.eval(model.parameters())
         grad_fn = mx.compile(mx.grad(fn))  # type: ignore[arg-type]
         warm = grad_fn(emb)
