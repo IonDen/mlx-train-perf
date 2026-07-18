@@ -228,9 +228,10 @@ def test_enable_prewarms_rate_caches_no_calibration_in_compiled_trace() -> None:
     fwd_tile = select_fwd_tile(n, _HEAD_DIM)
     dq_tile, dkv_tile = select_bwd_tiles(n, _HEAD_DIM)
     nb = _n_bucket(n)
-    fkey = (_HEAD_DIM, str(dtype), True, b, hq, nb, fwd_tile.variant, fwd_tile.d_slab)
-    dqkey = (_HEAD_DIM, str(dtype), True, b, hq, nb, dq_tile.variant, dq_tile.d_slab)
-    dkvkey = (_HEAD_DIM, str(dtype), True, b, hq, nb, dkv_tile.variant, dkv_tile.d_slab)
+    # key tail gains a trailing `packed` bool (0.4.0); enable pre-warms the non-packed path.
+    fkey = (_HEAD_DIM, str(dtype), True, b, hq, nb, fwd_tile.variant, fwd_tile.d_slab, False)
+    dqkey = (_HEAD_DIM, str(dtype), True, b, hq, nb, dq_tile.variant, dq_tile.d_slab, False)
+    dkvkey = (_HEAD_DIM, str(dtype), True, b, hq, nb, dkv_tile.variant, dkv_tile.d_slab, False)
     for cache, key in (
         (_FWD_RATE_CACHE, fkey), (_BWD_DQ_RATE_CACHE, dqkey), (_BWD_DKV_RATE_CACHE, dkvkey)
     ):

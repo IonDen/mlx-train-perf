@@ -1590,58 +1590,64 @@ def _fake_kernel(
     ]
 
 
+@pytest.mark.parametrize("packed", [False, True], ids=["causal", "packed"])
 def test_calibrated_bwd_dq_rate_probes_the_selected_variant_and_d_slab(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, packed: bool
 ) -> None:
     """Probe-what-you-rate for dQ: `calibrated_bwd_dq_rate`'s `measure()` must build the SAME
-    (variant, d_slab) dQ kernel the launcher will dispatch -- rating one variant while
+    (variant, d_slab, packed) dQ kernel the launcher will dispatch -- rating one variant while
     dispatching another sizes the query-row split from the wrong rate. Spies on `_bwd_dq_kernel`
-    (the construction seam) with a Metal-free fake and asserts the recorded (variant, d_slab)
-    matches the `tile` passed in."""
+    (the construction seam) with a Metal-free fake and asserts the recorded (variant, d_slab,
+    packed) matches what the caller selected. The `packed` arm (0.4.0) proves a packed-keyed
+    dQ rate builds the PACKED dQ kernel."""
     monkeypatch.setattr(bwd_launch, "_BWD_DQ_RATE_CACHE", {})
-    calls: list[tuple[str, int | None]] = []
+    calls: list[tuple[str, int | None, bool]] = []
 
     def fake_dq_kernel(
         head_dim: int, causal: bool, flip_causal: bool, variant: str,  # noqa: ARG001
-        d_slab: int | None,
+        d_slab: int | None, packed: bool = False,
     ) -> object:
-        calls.append((variant, d_slab))
+        calls.append((variant, d_slab, packed))
         return _fake_kernel
 
     monkeypatch.setattr(bwd_launch, "_bwd_dq_kernel", fake_dq_kernel)
     bwd_launch.calibrated_bwd_dq_rate(
         head_dim=64, dtype=mx.float32, b=1, hq=4, hkv=4, n=256, causal=True,
-        tile=TileShape(variant="mma", d_slab=64),
+        tile=TileShape(variant="mma", d_slab=64), packed=packed,
     )
 
-    assert calls == [("mma", 64)], (
-        f"dQ calibration built {calls}, but the caller selected variant='mma' d_slab=64"
+    assert calls == [("mma", 64, packed)], (
+        f"dQ calibration built {calls}, but the caller selected variant='mma' d_slab=64 "
+        f"packed={packed}"
     )
 
 
+@pytest.mark.parametrize("packed", [False, True], ids=["causal", "packed"])
 def test_calibrated_bwd_dkv_rate_probes_the_selected_variant_and_d_slab(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, packed: bool
 ) -> None:
     """Probe-what-you-rate for dK/dV: `calibrated_bwd_dkv_rate`'s `measure()` must build the
-    SAME (variant, d_slab) dK/dV kernel the launcher will dispatch (mirrors the dQ test)."""
+    SAME (variant, d_slab, packed) dK/dV kernel the launcher will dispatch (mirrors the dQ
+    test). The `packed` arm (0.4.0) proves a packed-keyed dK/dV rate builds the PACKED kernel."""
     monkeypatch.setattr(bwd_launch, "_BWD_DKV_RATE_CACHE", {})
-    calls: list[tuple[str, int | None]] = []
+    calls: list[tuple[str, int | None, bool]] = []
 
     def fake_dkv_kernel(
         head_dim: int, causal: bool, flip_causal: bool, variant: str,  # noqa: ARG001
-        d_slab: int | None,
+        d_slab: int | None, packed: bool = False,
     ) -> object:
-        calls.append((variant, d_slab))
+        calls.append((variant, d_slab, packed))
         return _fake_kernel
 
     monkeypatch.setattr(bwd_launch, "_bwd_dkv_kernel", fake_dkv_kernel)
     bwd_launch.calibrated_bwd_dkv_rate(
         head_dim=64, dtype=mx.float32, b=1, hq=4, hkv=4, n=256, causal=True,
-        tile=TileShape(variant="mma", d_slab=64),
+        tile=TileShape(variant="mma", d_slab=64), packed=packed,
     )
 
-    assert calls == [("mma", 64)], (
-        f"dK/dV calibration built {calls}, but the caller selected variant='mma' d_slab=64"
+    assert calls == [("mma", 64, packed)], (
+        f"dK/dV calibration built {calls}, but the caller selected variant='mma' d_slab=64 "
+        f"packed={packed}"
     )
 
 
@@ -1663,7 +1669,8 @@ def test_bwd_dq_rate_cache_key_separates_by_variant_and_d_slab(
 
     keys = list(bwd_launch._BWD_DQ_RATE_CACHE)
     assert len(keys) == 2                          # two distinct cache entries, not one collision
-    assert {k[-2:] for k in keys} == {("mma", 64), ("mma", 128)}   # keyed on (variant, d_slab)
+    # key tail is (variant, d_slab, packed); both entries are non-packed here.
+    assert {k[-3:] for k in keys} == {("mma", 64, False), ("mma", 128, False)}
 
 
 def test_bwd_dq_and_dkv_rates_use_independent_caches(
@@ -1680,14 +1687,14 @@ def test_bwd_dq_and_dkv_rates_use_independent_caches(
 
     def fake_dq_kernel(
         head_dim: int, causal: bool, flip_causal: bool, variant: str,  # noqa: ARG001
-        d_slab: int | None,
+        d_slab: int | None, packed: bool = False,  # noqa: ARG001
     ) -> object:
         dq_built.append((variant, d_slab))
         return _fake_kernel
 
     def fake_dkv_kernel(
         head_dim: int, causal: bool, flip_causal: bool, variant: str,  # noqa: ARG001
-        d_slab: int | None,
+        d_slab: int | None, packed: bool = False,  # noqa: ARG001
     ) -> object:
         dkv_built.append((variant, d_slab))
         return _fake_kernel

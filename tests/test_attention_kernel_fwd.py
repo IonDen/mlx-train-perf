@@ -1055,17 +1055,20 @@ def test_fwd_kernel_cache_key_separates_by_d_slab(monkeypatch: pytest.MonkeyPatc
         fwd_launch._fwd_kernel.cache_clear()
 
 
+@pytest.mark.parametrize("packed", [False, True], ids=["causal", "packed"])
 def test_calibrated_fwd_rate_probes_the_selected_variant_and_d_slab(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, packed: bool
 ) -> None:
     """Finding (T6 rung 3): before this fix, `calibrated_fwd_rate`'s `measure()` always built
     the SCALAR kernel regardless of the caller's `tile` -- rating the scalar kernel while the
     launcher dispatches mma sizes the query-row split from the WRONG rate. Spies on
     `_fwd_kernel` (the kernel-construction seam) with a fake that fabricates zero-cost output
     arrays instead of touching Metal, so this stays in the DEFAULT lane, and asserts the
-    recorded (variant, d_slab) matches the `tile` passed in -- probe what you rate."""
+    recorded (variant, d_slab, packed) matches what the caller selected -- probe what you rate.
+    The `packed` arm (0.4.0) proves a packed-keyed rate builds the PACKED kernel, so the
+    single-segment probe dispatched is the packed kernel the launcher will run."""
     monkeypatch.setattr(fwd_launch, "_FWD_RATE_CACHE", {})
-    calls: list[tuple[str, int | None]] = []
+    calls: list[tuple[str, int | None, bool]] = []
 
     def fake_kernel(
         *, inputs: list[mx.array], template: list[tuple[str, mx.Dtype]],  # noqa: ARG001
@@ -1079,20 +1082,21 @@ def test_calibrated_fwd_rate_probes_the_selected_variant_and_d_slab(
 
     def fake_fwd_kernel(
         head_dim: int, causal: bool, flip_causal: bool, variant: str,  # noqa: ARG001
-        d_slab: int | None,
+        d_slab: int | None, packed: bool = False,
     ) -> object:
-        calls.append((variant, d_slab))
+        calls.append((variant, d_slab, packed))
         return fake_kernel
 
     monkeypatch.setattr(fwd_launch, "_fwd_kernel", fake_fwd_kernel)
     tile = TileShape(variant="mma", d_slab=64)
     fwd_launch.calibrated_fwd_rate(
         head_dim=64, dtype=mx.float32, b=1, hq=4, hkv=4, n=256, causal=True, tile=tile,
+        packed=packed,
     )
 
-    assert calls == [("mma", 64)], (
-        f"calibration built {calls}, but the caller selected variant='mma' d_slab=64 -- "
-        "measure() must probe the SAME kernel the launcher will dispatch"
+    assert calls == [("mma", 64, packed)], (
+        f"calibration built {calls}, but the caller selected variant='mma' d_slab=64 "
+        f"packed={packed} -- measure() must probe the SAME kernel the launcher will dispatch"
     )
 
 

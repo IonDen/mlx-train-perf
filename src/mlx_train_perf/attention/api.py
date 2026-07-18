@@ -72,14 +72,25 @@ def _validate_shapes(q: mx.array, k: mx.array, v: mx.array) -> None:
 
 
 def resolve_attention_impl(
-    q: mx.array, k: mx.array, v: mx.array, *, impl: str, causal: bool = True
+    q: mx.array, k: mx.array, v: mx.array, *, impl: str, causal: bool = True,
+    segments: PackedMask | None = None,
 ) -> str:
-    """"reference" is always allowed (the oracle). "auto"/"kernel" run the full
-    kernel-support gate (dtype, head_dim, causal, Metal availability, mlx-verified) and,
-    when every gate passes, resolve to "kernel". An
+    """"reference" is always allowed (the oracle, and it serves `segments=` at small N).
+    "auto"/"kernel" run the full kernel-support gate (dtype, head_dim, causal, Metal
+    availability, mlx-verified) and, when every gate passes, resolve to "kernel". An
     unsupported dtype/head_dim/causal/device raises `UnsupportedAttentionError` with a
-    pointer to impl="reference"; there is no silent fallback."""
+    pointer to impl="reference"; there is no silent fallback.
+
+    `segments` (packed block-diagonal-causal attention) requires `causal=True` for EVERY impl
+    -- packing composes on top of the causal triangle -- so a `segments=` + `causal=False` call
+    is refused here (before the reference oracle's own assert or the kernel causal gate would
+    fire), consistent with the other kernel-support refusals."""
     _validate_shapes(q, k, v)
+    if segments is not None and not causal:
+        raise UnsupportedAttentionError(
+            "segments (packed attention) require causal=True (got causal=False); "
+            "packing composes on top of the causal triangle."
+        )
     if impl == "reference":
         return "reference"
     if impl not in ("auto", "kernel"):
@@ -182,9 +193,94 @@ def _flash_attention_backward(
     return d_q.astype(q.dtype), d_k.astype(k.dtype), d_v.astype(v.dtype)
 
 
+def _flash_attention_packed(
+    q: mx.array, k: mx.array, v: mx.array, *,
+    seg_id: mx.array, seg_start: mx.array,
+    scale: float, causal: bool, resolved: str, tile: TileShape, rate: float | None,
+    dq_tile: TileShape, dq_rate: float | None, dkv_tile: TileShape, dkv_rate: float | None,
+) -> mx.array:
+    """The PACKED (`segments`) branch of `flash_attention`: a 5-primal custom_function
+    `_core(q, k, v, seg_id, seg_start)` so the two int32 segment buffers are custom_function
+    PRIMALS -- threaded and re-read every step, never closure captures. A captured layout would
+    freeze into a compiled trace (spec 8.3 / review F2, the residual-`L` footgun this module's
+    docstring documents), so the forward AND backward read the seg PRIMALS (`seg_id_`/
+    `seg_start_`), never this function's closure args -- a re-fed layout masks fresh.
+
+    The vjp returns int-dtype ZERO cotangents for the two segment primals: SETTLED (mlx 0.32.0,
+    plan-review empirical probe, verified eager + compiled) that int zeros / float zeros / None /
+    omission produce identical grads; int zeros chosen for clarity (re-confirmed by
+    tests/test_attention_api.py::test_int_primal_vjp_int_zero_cotangent_matches_autodiff). Kernel
+    vs reference oracle selected by `resolved`; rates/tiles are resolved once by the caller and
+    closure-captured, mirroring the non-packed `_core`/`_core_vjp`."""
+
+    @mx.custom_function
+    def _core(
+        q_: mx.array, k_: mx.array, v_: mx.array,
+        seg_id_: mx.array, seg_start_: mx.array,
+    ) -> tuple[mx.array, mx.array]:
+        if resolved == "kernel":
+            return launch_flash_fwd(
+                q_, k_, v_, scale=scale, causal=causal, tile=tile, rate_macs_per_s=rate,
+                seg_id=seg_id_, seg_start=seg_start_,
+            )
+        return flash_attention_reference(
+            q_, k_, v_, scale=scale, causal=causal,
+            segments=PackedMask(seg_id=seg_id_, seg_start=seg_start_),
+        )
+
+    @_core.vjp
+    def _core_vjp(
+        primals: tuple[mx.array, mx.array, mx.array, mx.array, mx.array],
+        cotangents: tuple[mx.array, mx.array],
+        outputs: tuple[mx.array, mx.array],
+    ) -> tuple[mx.array, mx.array, mx.array, mx.array, mx.array]:
+        VJP_CALLS["flash_attention"] = VJP_CALLS.get("flash_attention", 0) + 1
+        q_, k_, v_, seg_id_, seg_start_ = primals
+        d_o, _d_l = cotangents  # L's cotangent is always zero -- see the module docstring
+        o_, lse_ = outputs
+        # seg_id/seg_start are int routing primals with no gradient -> zero cotangents (int-dtype;
+        # see the function docstring for the settled contract).
+        seg_id_ct = mx.zeros(seg_id_.shape, dtype=seg_id_.dtype)
+        seg_start_ct = mx.zeros(seg_start_.shape, dtype=seg_start_.dtype)
+        if resolved == "kernel":
+            # Fully kernel-backed packed backward: same D + dQ + chained dK/dV as the causal path,
+            # with the seg PRIMALS threaded into both launchers (never closure-captured). The
+            # counter proves this kernel branch fired vs the pure-MLX oracle (parity can't tell).
+            VJP_CALLS["flash_attention_kernel_bwd"] = (
+                VJP_CALLS.get("flash_attention_kernel_bwd", 0) + 1
+            )
+            d_arr = launch_bwd_D(d_o, o_)
+            d_q = launch_bwd_dq(
+                q_, k_, v_, d_o, lse_, d_arr, scale=scale, causal=causal,
+                rate_macs_per_s=dq_rate, variant=dq_tile.variant, d_slab=dq_tile.d_slab,
+                seg_id=seg_id_, seg_start=seg_start_,
+            )
+            d_k, d_v = launch_bwd_dkv(
+                q_, k_, v_, d_o, lse_, d_arr, scale=scale, causal=causal,
+                rate_macs_per_s=dkv_rate, variant=dkv_tile.variant, d_slab=dkv_tile.d_slab,
+                seg_id=seg_id_, seg_start=seg_start_,
+            )
+            return d_q, d_k, d_v, seg_id_ct, seg_start_ct
+        d_q, d_k, d_v = _flash_attention_backward(
+            q_, k_, v_, o_, lse_, d_o, scale=scale, causal=causal,
+            segments=PackedMask(seg_id=seg_id_, seg_start=seg_start_),
+        )
+        return d_q, d_k, d_v, seg_id_ct, seg_start_ct
+
+    core_fn = cast(
+        Callable[
+            [mx.array, mx.array, mx.array, mx.array, mx.array], tuple[mx.array, mx.array]
+        ],
+        _core,
+    )
+    o, _ = core_fn(q, k, v, seg_id, seg_start)
+    return o
+
+
 def flash_attention(
     q: mx.array, k: mx.array, v: mx.array, *, scale: float, causal: bool = True,
     impl: Literal["auto", "kernel", "reference"] = "auto",
+    segments: PackedMask | None = None,
 ) -> mx.array:
     """`softmax(scale * Q K^T + causal_mask) @ V`, GQA via the pinned contiguous
     convention. `impl='auto'`/`'kernel'` route the FORWARD through the Metal kernel
@@ -193,8 +289,16 @@ def flash_attention(
     either pass; the two per-kernel backward split rates are calibrated at construction and
     closure-captured.
     `impl='reference'` is the oracle (never a production path): its backward materializes the
-    full (N, N) score/probability matrices, so every caller must fence it to tiny N."""
-    resolved = resolve_attention_impl(q, k, v, impl=impl, causal=causal)
+    full (N, N) score/probability matrices, so every caller must fence it to tiny N.
+
+    `segments` (0.4.0, requires `causal=True`) switches on PACKED block-diagonal-causal
+    attention -- key j reaches query i iff same segment AND j <= i. When given, the rates are
+    keyed `packed=True` ("probe what you rate") and `seg_id`/`seg_start` are threaded as
+    `custom_function` PRIMALS, never closure captures: they vary per training step, so a closure
+    capture would freeze one step's packing into a compiled trace (the residual-`L` footgun this
+    module's docstring documents). `segments=None` is byte-for-byte today's causal path."""
+    packed = segments is not None
+    resolved = resolve_attention_impl(q, k, v, impl=impl, causal=causal, segments=segments)
 
     if resolved == "kernel":
         # Select the forward tile AND the two backward tiles (dQ, dK/dV) from the measured
@@ -205,20 +309,21 @@ def flash_attention(
         # occupancy regime, so a compiled caller re-probes only on the first trace. The backward
         # rates are split PER KERNEL (T9b Step 3): the dQ and dK/dV throughputs differ measurably
         # (2.35x at scalar), so each split is sized by its own kernel's measured rate -- no
-        # cross-kernel assumption. Rates are never measured inside the vjp.
+        # cross-kernel assumption. `packed` keys each rate to its own kernel identity (a packed
+        # dispatch never reads a causal-measured rate). Rates are never measured inside the vjp.
         tile = select_fwd_tile(q.shape[2], q.shape[-1])
         rate = calibrated_fwd_rate(
             head_dim=q.shape[-1], dtype=q.dtype, b=q.shape[0], hq=q.shape[1],
-            hkv=k.shape[1], n=q.shape[2], causal=causal, tile=tile,
+            hkv=k.shape[1], n=q.shape[2], causal=causal, tile=tile, packed=packed,
         )
         dq_tile, dkv_tile = select_bwd_tiles(q.shape[2], q.shape[-1])
         dq_rate: float | None = calibrated_bwd_dq_rate(
             head_dim=q.shape[-1], dtype=q.dtype, b=q.shape[0], hq=q.shape[1],
-            hkv=k.shape[1], n=q.shape[2], causal=causal, tile=dq_tile,
+            hkv=k.shape[1], n=q.shape[2], causal=causal, tile=dq_tile, packed=packed,
         )
         dkv_rate: float | None = calibrated_bwd_dkv_rate(
             head_dim=q.shape[-1], dtype=q.dtype, b=q.shape[0], hq=q.shape[1],
-            hkv=k.shape[1], n=q.shape[2], causal=causal, tile=dkv_tile,
+            hkv=k.shape[1], n=q.shape[2], causal=causal, tile=dkv_tile, packed=packed,
         )
     else:
         tile = TileShape()
@@ -226,6 +331,13 @@ def flash_attention(
         dq_tile = dkv_tile = TileShape()
         dq_rate = None
         dkv_rate = None
+
+    if segments is not None:  # == `packed`; the `is not None` form narrows the type for mypy
+        return _flash_attention_packed(
+            q, k, v, seg_id=segments.seg_id, seg_start=segments.seg_start,
+            scale=scale, causal=causal, resolved=resolved, tile=tile, rate=rate,
+            dq_tile=dq_tile, dq_rate=dq_rate, dkv_tile=dkv_tile, dkv_rate=dkv_rate,
+        )
 
     @mx.custom_function
     def _core(q_: mx.array, k_: mx.array, v_: mx.array) -> tuple[mx.array, mx.array]:
