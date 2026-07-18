@@ -32,7 +32,7 @@ def pack_indices(
             if room[j] >= cost:
                 packs[j].append(i)
                 room[j] -= cost
-                if room[j] <= 1:  # can't fit even a 1-token sequence
+                if room[j] <= 1:  # room <= 1 slot: 1-token seq costs 2 (token + separator)
                     open_packs.remove(j)
                 break
         else:

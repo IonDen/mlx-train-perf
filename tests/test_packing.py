@@ -50,6 +50,28 @@ def test_pack_stats_hand_computed_with_truncation() -> None:
     assert stats.tail_pad_fraction == pytest.approx(7 / 20)  # 22 full cap - 15 used
 
 
+def test_pack_stats_hand_computed_multi_sequence_pack() -> None:
+    # pack_len=12 -> capacity 13/pack. Pack 0 holds TWO sequences (costs 6+5=11 <=
+    # 13); pack 1 holds one (cost 10 <= 13). separators=3 but len(packs)=2, so this
+    # fixture -- unlike the singleton-pack fixture above -- distinguishes a
+    # per-sequence separator count from a (degenerately equal) per-pack count.
+    lengths = [5, 4, 9]
+    packs = [[0, 1], [2]]
+    stats = pack_stats(packs, lengths, 12)
+    assert stats.real_tokens == 18  # 5 + 4 + 9, none truncated
+    assert stats.capacity_tokens == 24  # len(packs) * pack_len
+    assert stats.utilization == pytest.approx(18 / 24)
+    assert stats.separator_fraction == pytest.approx(3 / 24)  # 3 seqs, not 2 packs
+    assert stats.tail_pad_fraction == pytest.approx(5 / 24)  # 2*13 - 18 - 3
+
+
+def test_pack_stats_refusals() -> None:
+    with pytest.raises(PackingError):
+        pack_stats([], [], 5)
+    with pytest.raises(PackingError):
+        pack_stats([[0]], [5], 0)
+
+
 @given(st.lists(st.integers(1, 300), min_size=1, max_size=200),
        st.integers(0, 3), st.integers(0, 2), st.integers(1, 1024))
 def test_pack_stats_accounting_identity(lengths, seed, epoch, pack_len):
@@ -60,10 +82,21 @@ def test_pack_stats_accounting_identity(lengths, seed, epoch, pack_len):
     # packs, capacity is len(packs) * (pack_len + 1) == capacity_tokens + len(packs).
     packs = pack_indices(lengths, pack_len, seed=seed, epoch=epoch)
     stats = pack_stats(packs, lengths, pack_len)
-    separators = len(lengths)  # every sequence placed exactly once
-    total_full_capacity = len(packs) * (pack_len + 1)
-    tail_pad = total_full_capacity - stats.real_tokens - separators
-    assert stats.tail_pad_fraction == pytest.approx(tail_pad / stats.capacity_tokens)
-    lhs = (stats.real_tokens + separators + tail_pad)
+
+    # Expected values computed INDEPENDENTLY from lengths + packs (every sequence is
+    # placed exactly once) -- not solved backward from `stats.real_tokens`, which
+    # would make the final identity assert a tautology for any real_tokens value.
+    expected_real = sum(min(lengths[i], pack_len) for pack in packs for i in pack)
+    expected_separators = sum(len(pack) for pack in packs)
+    capacity_tokens = len(packs) * pack_len
+    expected_tail = len(packs) * (pack_len + 1) - expected_real - expected_separators
+
+    assert stats.real_tokens == expected_real
+    assert stats.capacity_tokens == capacity_tokens
+    assert stats.separator_fraction == pytest.approx(expected_separators / capacity_tokens)
+    assert stats.tail_pad_fraction == pytest.approx(expected_tail / capacity_tokens)
+
+    # The identity now falls out of the independently-pinned fields above.
+    lhs = stats.real_tokens + expected_separators + expected_tail
     rhs = stats.capacity_tokens + len(packs)
     assert lhs == rhs
