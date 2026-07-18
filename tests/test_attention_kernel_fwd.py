@@ -820,6 +820,37 @@ def test_fwd_single_segment_packed_matches_causal_bitwise(variant: str) -> None:
     assert mx.array_equal(l_c, l_p).item(), "single-segment packed L != causal L"
 
 
+@pytest.mark.benchmark
+@pytest.mark.metal
+def test_fwd_packed_parity_8k_bucket() -> None:
+    """Gate-A §9a anchor: packed forward parity vs the block-diagonal oracle at the 8k
+    dispatch bucket (the occupancy-saturation regime tile shapes are judged at), bf16,
+    4 segments with non-32-aligned boundaries. The oracle materializes the (N, N) score
+    matrix (~1 GiB fp32 at this shape) — benchmark-gated, never in the default/metal lanes.
+    Gate-A measured (2026-07-18, mlx 0.32.0, M1 Max, seed=42): O 9.766e-4, L 1.907e-6 —
+    inside the packed-grid pins reused here (`_artifacts/gate_packed/parity8k.json`)."""
+    b, hq, hkv, n, d = 1, 4, 2, 8192, 128
+    scale = 1.0 / math.sqrt(d)
+    q, k, v = _rand_qkv(b=b, hq=hq, hkv=hkv, n=n, d=d, dtype=mx.bfloat16, seed=42)
+    seg_id, seg_start = _packed_layout([2000, 1500, 2600, 2092], b)
+    pm = PackedMask(seg_id=seg_id, seg_start=seg_start)
+
+    tile = select_fwd_tile(n, d)
+    o_k, l_k = launch_flash_fwd(
+        q, k, v, scale=scale, causal=True, tile=tile,
+        rate_macs_per_s=GENEROUS_RATE, seg_id=seg_id, seg_start=seg_start,
+    )
+    o_ref, l_ref = flash_attention_reference(q, k, v, scale=scale, causal=True, segments=pm)
+    mx.eval(o_k, l_k, o_ref, l_ref)
+
+    f = mx.float32
+    d_o = mx.abs(o_k.astype(f) - o_ref.astype(f)).max().item()
+    d_l = mx.abs(l_k - l_ref).max().item()
+    print(f"[packed 8k {tile.variant}] O={d_o:.3e} L={d_l:.3e}")
+    assert d_o < _TOL_PACKED_O[tile.variant][mx.bfloat16], f"packed 8k O diff {d_o}"
+    assert d_l < _TOL_PACKED_L[tile.variant][mx.bfloat16], f"packed 8k L diff {d_l}"
+
+
 @pytest.mark.metal
 @pytest.mark.parametrize("variant", ["scalar", "mma"])
 def test_fwd_packed_flip_segments_breaks_parity(variant: str) -> None:
