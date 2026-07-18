@@ -25,6 +25,7 @@ from mlx_train_perf._compat import check_mlx_verified
 from mlx_train_perf.attention.kernel.dispatch import select_bwd_tiles, select_fwd_tile
 from mlx_train_perf.attention.kernel.launch import (
     TileShape,
+    _n_bucket,
     calibrated_bwd_dkv_rate,
     calibrated_bwd_dq_rate,
     calibrated_fwd_rate,
@@ -312,19 +313,46 @@ def flash_attention(
         # cross-kernel assumption. `packed` keys each rate to its own kernel identity (a packed
         # dispatch never reads a causal-measured rate). Rates are never measured inside the vjp.
         tile = select_fwd_tile(q.shape[2], q.shape[-1])
-        rate = calibrated_fwd_rate(
-            head_dim=q.shape[-1], dtype=q.dtype, b=q.shape[0], hq=q.shape[1],
-            hkv=k.shape[1], n=q.shape[2], causal=causal, tile=tile, packed=packed,
-        )
         dq_tile, dkv_tile = select_bwd_tiles(q.shape[2], q.shape[-1])
-        dq_rate: float | None = calibrated_bwd_dq_rate(
-            head_dim=q.shape[-1], dtype=q.dtype, b=q.shape[0], hq=q.shape[1],
-            hkv=k.shape[1], n=q.shape[2], causal=causal, tile=dq_tile, packed=packed,
-        )
-        dkv_rate: float | None = calibrated_bwd_dkv_rate(
-            head_dim=q.shape[-1], dtype=q.dtype, b=q.shape[0], hq=q.shape[1],
-            hkv=k.shape[1], n=q.shape[2], causal=causal, tile=dkv_tile, packed=packed,
-        )
+        # EXACT-SHAPE CONTRACT (0.4.0 / T6). The three rate calibrations host-sync (timing).
+        # They probe with DETACHED arrays, so eager AND compiled-trace calibration both run
+        # fine: mlx 0.32.0 allows `mx.eval` of detached constants inside a transform -- only
+        # eval of a TRACED array raises "[eval] Attempting to eval an array during function
+        # transformations" (verified mlx 0.32.0). So a cold cache under a compiled
+        # `train()` does NOT crash: it runs a one-time in-region calibration (a first-step
+        # host-sync stall), then caches. The seq_len/batch_size hints to enable_flash_attention
+        # pre-warm the caches to avoid that stall (the caches short-circuit before any eval on
+        # every later step). This ONE try/except covers both the packed and non-packed paths
+        # (the same three calls feed both).
+        #
+        # DEFENSE-IN-DEPTH: should an in-region calibration ever host-sync on a TRACED array (a
+        # future-mlx change or a calibration refactor that probes with the real q/k/v), the
+        # opaque eval-transform ValueError is upgraded to a clear UnsupportedAttentionError
+        # naming the shape and the exact pre-warm call. Any OTHER ValueError (a genuine
+        # calibration bug) is re-raised untouched -- never masked as a cache-shape problem.
+        try:
+            rate = calibrated_fwd_rate(
+                head_dim=q.shape[-1], dtype=q.dtype, b=q.shape[0], hq=q.shape[1],
+                hkv=k.shape[1], n=q.shape[2], causal=causal, tile=tile, packed=packed,
+            )
+            dq_rate: float | None = calibrated_bwd_dq_rate(
+                head_dim=q.shape[-1], dtype=q.dtype, b=q.shape[0], hq=q.shape[1],
+                hkv=k.shape[1], n=q.shape[2], causal=causal, tile=dq_tile, packed=packed,
+            )
+            dkv_rate: float | None = calibrated_bwd_dkv_rate(
+                head_dim=q.shape[-1], dtype=q.dtype, b=q.shape[0], hq=q.shape[1],
+                hkv=k.shape[1], n=q.shape[2], causal=causal, tile=dkv_tile, packed=packed,
+            )
+        except ValueError as exc:
+            if "function transformations" not in str(exc):
+                raise  # a genuine calibration ValueError -- do not mask it as a shape problem
+            b_, nb = q.shape[0], _n_bucket(q.shape[2])
+            raise UnsupportedAttentionError(
+                f"flash-attention rate calibration host-synced on a traced array for shape "
+                f"(batch={b_}, n-bucket={nb}, packed={packed}) inside a compiled trace. "
+                "Pre-warm the caches BEFORE compiling: enable_flash_attention(model, "
+                f"{'packed=True, ' if packed else ''}seq_len={q.shape[2]}, batch_size={b_})."
+            ) from exc
     else:
         tile = TileShape()
         rate = None

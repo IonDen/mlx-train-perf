@@ -54,6 +54,7 @@ import mlx.core as mx
 from mlx import nn
 
 from mlx_train_perf.attention.api import flash_attention
+from mlx_train_perf.attention.segments import PackedMask
 from mlx_train_perf.errors import AttentionInputError, UnsupportedAttentionError
 
 _Impl = Literal["auto", "kernel", "reference"]
@@ -68,13 +69,17 @@ _SUPPORTED_FAMILIES: tuple[str, ...] = (
 _KERNEL_HEAD_DIMS: tuple[int, ...] = (64, 96, 128)
 
 
-def _resolve_causal(mask: Any) -> bool:
-    """Map an mlx-lm attention mask onto `flash_attention`'s `causal` flag, or refuse.
+def _resolve_mask(mask: Any) -> bool | PackedMask:
+    """Map an mlx-lm attention mask onto `flash_attention`'s call, or refuse.
 
     `"causal"` (the string `create_attention_mask` returns for the real N>1 training path)
-    and `None` (its N==1 return) both mean causal. An `mx.array` mask is a sliding-window or
-    additive mask this causal-only training path does not serve; any other string is
-    unrecognized. Both raise `AttentionInputError`."""
+    and `None` (its N==1 return) both mean plain causal -> `True`. A `PackedMask` (0.4.0
+    block-diagonal-causal packing) passes through untouched, to be threaded as
+    `flash_attention(segments=...)`. An `mx.array` mask is a sliding-window or additive mask
+    this causal-only training path does not serve; any other string is unrecognized. Both
+    raise `AttentionInputError`."""
+    if isinstance(mask, PackedMask):
+        return mask
     if isinstance(mask, str):
         if mask == "causal":
             return True
@@ -142,9 +147,10 @@ class FlashAttentionWrapper(nn.Module):
         queries = self.rope(queries)
         keys = self.rope(keys)
 
-        causal = _resolve_causal(mask)
+        resolved = _resolve_mask(mask)
+        segments = resolved if isinstance(resolved, PackedMask) else None
         output = flash_attention(
-            queries, keys, values, scale=self.scale, causal=causal,
+            queries, keys, values, scale=self.scale, causal=True, segments=segments,
             impl=cast(_Impl, self._impl),
         )
         output = output.transpose(0, 2, 1, 3).reshape(b, length, -1)
@@ -162,17 +168,22 @@ def _head_dim(model: Any) -> int:
 
 
 def _prewarm_rate_caches(
-    model: Any, *, impl: str, seq_len: int, batch_size: int, head_dim: int
+    model: Any, *, impl: str, seq_len: int, batch_size: int, head_dim: int, packed: bool
 ) -> None:
     """Warm `flash_attention`'s three kernel rate caches (forward + backward dQ + backward
     dK/dV) at the shape a training forward will hit, so a subsequently compiled `train()`
     traces with warm caches (no host-sync inside the compiled region -- the T5-review
     contract). ONE untraced forward call is sufficient: all three `calibrated_*_rate` probes
     run in `flash_attention`'s Python body at construction time, keyed by
-    `(head_dim, dtype, causal, batch, n_heads, n-bucket, variant, d_slab)`, before the kernel
-    even dispatches. Inputs are zeros (values are irrelevant to a timing probe and touch no
-    global RNG); the dtype is the model's compute dtype, read off a floating trunk norm
-    weight (never quantized)."""
+    `(head_dim, dtype, causal, batch, n_heads, n-bucket, variant, d_slab, packed)`, before the
+    kernel even dispatches. Inputs are zeros (values are irrelevant to a timing probe and touch
+    no global RNG); the dtype is the model's compute dtype, read off a floating trunk norm
+    weight (never quantized).
+
+    `packed` (0.4.0): when set, a SECOND forward carrying an all-zeros single-segment
+    `PackedMask` at the same shape warms the three PACKED-keyed rate slots (key tail `packed`
+    True) -- what a packed training forward (`mask=PackedMask(...)`) hits. The non-packed warm
+    stays too: a packed run may still route plain-causal steps (`mask="causal"`)."""
     attn = model.model.layers[0].self_attn  # now a FlashAttentionWrapper
     hq, hkv = attn.n_heads, attn.n_kv_heads
     compute_dtype = model.model.norm.weight.dtype
@@ -181,6 +192,14 @@ def _prewarm_rate_caches(
     v = mx.zeros((batch_size, hkv, seq_len, head_dim), dtype=compute_dtype)
     out = flash_attention(q, k, v, scale=attn.scale, causal=True, impl=cast(_Impl, impl))
     mx.eval(out)
+    if packed:
+        seg_id = mx.zeros((batch_size, seq_len), dtype=mx.int32)
+        seg_start = mx.zeros((batch_size, seq_len), dtype=mx.int32)
+        out_packed = flash_attention(
+            q, k, v, scale=attn.scale, causal=True, impl=cast(_Impl, impl),
+            segments=PackedMask(seg_id=seg_id, seg_start=seg_start),
+        )
+        mx.eval(out_packed)
 
 
 def enable_flash_attention(
@@ -189,6 +208,7 @@ def enable_flash_attention(
     impl: str = "auto",
     seq_len: int | None = None,
     batch_size: int = 1,
+    packed: bool = False,
 ) -> None:
     """Enable the flash-attention training path on an mlx-lm model IN PLACE.
 
@@ -200,15 +220,24 @@ def enable_flash_attention(
     `impl`: forwarded to `flash_attention` per call (`"auto"`/`"kernel"` -> the Metal kernel;
     `"reference"` -> the pure-MLX oracle, for parity tests only).
 
-    `seq_len`/`batch_size` (compiled-train contract): when `seq_len` is given AND `impl` is a
-    kernel impl, pre-warm the kernel rate caches at that shape so a subsequently compiled
-    `train()` traces without a host-synced calibration inside the compiled region (see
-    `_prewarm_rate_caches`). Pass hints matching your training shape when you will run the
-    enabled model through mlx-lm's compiled `train()`. The hints are load-bearing there: a
-    compiled `train()` traced at a shape the caches were not warmed for host-syncs inside the
-    compiled region and RAISES during the trace, a loud failure rather than a silent
-    slowdown. When omitted, enable still succeeds -- eager / `mx.grad` callers calibrate
-    lazily and harmlessly on the first attention call.
+    `seq_len`/`batch_size`/`packed` (compiled-train contract): when `seq_len` is given AND
+    `impl` is a kernel impl, pre-warm the kernel rate caches at that shape so a subsequently
+    compiled `train()` traces without a host-synced calibration inside the compiled region
+    (see `_prewarm_rate_caches`). With `packed=True` the pre-warm ALSO warms the packed-keyed
+    rate slots (one extra all-zeros single-segment forward) -- pass it when you will feed the
+    wrapper a `PackedMask` mask.
+
+    EXACT-SHAPE CONTRACT: the rate caches key on the EXACT batch `b` and the n-bucket of the
+    sequence length (power-of-2 ceiling, floor 512). Pass `batch_size` equal to your runtime
+    batch and a `seq_len` that lands in your pack_len's n-bucket. A compiled `train()` traced
+    at an un-warmed shape does NOT crash -- it runs a ONE-TIME host-synced calibration inside
+    the compiled region (a first-step stall), then caches -- but pass matching hints to avoid
+    that stall (the calibration probes with detached arrays, which mlx permits eval'ing inside
+    a trace). Defense-in-depth: if such an in-region calibration ever host-syncs on a traced
+    array, `flash_attention` upgrades the opaque `[eval]` error to an actionable
+    `UnsupportedAttentionError` naming the shape and the pre-warm call. When `seq_len` is
+    omitted, enable still succeeds (including with `packed=True`) -- eager / `mx.grad` callers
+    calibrate lazily on the first attention call.
 
     Refuses (`UnsupportedAttentionError`): an unsupported model family; a sliding-window or
     mixed `layer_types` model (`layer_types` entry != "full_attention", or any `use_sliding`
@@ -258,5 +287,6 @@ def enable_flash_attention(
 
     if seq_len is not None and impl in ("auto", "kernel"):
         _prewarm_rate_caches(
-            model, impl=impl, seq_len=seq_len, batch_size=batch_size, head_dim=head_dim
+            model, impl=impl, seq_len=seq_len, batch_size=batch_size, head_dim=head_dim,
+            packed=packed,
         )

@@ -13,6 +13,11 @@ import pytest
 
 from mlx_train_perf.attention import api
 from mlx_train_perf.attention.api import flash_attention, resolve_attention_impl
+from mlx_train_perf.attention.kernel.launch import (
+    _BWD_DKV_RATE_CACHE,
+    _BWD_DQ_RATE_CACHE,
+    _FWD_RATE_CACHE,
+)
 from mlx_train_perf.attention.reference import math_attention
 from mlx_train_perf.attention.segments import PackedMask
 from mlx_train_perf.errors import AttentionInputError, UnsupportedAttentionError
@@ -369,3 +374,71 @@ def test_packed_fresh_segments_refeed_under_compile() -> None:
     g = mx.compile(mx.grad(loss))(q, seg_id_b, seg_start_b)
     mx.eval(g)
     assert api.VJP_CALLS.get("flash_attention_kernel_bwd", 0) > 0
+
+
+@pytest.mark.metal
+def test_calibration_eval_transform_valueerror_wrapped_as_unsupported(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """EXACT-SHAPE CONTRACT mechanic (0.4.0 / T6). IF a rate calibration ever host-syncs on a
+    traced array mid-transform, mlx raises the opaque `[eval] Attempting to eval an array
+    during function transformations` ValueError. `flash_attention`'s kernel path upgrades JUST
+    that error to a clear `UnsupportedAttentionError` naming the shape (batch, n-bucket, packed
+    flag) and the exact `enable_flash_attention(...)` pre-warm call, preserving the original via
+    `from`. The real calibration probes with DETACHED arrays so it never triggers this today
+    (see the sibling no-crash test); this fakes the calibration boundary to prove the guard
+    converts the error rather than letting the opaque one escape. An UNRELATED calibration
+    ValueError must pass through untouched (never masked as a shape problem)."""
+    q, k, v = _rand_qkv(b=1, hq=2, hkv=1, n=32, d=64, seed=42)  # head_dim 64 -> kernel path
+
+    def _raise_eval_transform(**_: object) -> float:
+        raise ValueError(
+            "[eval] Attempting to eval an array during function transformations "
+            "like compile or vmap is not allowed."
+        )
+
+    monkeypatch.setattr(api, "calibrated_fwd_rate", _raise_eval_transform)
+    with pytest.raises(UnsupportedAttentionError, match="enable_flash_attention") as ei:
+        flash_attention(q, k, v, scale=1.0, causal=True, impl="kernel")
+    assert "batch=1" in str(ei.value)
+    assert "n-bucket=512" in str(ei.value)
+    assert isinstance(ei.value.__cause__, ValueError)  # original preserved via `from`
+
+    # An unrelated calibration ValueError is NOT masked as a shape problem -- it escapes as-is.
+    def _raise_other(**_: object) -> float:
+        raise ValueError("some genuine calibration bug")
+
+    monkeypatch.setattr(api, "calibrated_fwd_rate", _raise_other)
+    with pytest.raises(ValueError, match="genuine calibration bug"):
+        flash_attention(q, k, v, scale=1.0, causal=True, impl="kernel")
+
+
+@pytest.mark.metal
+def test_cold_shape_compiled_grad_recalibrates_without_crash() -> None:
+    """Ground-truth of the real EXACT-SHAPE behavior (verified this task): calibration probes
+    with DETACHED arrays, and mlx permits eval'ing detached constants inside a compiled trace
+    (only eval of a TRACED array raises). So a compiled grad at a shape the caches were NEVER
+    warmed for does NOT crash -- it runs a one-time in-region calibration and populates the
+    cache. The seq_len/batch_size hints on `enable_flash_attention` merely avoid that first-step
+    stall; a wrong hint is a perf cost, not a failure. (Complements the warm-cache no-recalibrate
+    pin in test_attention_wrapper.py.)"""
+    hq, hkv, n, d = 2, 1, 32, 64  # n=32 -> n-bucket 512
+    scale = 1.0 / math.sqrt(d)
+    # Isolate: drop every b==2 rate-cache entry so b=2 is genuinely cold for any tile (b is
+    # key index 3: (head_dim, dtype, causal, b, hq, n-bucket, variant, d_slab, packed)).
+    for cache in (_FWD_RATE_CACHE, _BWD_DQ_RATE_CACHE, _BWD_DKV_RATE_CACHE):
+        for key in [k for k in cache if k[3] == 2]:
+            cache.pop(key, None)
+
+    q1, k1, v1 = _rand_qkv(b=1, hq=hq, hkv=hkv, n=n, d=d, seed=40)
+    mx.eval(flash_attention(q1, k1, v1, scale=scale, causal=True, impl="kernel"))  # warm b=1
+
+    q2, k2, v2 = _rand_qkv(b=2, hq=hq, hkv=hkv, n=n, d=d, seed=41)
+
+    def loss(q_: mx.array) -> mx.array:
+        return flash_attention(q_, k2, v2, scale=scale, causal=True, impl="kernel").sum()
+
+    g = mx.compile(mx.grad(loss))(q2)  # cold b=2 -> one-time in-region calibration, no crash
+    mx.eval(g)
+    assert math.isfinite(mx.abs(g).max().item())
+    assert any(key[3] == 2 for key in _FWD_RATE_CACHE), "cold compiled call did not calibrate b=2"
