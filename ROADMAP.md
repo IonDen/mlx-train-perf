@@ -2,6 +2,14 @@
 
 ## Released
 
+### 0.4.0 - 2026-07-19
+- Sequence packing for instruction tuning. Short examples share fixed 4,096-token training
+  rows, kept independent by a block-diagonal mask enforced inside the flash kernels with an
+  O(N) per-token segment id. Loss masking matches the unpacked trainer segment by segment
+  (parity 5.0e-4 on a packed-vs-unpacked batch). Measured on Alpaca at batch 1: real-data
+  throughput 2.72× on Qwen3-8B-4bit and on Llama-3.2-3B-4bit alike, a 2.0–2.3× conservative
+  steady-state reading — at batch 1 the win is per-step amortization, not padding removal.
+
 ### 0.3.1 - 2026-07-15
 - Qwen2 (Qwen2.5 family) support in the flash-attention wrapper. `enable_flash_attention` now
   accepts Qwen2 alongside Llama and Qwen3, so a Qwen2.5 fine-tune can use the flash path as
@@ -57,11 +65,11 @@ context-ceiling one — 0.3.0 already made the context ceiling memory-bound.
 The loss ships a fused forward paired with a proven chunked backward. A fully fused backward
 kernel is a further memory reduction for the loss layer itself.
 
-### Sequence packing
-Pack variable-length examples into fixed blocks to cut padding waste in SFT training. This
-needs a block-diagonal (additive) attention mask so examples packed into one block do not
-attend across each other — a mask the current causal-only flash path refuses, so supporting
-it means extending the flash kernel to a packed-block mask.
+### Packed dK/dV block skipping
+The packed forward and dQ kernels skip cross-segment key blocks and run about 3× faster
+than causal on real multi-segment rows; the dK/dV kernel masks per element instead of
+bounding its loop, so it does the causal amount of work. Bounding its query loop at each
+key's segment end is the remaining ~2× for packed backward throughput.
 
 ### Planner anchors beyond 8192
 The flash planner coefficient is fit to anchors up to 8192 tokens. Add measured anchors past

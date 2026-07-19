@@ -84,6 +84,55 @@ enable_flash_attention(model, seq_len=8192, batch_size=1)
 
 Call it in place on a loaded model, after you set the compute dtype and before you build the loss and call `train`. mlx-lm's `train` wraps the step in `mx.compile`, and the kernel calibrates itself with a one-time host-synced timing probe. Passing `seq_len` (and `batch_size`) runs that calibration up front, at your training shape, so the compiled step traces with warm caches. Match them to the shape you actually train: `batch_size` defaults to 1 and must equal your training batch. If a compiled `train` traces at a shape the caches were not warmed for, the calibration runs once inside the traced region instead — the run completes, but the timing probe executes on a machine mid-trace rather than in the controlled up-front window (measured on mlx 0.32.0: a one-time stall, not a crash). Omit the hints and the call still succeeds — eager and `mx.grad` callers calibrate lazily on the first attention call — but a compiled `train` run should always pass them for calibration fidelity.
 
+## Sequence packing
+
+New in 0.4.0 and opt-in. Instruction-tuning datasets are short and ragged: Alpaca under Qwen3's chat template averages 84 tokens per example, and mlx-lm's trainer runs one step per batch of them. At batch size 1 on an 8B model, a compiled training step costs about 2 to 2.5 seconds whether it carries 84 tokens or 4,096 — the fixed per-step cost dominates and the GPU idles. Packing concatenates many sequences into fixed 4,096-token rows so every step runs at full-context efficiency. A block-diagonal attention mask keeps the sequences independent: a token attends another only when both belong to the same original sequence, enforced inside the flash Metal kernels by a per-token segment id rather than a materialized mask (the mask tensor an `(N, N)` approach would need is exactly the quadratic allocation this library exists to avoid).
+
+Loss masking reproduces mlx-lm's unpacked semantics segment by segment, so the supervised token set is identical to an unpacked run. Three sequences packed into one row produce the same token count and a loss within measured bf16 tolerance of the same three run unpacked: worst difference 5.0e-4 against a 2e-2 pin sized from measured RoPE offset drift (`tests/test_adapter_packed.py`). Cross-sequence contamination is tested by construction: deliberately dropping the segment mask in the test suite moves the loss by 0.11, well past the pin.
+
+Measured on Alpaca (pinned revision, 4,000-example sample, seed 42), LoRA rank 8, batch 1, gradient checkpointing, bf16, pack length 4,096 (`scripts/bench_packed_training.py`):
+
+| real tokens/sec | stock batching | packed | ratio |
+|---|---|---|---|
+| Qwen3-8B-4bit | 32.9 | 89.6 | 2.72× |
+| Llama-3.2-3B-4bit | 71.5 | 194.4 | 2.72× |
+
+Samples per hour move the same way: 1,408 → 3,835 on Qwen3-8B and 2,441 → 6,638 on Llama-3.2-3B. "Real tokens" counts sequence content only, never padding or separators.
+
+Where the win comes from matters for whether you will see it too. At batch size 1, stock batching loses little to padding (17% on this dataset, mostly round-to-32 alignment) — the win comes from amortization. A packed row carries roughly 40–50 Alpaca sequences (47.6 on average under Qwen3's tokenizer, 38.1 under Llama's), so the fixed step cost is paid once per ~4,000 real tokens instead of once per 84, and attention runs at its 4,096-token efficiency instead of a ~100-token shape. A dataset of long sequences packs fewer per row and gains less; one that already fills the context gains nothing. The stock arm's per-step median also includes `mx.compile`'s first trace of each batch width (stock widths vary; packed rows are one constant shape, which is itself part of the win), and a long training run amortizes those traces away. Reading the stock arm at its fastest repeated warm step instead of its median gives a conservative bound of about 2.0–2.3×, so the honest range is 2–2.7× on this dataset. The packed arm's own walls are flat to within 5%.
+
+### Training packed
+
+The parts drop into the stock trainer the same way the loss does — a batch iterator, a loss function, and the flash-attention switch. Packing requires the flash path (the stock attention cannot express a block-diagonal mask):
+
+```python
+import functools
+import mlx.core as mx
+from mlx_lm import load
+from mlx_lm.tuner.trainer import train
+from mlx_train_perf.adapters.mlx_lm import make_packed_loss_fn
+from mlx_train_perf.attention import enable_flash_attention
+from mlx_train_perf.data.packing import packed_iterate_batches
+
+model, tokenizer = load("mlx-community/Qwen3-8B-4bit")
+model.set_dtype(mx.bfloat16)  # 4-bit checkpoints compute in fp16; the kernels need bf16/fp32
+enable_flash_attention(model, seq_len=4096, batch_size=1, packed=True)
+# ... freeze the base model and apply linear_to_lora_layers as usual ...
+
+train(
+    model=model, optimizer=opt,
+    train_dataset=dataset,          # items are (tokens, offset) pairs; offset = prompt length
+    args=args,                      # args.max_seq_length is the pack length
+    loss=make_packed_loss_fn(model),
+    iterate_batches=functools.partial(
+        packed_iterate_batches,
+        max_position_embeddings=model.args.max_position_embeddings,
+    ),
+)
+```
+
+`packed_iterate_batches` re-packs each epoch with a fresh shuffle and hands the trainer fixed-shape batches; `make_packed_loss_fn` walks the model's layers itself to thread the segment mask (the stock model call hardcodes a causal mask) and refuses at construction if `enable_flash_attention` has not run. Pass `packed=True` with `seq_len` equal to your pack length and `batch_size` equal to your training batch: the calibration caches key on the exact batch size and sequence bucket, so matching hints keep the one-time kernel timing probes in the controlled window before `mx.compile` traces the step. The pack length must not exceed the model's trained context — packed sequences keep their relative positions, and the row as a whole runs at absolute positions up to the pack length.
+
 ## Install
 
 ```bash
@@ -163,6 +212,15 @@ python scripts/bench_train_step.py --model mlx-community/Qwen3-8B-4bit --seq-len
 python scripts/bench_train_step.py --model mlx-community/Qwen3-8B-4bit --seq-len 8192 \
     --attention stock --impl kernel --compute-dtype bfloat16 --grad-checkpoint --out _artifacts/stock
 python scripts/northstar_context_sweep.py # the max-context sweep (1-2 h; heavy)
+# the 2.72x packing table: prep the dataset once per model, then run each arm into its own --out dir
+python scripts/prep_alpaca.py --model mlx-community/Qwen3-8B-4bit \
+    --out _artifacts/packed_bench/alpaca_qwen3.jsonl --batch-size 1 --pack-len 4096 --max-samples 4000 --seed 42
+python scripts/bench_packed_training.py --model mlx-community/Qwen3-8B-4bit \
+    --data _artifacts/packed_bench/alpaca_qwen3.jsonl --arm stock --pack-len 4096 --batch-size 1 \
+    --steps 60 --grad-checkpoint --compute-dtype bfloat16 --out _artifacts/packed_bench/qwen3_stock
+python scripts/bench_packed_training.py --model mlx-community/Qwen3-8B-4bit \
+    --data _artifacts/packed_bench/alpaca_qwen3.jsonl --arm packed --pack-len 4096 --batch-size 1 \
+    --steps 30 --grad-checkpoint --compute-dtype bfloat16 --out _artifacts/packed_bench/qwen3_packed
 ```
 
 ## Memory safety net
