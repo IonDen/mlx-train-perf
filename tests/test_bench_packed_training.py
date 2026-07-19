@@ -30,7 +30,7 @@ from mlx_train_perf.data.packing import (
     packed_batching_stats,
     stock_batching_stats,
 )
-from mlx_train_perf.errors import LaunchBudgetError, MlxTrainPerfError
+from mlx_train_perf.errors import LaunchBudgetError, MlxTrainPerfError, PackingError
 
 _SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts"
 sys.path.insert(0, str(_SCRIPTS_DIR))
@@ -535,6 +535,24 @@ def test_pinned_alpaca_revision_is_a_full_commit_sha() -> None:
     rev = prep_alpaca.ALPACA_REVISION
     assert len(rev) == 40
     assert all(c in "0123456789abcdef" for c in rev)
+
+
+def test_parse_download_path_strips_the_hf_cli_path_prefix() -> None:
+    """hf CLI (huggingface_hub 1.x) prints its final line as `path=<dir>`; older output
+    printed the bare directory. Both forms must parse — the T14 run found the raw
+    `path=`-prefixed line being used as a literal path (glob found nothing, zero records,
+    empty jsonl)."""
+    assert prep_alpaca.parse_download_path(
+        "Fetching 3 files\npath=/tmp/hub/snapshots/abc"
+    ) == Path("/tmp/hub/snapshots/abc")
+    assert prep_alpaca.parse_download_path(
+        "Fetching 3 files\n/tmp/hub/snapshots/abc"
+    ) == Path("/tmp/hub/snapshots/abc")
+
+
+def test_parse_download_path_refuses_empty_output() -> None:
+    with pytest.raises(PackingError):
+        prep_alpaca.parse_download_path("   \n  ")
 
 
 @pytest.mark.network

@@ -27,7 +27,7 @@ from mlx_train_perf.data.packing import (
     packed_batching_stats,
     stock_batching_stats,
 )
-from mlx_train_perf.errors import MissingDependencyError
+from mlx_train_perf.errors import MissingDependencyError, PackingError
 
 # The Alpaca dataset repo + a RESOLVED commit sha (not a branch): a branch name would
 # make the prep non-deterministic. Resolved once via the Hub API (2026-07-19).
@@ -127,6 +127,17 @@ def dataset_stats(
 # ---------------------------------------------------------------------------
 
 
+def parse_download_path(stdout: str) -> Path:
+    """The snapshot directory from `hf download`'s stdout. huggingface_hub 1.x prints the
+    final line as `path=<dir>`; older CLIs printed the bare directory -- accept both.
+    (Found live in the T14 run: the raw `path=`-prefixed line used as a literal path made
+    the parquet glob match nothing and the prep emit an empty jsonl.)"""
+    lines = [line.strip() for line in stdout.strip().splitlines() if line.strip()]
+    if not lines:
+        raise PackingError("hf download produced no output to parse a snapshot path from")
+    return Path(lines[-1].removeprefix("path="))
+
+
 def download_alpaca(revision: str) -> list[dict[str, str]]:
     """Download `tatsu-lab/alpaca` at `revision` via the `hf` CLI and read its single
     parquet into `{"instruction", "input", "output"}` records. `pyarrow` is required for
@@ -141,7 +152,7 @@ def download_alpaca(revision: str) -> list[dict[str, str]]:
         ["hf", "download", ALPACA_REPO, "--repo-type", "dataset", "--revision", revision],
         check=True, capture_output=True, text=True,
     )
-    local = Path(result.stdout.strip().splitlines()[-1])
+    local = parse_download_path(result.stdout)
     records: list[dict[str, str]] = []
     for parquet_path in sorted(local.glob("data/*.parquet")):
         cols = pq.read_table(parquet_path).to_pydict()
