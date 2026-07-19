@@ -223,6 +223,23 @@ def test_pack_len_exceeding_max_position_embeddings_refuses():
                                      max_position_embeddings=50, comm_group=None))
 
 
+def test_iterator_refuses_when_packs_fall_below_batch_size() -> None:
+    # One tiny sequence packs into a single pack; batch_size=2 -> num_batches==0. Stock's
+    # iterate_batches fail-fasts when len(dataset) < batch_size (trainer.py:116-120); ours
+    # must too, rather than silently yielding nothing (loop=False).
+    with pytest.raises(PackingError, match="fewer than batch_size"):
+        next(packed_iterate_batches(dataset=[([1, 2, 3], 0)], batch_size=2,
+                                    max_seq_length=16, loop=False, seed=0))
+
+
+def test_iterator_loop_true_refuses_instead_of_hanging() -> None:
+    # loop=True (what mlx-lm's train() always passes) would spin forever re-packing with
+    # zero progress when num_batches==0; the guard must raise on the first next() instead.
+    with pytest.raises(PackingError, match="fewer than batch_size"):
+        next(packed_iterate_batches(dataset=[([1, 2, 3], 0)], batch_size=2,
+                                    max_seq_length=16, loop=True, seed=0))
+
+
 def test_bare_token_dataset_items_default_offset_zero():
     # bare `list[int]` items (no offset) supervise from position 0, same as offset=0.
     ds = [[5, 6, 7, 8]] * 4

@@ -50,6 +50,26 @@ def _packed_layout(seg_lens: list[int], b: int) -> tuple[mx.array, mx.array]:
     return seg_id, seg_start
 
 
+def _packed_layout_per_row(rows_seg_lens: list[list[int]]) -> tuple[mx.array, mx.array]:
+    """(B, N) int32 seg_id/seg_start with a DIFFERENT segment layout on each batch row --
+    unlike `_packed_layout`, which broadcasts one row across the batch. Every row's seg_lens
+    must sum to the same N (the sequence axis is uniform). This is what makes a wrong batch
+    index in the kernel's segment-buffer reads observable (see the test below)."""
+    seg_id_rows: list[list[int]] = []
+    seg_start_rows: list[list[int]] = []
+    for seg_lens in rows_seg_lens:
+        seg_id_row: list[int] = []
+        seg_start_row: list[int] = []
+        start = 0
+        for sid, ln in enumerate(seg_lens):
+            seg_id_row += [sid] * ln
+            seg_start_row += [start] * ln
+            start += ln
+        seg_id_rows.append(seg_id_row)
+        seg_start_rows.append(seg_start_row)
+    return mx.array(seg_id_rows, dtype=mx.int32), mx.array(seg_start_rows, dtype=mx.int32)
+
+
 def test_flash_attention_value_matches_math_attention() -> None:
     """impl='reference' routes through the same T3 code path as math_attention, so O
     must be bit-identical (per T3's own contract, test_flash_reference_O_equals_..."""
@@ -318,6 +338,48 @@ def test_packed_parity_through_public_api(n: int) -> None:
     assert d_o < _PACKED_API_O_TOL, f"packed API O diff {d_o}"
     assert worst < _PACKED_API_GRAD_TOL, f"packed API grad worst {worst}"
     assert api.VJP_CALLS.get("flash_attention_kernel_bwd", 0) > 0
+
+
+@pytest.mark.metal
+def test_packed_parity_per_row_varying_layout() -> None:
+    """DIFFERENT segment layouts per batch row at the SAME n, through the public kernel path
+    forward AND backward -- the one test that can catch a wrong batch index in ANY of the six
+    MSL segment-buffer reads (`seg_off = b * n`: source.py:51/275/695/876 via `b = bh/hq`,
+    :1233/1442 via `b = bkv/hkv`). The rest of the packed kernel grid uses batch-uniform
+    fixtures (`[row] * b`), whose rows are byte-identical -- so a read of the WRONG row's
+    segment content lands on the same bytes and the test stays green. Here row 0 ([100, 156])
+    and row 1 ([40, 60, 50, 66, 40]) carry genuinely different boundaries, so a wrong-row read
+    masks against the other row's layout and O/grad parity breaks. Oracle: math_attention(
+    segments=), whose `segment_allowed` broadcasts per-row (B,1,N,N) and honors distinct rows.
+    Pins reuse the batch-uniform grid's `_PACKED_API_O_TOL` / `_PACKED_API_GRAD_TOL`."""
+    b, hq, hkv, n, d = 2, 4, 2, 256, 64
+    scale = 1.0 / math.sqrt(d)
+    q, k, v = _rand_qkv(b=b, hq=hq, hkv=hkv, n=n, d=d, seed=34)
+    seg_id, seg_start = _packed_layout_per_row([[100, 156], [40, 60, 50, 66, 40]])
+    pm = PackedMask(seg_id=seg_id, seg_start=seg_start)
+
+    o_kernel = flash_attention(q, k, v, scale=scale, causal=True, impl="kernel", segments=pm)
+    o_ref = math_attention(q, k, v, scale=scale, causal=True, segments=pm)
+    mx.eval(o_kernel, o_ref)
+    d_o = mx.abs(o_kernel - o_ref).max().item()
+
+    def kernel_loss(q_: mx.array, k_: mx.array, v_: mx.array) -> mx.array:
+        return flash_attention(
+            q_, k_, v_, scale=scale, causal=True, impl="kernel", segments=pm
+        ).sum()
+
+    def math_loss(q_: mx.array, k_: mx.array, v_: mx.array) -> mx.array:
+        return math_attention(q_, k_, v_, scale=scale, causal=True, segments=pm).sum()
+
+    g_kernel = mx.grad(kernel_loss, argnums=(0, 1, 2))(q, k, v)
+    g_math = mx.grad(math_loss, argnums=(0, 1, 2))(q, k, v)
+    mx.eval(*g_kernel, *g_math)
+    worst = max(
+        float(mx.abs(gk - gm).max().item()) for gk, gm in zip(g_kernel, g_math, strict=True)
+    )
+    print(f"[packed API per-row n{n}] O={d_o:.3e} grad_worst={worst:.3e}")
+    assert d_o < _PACKED_API_O_TOL, f"per-row packed API O diff {d_o}"
+    assert worst < _PACKED_API_GRAD_TOL, f"per-row packed API grad worst {worst}"
 
 
 @pytest.mark.metal

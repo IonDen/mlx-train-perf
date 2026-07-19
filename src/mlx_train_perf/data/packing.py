@@ -225,6 +225,11 @@ def packed_iterate_batches(
     while True:
         packs = pack_indices(lengths, max_seq_length, seed=base_seed, epoch=epoch)
         num_batches = len(packs) // batch_size
+        if num_batches == 0:
+            raise PackingError(
+                f"packed dataset produced {len(packs)} pack(s) at pack_len={max_seq_length}, "
+                f"fewer than batch_size={batch_size}; reduce batch_size or add more data"
+            )
         for b in range(num_batches):
             batch_packs = packs[b * batch_size : (b + 1) * batch_size]
             rows: list[list[int]] = []

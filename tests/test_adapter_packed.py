@@ -70,7 +70,7 @@ def _unpacked_batch(
 ) -> tuple[mx.array, mx.array]:
     """The same sequences as an UNPACKED (B, width+1) batch + `(offset, length)` lengths for
     `make_loss_fn` -- each row is its tokens right-padded with the pad id 0 (the target-only
-    slot after the last real token is the 0 stock's `1 + ...` row sizing guarantees)."""
+    slot after the last real token is the 0 that stock's `1 + ...` row sizing guarantees)."""
     rows = [list(tokens) + [0] * (width + 1 - len(tokens)) for tokens, _ in entries]
     lengths = [[offset, len(tokens)] for tokens, offset in entries]
     return mx.array(rows, dtype=mx.int32), mx.array(lengths, dtype=mx.int32)

@@ -634,7 +634,11 @@ def _packed_summary(
     ]
     walls = [1.0 / rate for rate in iters_per_sec if rate > 0]
     median_wall = median_post_warmup(walls, warmup) if walls else 0.0
-    peak_all = [float(cast(float, info["peak_memory"])) for info in step_reports]
+    # info["peak_memory"] is the trainer's mx.get_peak_memory()/1e9 (DECIMAL GB); rescale to
+    # GiB so callback_peak_memory_gb matches this file's sibling *_gb (GiB) fields.
+    peak_all = [
+        float(cast(float, info["peak_memory"])) * 1e9 / 1024**3 for info in step_reports
+    ]
     loss_all = [float(cast(float, info["train_loss"])) for info in step_reports]
     return {
         **packed_throughput_fields(
