@@ -1,0 +1,63 @@
+@startuml
+title Three forward paths to the same per-token loss
+
+skinparam backgroundColor #FFFFFF
+skinparam shadowing false
+skinparam defaultFontName Helvetica
+skinparam defaultFontSize 15
+skinparam packageStyle rectangle
+skinparam packageBorderColor #6B7280
+skinparam packageFontColor #111827
+skinparam rectangle {
+  RoundCorner 10
+  BorderColor #4B5563
+  FontColor #111827
+  BackgroundColor #F8FAFC
+}
+skinparam ArrowColor #475569
+skinparam ArrowThickness 1.4
+
+package "Materialized MLX" as materialized {
+  rectangle "Hidden states H (N x D)\nOutput weights W (V x D)" as mat_input
+  rectangle "Matrix multiply" as mat_compute #DBEAFE
+  rectangle "Write logits Z (N x V)\nto device memory" as mat_state #FECACA
+  rectangle "Row log-sum-exp\nand target lookup" as mat_reduce #DBEAFE
+  rectangle "Per-token loss (N)" as mat_output #DCFCE7
+
+  mat_input -right-> mat_compute
+  mat_compute -right-> mat_state
+  mat_state -right-> mat_reduce
+  mat_reduce -right-> mat_output
+}
+
+package "Pure-MLX chunking" as chunked {
+  rectangle "Hidden states H (N x D)\nOne vocabulary tile of W" as chunk_input
+  rectangle "Build MLX operations\nfor tile logits Z_t (N x C)" as chunk_compute #DBEAFE
+  rectangle "MLX manages tile intermediates\nMerge (m, s, target)" as chunk_state #FEF3C7
+  rectangle "Repeat for each\nvocabulary tile" as chunk_repeat #F8FAFC
+  rectangle "Per-token loss (N)" as chunk_output #DCFCE7
+
+  chunk_input -right-> chunk_compute
+  chunk_compute -right-> chunk_state
+  chunk_state -right-> chunk_repeat
+  chunk_repeat -right-> chunk_output
+}
+
+package "Fused Metal forward" as fused {
+  rectangle "Hidden states H (N x D)\nOne vocabulary tile of W" as fused_input
+  rectangle "Metal dispatch computes\ntile logits inside the kernel" as fused_compute #DBEAFE
+  rectangle "Tile logits remain kernel-local\nWrite next (m, s, target), all O(N)" as fused_state #DCFCE7
+  rectangle "Chain one dispatch per\nvocabulary tile" as fused_repeat #F8FAFC
+  rectangle "Per-token loss and LSE (N)" as fused_output #DCFCE7
+
+  fused_input -right-> fused_compute
+  fused_compute -right-> fused_state
+  fused_state -right-> fused_repeat
+  fused_repeat -right-> fused_output
+}
+
+mat_input -[hidden]down-> chunk_input
+chunk_input -[hidden]down-> fused_input
+
+caption Conceptual dataflow, not a measured allocation-lifetime trace.
+@enduml
