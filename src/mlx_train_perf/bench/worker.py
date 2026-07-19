@@ -24,6 +24,7 @@ run through the real compiled `train()` step, and the tok/s comparison is compil
 compiled, apples to apples.
 """
 import argparse
+import functools
 import json
 import random
 import statistics
@@ -35,7 +36,7 @@ from typing import Any, Literal, cast
 
 import mlx.core as mx
 
-from mlx_train_perf.adapters.mlx_lm import make_loss_fn
+from mlx_train_perf.adapters.mlx_lm import make_loss_fn, make_packed_loss_fn
 from mlx_train_perf.attention.wrapper import enable_flash_attention
 from mlx_train_perf.bench.artifacts import (
     condition_identity,
@@ -51,6 +52,11 @@ from mlx_train_perf.core.guards import (
     wired_cap_holds,
 )
 from mlx_train_perf.core.loss import DenseHead, HeadRef, QuantizedHead, linear_cross_entropy
+from mlx_train_perf.data.packing import (
+    packed_batching_stats,
+    packed_iterate_batches,
+    stock_batching_stats,
+)
 from mlx_train_perf.errors import (
     LaunchBudgetError,
     MemoryBudgetError,
@@ -452,6 +458,308 @@ def run_train_step(
     }
 
 
+# ---------------------------------------------------------------------------------
+# packed_train: the 0.4.0 sequence-packing throughput bench. ONE arm per condition --
+# `stock` (unpacked `make_loss_fn` + stock `iterate_batches`) or `packed`
+# (`make_packed_loss_fn` + `packed_iterate_batches`). BOTH arms enable flash attention
+# and the fused CE loss, so the ONLY variable is the batching strategy. Drives the real,
+# compiled `mlx_lm.tuner.trainer.train()` against a REAL prepped dataset (scripts/
+# prep_alpaca.py), and reports real (non-pad) tokens/s + samples/hour by combining the
+# measured median step wall with deterministic host-side per-step content counts
+# (data.packing.{stock,packed}_batching_stats).
+# ---------------------------------------------------------------------------------
+
+_ARMS_PACKED = ("stock", "packed")
+
+
+def median_post_warmup(values: list[float], warmup: int) -> float:
+    """Median of `values` after dropping the first `warmup` (the compiled step-1 trace
+    plus any first-shape kernel calibration stalls). Falls back to the full list when
+    `warmup` would drop everything (a short run), so a non-empty input never yields 0."""
+    kept = values[warmup:] if len(values) > warmup else values
+    if not kept:
+        raise MlxTrainPerfError("no step-wall samples to summarize")
+    return statistics.median(kept)
+
+
+def packed_throughput_fields(
+    *, mean_real_tokens_per_step: float, mean_samples_per_step: float,
+    median_step_wall_s: float,
+) -> dict[str, object]:
+    """Compose the measured median step wall with the deterministic per-step content
+    counts into real (non-pad) tokens/s and samples/hour -- the throughput headline. A
+    non-positive wall (an all-warmup or empty run) yields 0.0 rather than dividing by 0."""
+    if median_step_wall_s > 0:
+        real_tps = mean_real_tokens_per_step / median_step_wall_s
+        samples_hr = mean_samples_per_step / median_step_wall_s * 3600.0
+    else:
+        real_tps = samples_hr = 0.0
+    return {
+        "real_tokens_per_second": round(real_tps, 3),
+        "samples_per_hour": round(samples_hr, 3),
+        "mean_real_tokens_per_step": round(mean_real_tokens_per_step, 4),
+        "mean_samples_per_step": round(mean_samples_per_step, 4),
+        "median_step_wall_s": round(median_step_wall_s, 6),
+    }
+
+
+def _make_reasserting_loss_varargs(
+    loss_fn: Callable[..., tuple[mx.array, mx.array]],
+    observed_before: list[int],
+) -> Callable[..., tuple[mx.array, mx.array]]:
+    """Variadic sibling of `_make_reasserting_loss` for the packed loss's 5-array trainer
+    contract (`model, batch, seg_id, seg_start, loss_mask`) -- also reused for the stock
+    arm's 3-array `make_loss_fn`. The FIRST call re-asserts this project's house wired cap
+    (see the module docstring for why this lives inside the loop); `mx.compile` re-runs the
+    traced body only on a recompile, so firing once suffices."""
+
+    def wrapped(model: Any, *arrays: mx.array) -> tuple[mx.array, mx.array]:
+        if not observed_before:
+            observed_before.append(install_guardrails())
+        return loss_fn(model, *arrays)
+
+    return wrapped
+
+
+def _load_packed_dataset(path: str) -> list[tuple[list[int], int]]:
+    """Read the prep_alpaca jsonl -- one `{"tokens": [...], "offset": N}` object per
+    line -- into the `(tokens, offset)` pairs both stock and packed `iterate_batches`
+    consume. The SOLE file read of this condition kind (isolated for the same reason
+    `_load_model` is: tests never touch a real dataset)."""
+    dataset: list[tuple[list[int], int]] = []
+    with Path(path).open(encoding="utf-8") as handle:
+        for line in handle:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            obj = json.loads(stripped)
+            dataset.append(([int(t) for t in obj["tokens"]], int(obj["offset"])))
+    return dataset
+
+
+def _arm_batching_stats(
+    arm: str, lengths: list[int], *, pack_len: int, batch: int, seed: int
+) -> tuple[float, float, dict[str, object]]:
+    """Deterministic host-side per-step content counts (mean real tokens / mean samples
+    per step) plus the arm-specific utilization fields: the stock padding-waste fraction,
+    or the packed utilization / separator / tail fractions."""
+    if arm == "packed":
+        pstats = packed_batching_stats(lengths, pack_len, batch_size=batch, seed=seed)
+        return pstats.mean_real_tokens_per_step, pstats.mean_samples_per_step, {
+            "num_batches": pstats.num_batches,
+            "real_tokens_total": pstats.real_tokens_total,
+            "utilization": round(pstats.utilization, 6),
+            "separator_fraction": round(pstats.separator_fraction, 6),
+            "tail_pad_fraction": round(pstats.tail_pad_fraction, 6),
+        }
+    sstats = stock_batching_stats(lengths, batch_size=batch, max_seq_length=pack_len)
+    return sstats.mean_real_tokens_per_step, sstats.mean_samples_per_step, {
+        "num_batches": sstats.num_batches,
+        "real_tokens_total": sstats.real_tokens_total,
+        "padded_tokens_total": sstats.padded_tokens_total,
+        "padding_waste_fraction": round(sstats.padding_waste_fraction, 6),
+    }
+
+
+def _run_packed_train_steps(
+    model: Any,
+    optimizer: Any,
+    loss_fn: Callable[..., tuple[mx.array, mx.array]],
+    dataset: list[tuple[list[int], int]],
+    *,
+    batch: int,
+    pack_len: int,
+    steps: int,
+    grad_checkpoint: bool,
+    iterate_batches: Any,
+) -> list[dict[str, object]]:
+    """Drive `steps` real fine-tune iterations through the compiled `train()`. The packed
+    arm passes `iterate_batches=partial(packed_iterate_batches, ...)`; the stock arm passes
+    `None`, leaving `train()`'s own stock `iterate_batches` in place. `max_seq_length` is
+    the pack length for both -- packed rows are `pack_len + 1` wide (`packed_iterate_batches`
+    sizes them), stock pads up to `pack_len`."""
+    from mlx_lm.tuner.trainer import TrainingArgs, train  # noqa: PLC0415
+
+    callback = _RecordingCallback()
+    with tempfile.TemporaryDirectory(prefix="mlx-train-perf-packed-") as tmp_dir:
+        args = TrainingArgs(
+            batch_size=batch, iters=steps, val_batches=0, steps_per_report=1,
+            steps_per_eval=steps + 1, steps_per_save=steps + 1,
+            max_seq_length=pack_len, grad_checkpoint=grad_checkpoint,
+            adapter_file=str(Path(tmp_dir) / "adapters.safetensors"),
+        )
+        extra: dict[str, Any] = {}
+        if iterate_batches is not None:
+            extra["iterate_batches"] = iterate_batches
+        train(model=model, optimizer=optimizer, train_dataset=dataset, val_dataset=[],
+              args=args, loss=loss_fn, training_callback=cast(Any, callback), **extra)
+    return callback.train_info
+
+
+def _setup_packed_model(
+    model_id: str, revision: str | None, *, compute_dtype: str | None, pack_len: int,
+    batch: int, packed_arm: bool, seed: int, lora_rank: int, lora_layers: int,
+) -> Any:
+    """Load the model and wire it for a `packed_train` arm, in the load-bearing order
+    (mirrors `run_train_step` + `tests/test_packed_smoke.py`): cast to `compute_dtype` if
+    set, `mx.eval` the cast (gotcha 14), enable flash attention (`packed=` for the packed
+    arm) BEFORE `freeze()`/`linear_to_lora_layers` (LoRA target discovery walks the module
+    tree by path), then `mx.eval` the LoRA setup so its lazy graph does not leak into the
+    measured window."""
+    from mlx_lm.tuner.utils import linear_to_lora_layers  # noqa: PLC0415
+
+    model, _tokenizer = _load_model(model_id, revision)
+    if compute_dtype is not None:
+        model.set_dtype(_resolve_dtype(compute_dtype))
+    mx.eval(model.parameters())
+    enable_flash_attention(model, seq_len=pack_len, batch_size=batch, packed=packed_arm)
+    mx.random.seed(seed)  # BEFORE freeze/LoRA-injection: their random init draws next
+    model.freeze()
+    linear_to_lora_layers(
+        model, lora_layers, {"rank": lora_rank, "dropout": 0.0, "scale": 20.0}
+    )
+    mx.eval(model.parameters())  # force the lazy setup graphs before the measured window
+    return model
+
+
+def _packed_summary(
+    step_reports: list[dict[str, object]], *, warmup: int, mean_real: float,
+    mean_samples: float,
+) -> dict[str, object]:
+    """The measured throughput/loss/peak fields: per-step walls (`1 / iterations_per_second`,
+    `steps_per_report=1`), their post-warmup median, the composed real-tokens/s + samples/hour,
+    the per-step loss curve, and the callback's peak-memory high-water mark."""
+    iters_per_sec = [
+        float(cast(float, info["iterations_per_second"])) for info in step_reports
+    ]
+    walls = [1.0 / rate for rate in iters_per_sec if rate > 0]
+    median_wall = median_post_warmup(walls, warmup) if walls else 0.0
+    peak_all = [float(cast(float, info["peak_memory"])) for info in step_reports]
+    loss_all = [float(cast(float, info["train_loss"])) for info in step_reports]
+    return {
+        **packed_throughput_fields(
+            mean_real_tokens_per_step=mean_real, mean_samples_per_step=mean_samples,
+            median_step_wall_s=median_wall,
+        ),
+        "step_walls_s": [round(w, 6) for w in walls],
+        "loss_all": [round(x, 6) for x in loss_all],
+        "callback_peak_memory_gb": round(max(peak_all), 4) if peak_all else 0.0,
+    }
+
+
+def run_packed_train(params: dict[str, object]) -> dict[str, object]:
+    """Time `steps` real mlx-lm LoRA fine-tune steps for ONE batching arm against a real
+    (`mlx_lm.load`-resolved) model and a real prepped dataset (`params["data"]`, a
+    prep_alpaca jsonl). Both arms enable flash attention and the fused CE loss -- the ONLY
+    variable is the batching strategy (`arm="stock"` -> `make_loss_fn` + stock batching;
+    `arm="packed"` -> `make_packed_loss_fn` + `packed_iterate_batches`). Reports real
+    (non-pad) tokens/s and samples/hour (measured median step wall x deterministic per-step
+    content counts), the memory story, the stock padding-waste fraction (stock arm) or the
+    packed utilization/separator/tail fractions (packed arm), and this project's wired-limit
+    contract (`WiredCapRegressionError` if the cap did not hold through training).
+
+    Wiring order mirrors `run_train_step` and `tests/test_packed_smoke.py`:
+    `enable_flash_attention` (with `packed=`) BEFORE `freeze()`/`linear_to_lora_layers` (LoRA
+    target discovery walks `named_modules()` by path); `mx.eval(model.parameters())` after
+    the cast and after LoRA (gotcha 14); `mx.synchronize()` before the memory snapshot
+    (gotcha 15).
+
+    `params`: `model` (str, required), `revision` (str | None), `data` (jsonl path,
+    required), `pack_len` (int, required -- the max_seq_length / pack length), `batch`
+    (int, required), `steps` (int, required), `warmup` (int, default 5 -- steps dropped
+    before the median), `arm` ("stock" | "packed", default "packed"), `lora_rank` (default
+    8), `lora_layers` (default -1 == all), `impl` (default "auto"), `learning_rate`
+    (default 1e-5), `seed` (default 0), `compute_dtype` (str | None -- the kernel impl needs
+    "bfloat16" on 4-bit checkpoints), `grad_checkpoint` (bool, default False)."""
+    _require_mlx_lm()
+    import mlx.optimizers as optim  # noqa: PLC0415
+
+    model_id = str(params["model"])
+    revision = cast("str | None", params.get("revision"))
+    data_path = str(params["data"])
+    pack_len = int(cast(int, params["pack_len"]))
+    batch = int(cast(int, params["batch"]))
+    steps = int(cast(int, params["steps"]))
+    warmup = int(cast(int, params.get("warmup", 5)))
+    arm = str(params.get("arm", "packed"))
+    lora_rank = int(cast(int, params.get("lora_rank", 8)))
+    lora_layers = int(cast(int, params.get("lora_layers", -1)))
+    impl = cast(Literal["auto", "kernel", "chunked", "naive"], params.get("impl", "auto"))
+    learning_rate = float(cast(float, params.get("learning_rate", 1e-5)))
+    seed = int(cast(int, params.get("seed", 0)))
+    compute_dtype = cast("str | None", params.get("compute_dtype"))
+    grad_checkpoint = bool(params.get("grad_checkpoint", False))
+    if arm not in _ARMS_PACKED:
+        raise MlxTrainPerfError(f"unknown arm {arm!r}; expected one of {_ARMS_PACKED}")
+
+    dataset = _load_packed_dataset(data_path)
+    lengths = [len(tokens) for tokens, _ in dataset]
+    packed_arm = arm == "packed"
+    # Deterministic host-side per-step content + arm-specific utilization, before training.
+    mean_real, mean_samples, batching_fields = _arm_batching_stats(
+        arm, lengths, pack_len=pack_len, batch=batch, seed=seed,
+    )
+
+    # Both arms enable flash attention -- the only variable is the batching strategy.
+    model = _setup_packed_model(
+        model_id, revision, compute_dtype=compute_dtype, pack_len=pack_len, batch=batch,
+        packed_arm=packed_arm, seed=seed, lora_rank=lora_rank, lora_layers=lora_layers,
+    )
+
+    base_loss: Callable[..., tuple[mx.array, mx.array]]
+    iterate: Any
+    if packed_arm:
+        base_loss = make_packed_loss_fn(model, impl=impl)
+        max_pos = cast("int | None", getattr(model.args, "max_position_embeddings", None))
+        iterate = functools.partial(
+            packed_iterate_batches, seed=seed, max_position_embeddings=max_pos,
+        )
+    else:
+        base_loss = make_loss_fn(model, impl=impl)
+        iterate = None
+    observed_before: list[int] = []
+    loss_fn = _make_reasserting_loss_varargs(base_loss, observed_before)
+
+    dev_max = int(mx.device_info()["max_recommended_working_set_size"])
+    expected_wired, _soft = clamped_caps(dev_max)
+    opt = optim.Adam(learning_rate=learning_rate)
+
+    mx.synchronize()  # gotcha 15: settle pending evals before the memory snapshot
+    active_before = mx.get_active_memory()
+    mx.reset_peak_memory()
+    step_reports = _run_packed_train_steps(
+        model, opt, loss_fn, dataset, batch=batch, pack_len=pack_len, steps=steps,
+        grad_checkpoint=grad_checkpoint, iterate_batches=iterate,
+    )
+    marginal_peak_gb = (mx.get_peak_memory() - active_before) / 1024**3
+
+    observed_after = install_guardrails()
+    if not wired_cap_holds(observed_bytes=observed_after, expected_bytes=expected_wired):
+        raise WiredCapRegressionError(
+            f"packed_train condition's wired limit was {observed_after / 1024**3:.2f} GB "
+            f"after training, expected the house cap {expected_wired / 1024**3:.2f} GB "
+            "-- mlx_lm.tuner.trainer.train()'s entry-time override was not correctly "
+            "re-asserted (see this module's docstring)"
+        )
+
+    return {
+        "arm": arm,
+        "pack_len": pack_len,
+        **batching_fields,
+        **_packed_summary(
+            step_reports, warmup=warmup, mean_real=mean_real, mean_samples=mean_samples,
+        ),
+        "active_before_gb": round(active_before / 1024**3, 4),
+        "marginal_peak_gb": round(marginal_peak_gb, 4),
+        "total_peak_gb": round(active_before / 1024**3 + marginal_peak_gb, 4),
+        "observed_wired_limit_gb": round(observed_after / 1024**3, 4),
+        "house_wired_limit_gb": round(expected_wired / 1024**3, 4),
+        "wired_limit_before_reassert_gb": (
+            round(observed_before[0] / 1024**3, 4) if observed_before else None
+        ),
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="python -m mlx_train_perf.bench.worker")
     ap.add_argument("--config", required=True, help="path to a JSON condition config")
@@ -515,6 +823,11 @@ def main(argv: list[str] | None = None) -> int:
                 fields = run_loss_layer(params)
             elif kind == "train_step":
                 fields = run_train_step(params, attention_impl=attention_impl)
+            elif kind == "packed_train":
+                # attention_impl rides the identity (always "flash" for this kind) but is
+                # not an execution knob here -- run_packed_train always enables flash on
+                # both arms; the batching strategy is the only variable.
+                fields = run_packed_train(params)
             else:
                 # Deliberately uncaught: an unsupported kind is a program error (a bad
                 # Condition was constructed), not a recorded run outcome -- it crashes this
@@ -524,8 +837,8 @@ def main(argv: list[str] | None = None) -> int:
                 # above (not a dict bound at import time) also keeps this dispatch
                 # monkeypatch-friendly for tests.
                 raise MlxTrainPerfError(
-                    f"unsupported bench condition kind {kind!r}; expected 'loss_layer' or "
-                    "'train_step'"
+                    f"unsupported bench condition kind {kind!r}; expected 'loss_layer', "
+                    "'train_step', or 'packed_train'"
                 )
         except LaunchBudgetError as exc:
             # A guard refusal IS a result: the calibrated rate cannot serve this shape

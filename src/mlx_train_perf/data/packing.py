@@ -247,3 +247,136 @@ def packed_iterate_batches(
         epoch += 1
         if not loop:
             break
+
+
+# ---------------------------------------------------------------------------------
+# Dataset-level batching analytics (host-side, GPU-free) -- the numbers behind the
+# packed-training bench (scripts/bench_packed_training.py). `stock_batching_stats`
+# replays mlx-lm's own sort+batch+pad-to-max logic exactly (the padding-waste baseline);
+# `packed_batching_stats` reports the per-step real-token/sample counts over the packs a
+# whole number of batches consumes, plus the whole-dataset `pack_stats` fractions.
+# ---------------------------------------------------------------------------------
+
+_STOCK_PAD_TO = 32  # mlx_lm.tuner.trainer.iterate_batches pads to 1 + 32*ceil(max/32)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class LengthHistogram:
+    """Sequence-length summary for a tokenized dataset (all counts in tokens)."""
+
+    count: int
+    mean: float
+    median: float
+    p90: float
+    minimum: int
+    maximum: int
+    total_tokens: int
+
+
+def length_histogram(lengths: Sequence[int]) -> LengthHistogram:
+    """Count / mean / median / p90 / min / max / total over a dataset's sequence lengths.
+    p90 is numpy's default (linear-interpolation) percentile."""
+    if not lengths:
+        raise PackingError("cannot summarize an empty length list")
+    arr: Any = np.asarray(lengths, dtype=np.int64)
+    return LengthHistogram(
+        count=len(lengths),
+        mean=float(arr.mean()),
+        median=float(np.median(arr)),
+        p90=float(np.percentile(arr, 90)),
+        minimum=int(arr.min()),
+        maximum=int(arr.max()),
+        total_tokens=int(arr.sum()),
+    )
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class StockBatchingStats:
+    """Padding-waste breakdown of stock (unpacked) batching at a fixed batch size."""
+
+    num_batches: int
+    real_tokens_total: int
+    padded_tokens_total: int
+    padding_waste_fraction: float
+    mean_real_tokens_per_step: float
+    mean_samples_per_step: float
+
+
+def stock_batching_stats(
+    lengths: Sequence[int], *, batch_size: int, max_seq_length: int
+) -> StockBatchingStats:
+    """Replay `mlx_lm.tuner.trainer.iterate_batches` (trainer.py:102-170) host-side to
+    measure its padding waste: sort by length, group into `batch_size` batches (dropping
+    the trailing partial), pad each batch to `min(1 + 32*ceil(max_in_batch/32),
+    max_seq_length)`, and truncate content to `max_seq_length`. `padding_waste_fraction`
+    is the share of the allocated `(num_batches * batch_size * width)` token budget that
+    is padding rather than real content."""
+    if batch_size < 1:
+        raise PackingError(f"batch_size must be >= 1; got {batch_size}")
+    if max_seq_length < 1:
+        raise PackingError(f"max_seq_length must be >= 1; got {max_seq_length}")
+    order = sorted(range(len(lengths)), key=lambda i: lengths[i])
+    real_total = 0
+    padded_total = 0
+    num_batches = 0
+    for start in range(0, len(order) - batch_size + 1, batch_size):
+        batch_lengths = [lengths[i] for i in order[start : start + batch_size]]
+        widest = max(batch_lengths)
+        width = min(
+            1 + _STOCK_PAD_TO * ((widest + _STOCK_PAD_TO - 1) // _STOCK_PAD_TO),
+            max_seq_length,
+        )
+        real_total += sum(min(n, max_seq_length) for n in batch_lengths)
+        padded_total += batch_size * width
+        num_batches += 1
+    waste = (padded_total - real_total) / padded_total if padded_total else 0.0
+    mean_real = real_total / num_batches if num_batches else 0.0
+    return StockBatchingStats(
+        num_batches=num_batches,
+        real_tokens_total=real_total,
+        padded_tokens_total=padded_total,
+        padding_waste_fraction=waste,
+        mean_real_tokens_per_step=mean_real,
+        mean_samples_per_step=float(batch_size),
+    )
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class PackedBatchingStats:
+    """Per-step real-token / sample counts (over the CONSUMED packs) plus the
+    whole-dataset utilization fractions (from `pack_stats`)."""
+
+    num_batches: int
+    real_tokens_total: int
+    mean_real_tokens_per_step: float
+    mean_samples_per_step: float
+    utilization: float
+    separator_fraction: float
+    tail_pad_fraction: float
+
+
+def packed_batching_stats(
+    lengths: Sequence[int], pack_len: int, *, batch_size: int, seed: int, epoch: int = 0
+) -> PackedBatchingStats:
+    """Pack the dataset once (`pack_indices(seed, epoch)`), then measure the packs a
+    whole number of `batch_size` batches consumes (the trailing partial batch is dropped,
+    matching `packed_iterate_batches`). `real_tokens_total` / the per-step means are over
+    those consumed packs; `utilization`/`separator_fraction`/`tail_pad_fraction` come from
+    `pack_stats` over the full pack list."""
+    if batch_size < 1:
+        raise PackingError(f"batch_size must be >= 1; got {batch_size}")
+    packs = pack_indices(lengths, pack_len, seed=seed, epoch=epoch)
+    num_batches = len(packs) // batch_size
+    consumed = packs[: num_batches * batch_size]
+    real_consumed = sum(min(lengths[i], pack_len) for pack in consumed for i in pack)
+    samples_consumed = sum(len(pack) for pack in consumed)
+    stats = pack_stats(packs, lengths, pack_len)
+    return PackedBatchingStats(
+        num_batches=num_batches,
+        real_tokens_total=real_consumed,
+        mean_real_tokens_per_step=real_consumed / num_batches if num_batches else 0.0,
+        mean_samples_per_step=samples_consumed / num_batches if num_batches else 0.0,
+        utilization=stats.utilization,
+        separator_fraction=stats.separator_fraction,
+        tail_pad_fraction=stats.tail_pad_fraction,
+    )
