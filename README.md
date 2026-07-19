@@ -231,6 +231,12 @@ The guard sets an active-memory ceiling from the machine's own RAM. It is anchor
 
 The guard is rank-local: every input it reads is this node's own RAM, availability, and process memory. On a multi-node `mx.distributed` job each rank sizes its own ceiling and flags its own crowding, and a breach hard-exits that rank — so run distributed training under a launcher (`mpirun` or `mlx.launch`) that propagates a rank failure to the whole job.
 
+## Research
+
+- [Fused linear cross-entropy on Apple GPUs](https://github.com/IonDen/mlx-train-perf/blob/main/docs/papers/fused-linear-cross-entropy-apple-gpus.md)
+  explains how vocabulary chunking and a fused Metal kernel avoid materializing logits. It covers
+  memory costs, the optimization ladder, failed performance models, and the limits of the evidence.
+
 ## Community benchmarks
 
 Every number above is from an M1 Max (32 GB), the machine this is developed on. Whether the
