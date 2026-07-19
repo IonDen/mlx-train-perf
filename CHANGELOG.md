@@ -4,6 +4,49 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-07-19
+
+Adds sequence packing for instruction-tuning data: many short sequences share one
+fixed-length training row, kept independent by a block-diagonal attention mask inside the
+flash Metal kernels. Measured on Alpaca at batch size 1 with LoRA and gradient
+checkpointing, packing moves real-data throughput 2.72× on both Qwen3-8B-4bit (32.9 →
+89.6 tokens/sec) and Llama-3.2-3B-4bit (71.5 → 194.4), with a conservative steady-state
+reading of 2.0–2.3× once the stock arm's one-time compile traces are discounted. The win
+at batch 1 is amortization, not padding: a fixed ~2-second step cost paid once per ~4,000
+packed tokens instead of once per ~84.
+
+### Added
+- `packed_iterate_batches` (`mlx_train_perf.data.packing`): a drop-in for `train`'s
+  `iterate_batches` that packs `(tokens, offset)` sequences into fixed rows with a seeded
+  per-epoch shuffle and first-fit placement, and emits per-token segment buffers alongside
+  each batch. Fixed shapes every batch, so the compiled step traces once.
+- `make_packed_loss_fn` (`mlx_train_perf.adapters.mlx_lm`): the packed counterpart of
+  `make_loss_fn`. Reproduces mlx-lm's loss masking segment by segment — the supervised
+  token set is identical to an unpacked run, and a packed batch matches the same sequences
+  run unpacked to 5.0e-4 (pin 2e-2, sized from measured RoPE offset drift). Refuses at
+  construction if flash attention is not enabled.
+- `flash_attention(segments=...)` and a `PACKED` variant of the forward, dQ, and dK/dV
+  Metal kernels: block-diagonal causal masking via an O(N) per-token segment id, never a
+  materialized mask. Single-segment output is bit-identical to the causal kernels; packed
+  parity against a block-diagonal oracle holds at the same pinned tolerances as causal,
+  through the 8k dispatch bucket. The identical-work packed variant costs at most 11% over
+  causal at 8k; on real multi-segment rows the forward and dQ kernels skip cross-segment
+  blocks and run about 3× faster than causal at the same length.
+- `enable_flash_attention(packed=True)`: pre-warms the packed kernels' calibration caches
+  at the training shape so the compiled first step traces with warm caches.
+- `scripts/bench_packed_training.py` and `scripts/prep_alpaca.py`: the committed benchmark
+  behind the numbers above — one arm per invocation, both arms on flash attention and the
+  fused loss so batching strategy is the only variable, real-token accounting that never
+  counts padding, and a pinned-revision dataset prep that records the exact padding-waste
+  and utilization statistics of the prepared sample.
+
+### Fixed
+- `enable_flash_attention`'s documentation overstated what happens when a compiled `train`
+  traces at a shape the calibration caches were not warmed for. Measured on mlx 0.32.0:
+  the calibration runs once inside the trace and the run completes — a one-time stall, not
+  the crash the docs promised. The pre-warm hints remain recommended; the mid-trace
+  calibration's measured rate lands within 3% of an up-front one.
+
 ## [0.3.1] - 2026-07-15
 
 Adds the Qwen2 (Qwen2.5) family to the flash-attention training path. Qwen2 already worked

@@ -44,9 +44,11 @@ from mlx_train_perf.attention.kernel.launch import (
     _FWD_RATE_CACHE,
     _n_bucket,
 )
+from mlx_train_perf.attention.reference import math_attention
+from mlx_train_perf.attention.segments import PackedMask
 from mlx_train_perf.attention.wrapper import (
     FlashAttentionWrapper,
-    _resolve_causal,
+    _resolve_mask,
     enable_flash_attention,
 )
 from mlx_train_perf.bench.worker import _run_train_steps, _synthetic_train_examples
@@ -101,6 +103,42 @@ _FAMILIES = {
 def _ids(vocab: int, b: int, length: int, *, seed: int = 0) -> mx.array:
     mx.random.seed(seed)
     return mx.random.randint(0, vocab, (b, length))
+
+
+def _packed_layout(seg_lens: list[int], b: int) -> tuple[mx.array, mx.array]:
+    """(B, N) int32 seg_id/seg_start for a fixed segment-length list, shared across batch rows
+    (mirrors tests/test_attention_api.py::_packed_layout -- the PackedMask contract: seg_id
+    contiguous ascending, seg_start each position's segment-start index)."""
+    seg_id_row: list[int] = []
+    seg_start_row: list[int] = []
+    start = 0
+    for sid, ln in enumerate(seg_lens):
+        seg_id_row += [sid] * ln
+        seg_start_row += [start] * ln
+        start += ln
+    seg_id = mx.array([seg_id_row] * b, dtype=mx.int32)
+    seg_start = mx.array([seg_start_row] * b, dtype=mx.int32)
+    return seg_id, seg_start
+
+
+def _wrapper_ref_forward(
+    wrapper: FlashAttentionWrapper, x: mx.array, *, segments: PackedMask | None
+) -> mx.array:
+    """Independent oracle for the wrapper's forward (llama, no qk-norm): reproduces the
+    project -> reshape -> RoPE steps on the wrapper's OWN held submodules, then routes the
+    attention through `math_attention(segments=)` (the block-diagonal-causal oracle) instead
+    of `flash_attention`. Distinguishes segments-forwarded from segments-dropped: with
+    `segments` set the oracle is block-diagonal, so a wrapper that dropped the mask would not
+    match it."""
+    b, length, _ = x.shape
+    q = wrapper.q_proj(x).reshape(b, length, wrapper.n_heads, -1).transpose(0, 2, 1, 3)
+    k = wrapper.k_proj(x).reshape(b, length, wrapper.n_kv_heads, -1).transpose(0, 2, 1, 3)
+    v = wrapper.v_proj(x).reshape(b, length, wrapper.n_kv_heads, -1).transpose(0, 2, 1, 3)
+    q = wrapper.rope(q)
+    k = wrapper.rope(k)
+    o = math_attention(q, k, v, scale=wrapper.scale, causal=True, segments=segments)
+    o = o.transpose(0, 2, 1, 3).reshape(b, length, -1)
+    return wrapper.o_proj(o)
 
 
 # ---------------------------------------------------------------------------
@@ -176,13 +214,52 @@ def test_enable_refuses_configured_dropout() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_resolve_causal_accepts_string_and_none_refuses_array() -> None:
-    assert _resolve_causal("causal") is True
-    assert _resolve_causal(None) is True
+def test_resolve_mask_accepts_string_none_packedmask_refuses_array() -> None:
+    assert _resolve_mask("causal") is True
+    assert _resolve_mask(None) is True
+    seg_id, seg_start = _packed_layout([2, 2], b=1)
+    pm = PackedMask(seg_id=seg_id, seg_start=seg_start)
+    assert _resolve_mask(pm) is pm  # a PackedMask passes through untouched
     with pytest.raises(AttentionInputError, match="causal"):
-        _resolve_causal("sliding")
+        _resolve_mask("sliding")
     with pytest.raises(AttentionInputError, match="array attention masks"):
-        _resolve_causal(mx.zeros((4, 4)))
+        _resolve_mask(mx.zeros((4, 4)))
+
+
+@pytest.mark.parametrize(
+    "impl", ["reference", pytest.param("kernel", marks=pytest.mark.metal)]
+)
+def test_wrapper_forwards_packed_mask_into_flash_attention_segments(impl: str) -> None:
+    """A `PackedMask` mask routes through the wrapper into `flash_attention(segments=)`: the
+    wrapper output matches the hand-built block-diagonal oracle (project -> RoPE ->
+    math_attention(segments=) -> o_proj) AND differs from the plain-causal output -- proving
+    the segments actually reached the attention rather than being silently dropped. Measured
+    worst |diff| vs the oracle (mlx 0.32.0, fp32, tiny 1x16, head_dim=64): reference
+    0.000e+00 (bit-identical -- flash_attention_reference and math_attention share a code
+    path), kernel ~9e-07 (fp32-accumulate flash vs materialized oracle). Pin 2e-6, matching
+    the sibling wrapper/API packed pins."""
+    model = _tiny_llama_hd64()
+    enable_flash_attention(model, impl=impl)
+    wrapper = model.model.layers[0].self_attn
+    assert isinstance(wrapper, FlashAttentionWrapper)
+
+    b, length = 1, 16
+    x = mx.random.normal((b, length, model.args.hidden_size))
+    mx.eval(x)
+    seg_id, seg_start = _packed_layout([9, 7], b=b)  # two segments
+    pm = PackedMask(seg_id=seg_id, seg_start=seg_start)
+
+    out = wrapper(x, mask=pm)
+    oracle = _wrapper_ref_forward(wrapper, x, segments=pm)
+    out_causal = wrapper(x, mask="causal")
+    mx.eval(out, oracle, out_causal)
+
+    worst = mx.abs(out - oracle).max().item()
+    assert worst < 2e-6, f"{impl} wrapper packed forward worst |diff| {worst:.3e} exceeds 2e-6"
+    assert not mx.array_equal(out, out_causal).item(), (
+        "packed and plain-causal outputs are identical -- the PackedMask never reached the "
+        "attention call (segments silently dropped)"
+    )
 
 
 def test_call_time_guard_accepts_causal_string_refuses_array_mask() -> None:
@@ -228,9 +305,10 @@ def test_enable_prewarms_rate_caches_no_calibration_in_compiled_trace() -> None:
     fwd_tile = select_fwd_tile(n, _HEAD_DIM)
     dq_tile, dkv_tile = select_bwd_tiles(n, _HEAD_DIM)
     nb = _n_bucket(n)
-    fkey = (_HEAD_DIM, str(dtype), True, b, hq, nb, fwd_tile.variant, fwd_tile.d_slab)
-    dqkey = (_HEAD_DIM, str(dtype), True, b, hq, nb, dq_tile.variant, dq_tile.d_slab)
-    dkvkey = (_HEAD_DIM, str(dtype), True, b, hq, nb, dkv_tile.variant, dkv_tile.d_slab)
+    # key tail gains a trailing `packed` bool (0.4.0); enable pre-warms the non-packed path.
+    fkey = (_HEAD_DIM, str(dtype), True, b, hq, nb, fwd_tile.variant, fwd_tile.d_slab, False)
+    dqkey = (_HEAD_DIM, str(dtype), True, b, hq, nb, dq_tile.variant, dq_tile.d_slab, False)
+    dkvkey = (_HEAD_DIM, str(dtype), True, b, hq, nb, dkv_tile.variant, dkv_tile.d_slab, False)
     for cache, key in (
         (_FWD_RATE_CACHE, fkey), (_BWD_DQ_RATE_CACHE, dqkey), (_BWD_DKV_RATE_CACHE, dkvkey)
     ):
@@ -255,6 +333,49 @@ def test_enable_prewarms_rate_caches_no_calibration_in_compiled_trace() -> None:
     mx.eval(g)
 
     assert (len(_FWD_RATE_CACHE), len(_BWD_DQ_RATE_CACHE), len(_BWD_DKV_RATE_CACHE)) == sizes
+
+
+@pytest.mark.metal
+def test_enable_packed_prewarms_packed_keyed_rate_caches() -> None:
+    """`enable_flash_attention(packed=True, seq_len=...)` additionally warms the THREE
+    packed-keyed rate caches (fwd + bwd dQ + bwd dK/dV) -- the same shape a packed training
+    forward hits, keyed with the trailing `packed` component True -- so a subsequently
+    compiled packed step traces warm. One `segments=`-carrying forward suffices: all three
+    `calibrated_*_rate(packed=True)` probes run in `flash_attention`'s Python body. Isolated by
+    popping the packed keys first, so this proves ENABLE warms them."""
+    model = _tiny_llama_hd64()
+    attn = model.model.layers[0].self_attn
+    hq = attn.n_heads
+    dtype = model.model.norm.weight.dtype
+    n, b = 32, 1
+
+    fwd_tile = select_fwd_tile(n, _HEAD_DIM)
+    dq_tile, dkv_tile = select_bwd_tiles(n, _HEAD_DIM)
+    nb = _n_bucket(n)
+    # trailing `packed` component True -> the packed-keyed rate slots.
+    fkey = (_HEAD_DIM, str(dtype), True, b, hq, nb, fwd_tile.variant, fwd_tile.d_slab, True)
+    dqkey = (_HEAD_DIM, str(dtype), True, b, hq, nb, dq_tile.variant, dq_tile.d_slab, True)
+    dkvkey = (_HEAD_DIM, str(dtype), True, b, hq, nb, dkv_tile.variant, dkv_tile.d_slab, True)
+    for cache, key in (
+        (_FWD_RATE_CACHE, fkey), (_BWD_DQ_RATE_CACHE, dqkey), (_BWD_DKV_RATE_CACHE, dkvkey)
+    ):
+        cache.pop(key, None)
+
+    enable_flash_attention(model, impl="kernel", seq_len=n, batch_size=b, packed=True)
+
+    assert fkey in _FWD_RATE_CACHE, "packed enable did not pre-warm the packed forward rate"
+    assert dqkey in _BWD_DQ_RATE_CACHE, "packed enable did not pre-warm the packed dQ rate"
+    assert dkvkey in _BWD_DKV_RATE_CACHE, "packed enable did not pre-warm the packed dK/dV rate"
+
+
+def test_enable_packed_without_seq_len_succeeds() -> None:
+    """`packed=True` with NO `seq_len` hint enables without error -- eager / `mx.grad` callers
+    calibrate the packed rates lazily and harmlessly on the first packed attention call (the
+    documented lazy-calibration path; the compiled-train contract only binds when a hint is
+    given)."""
+    model = _tiny_llama_hd64()
+    enable_flash_attention(model, impl="kernel", packed=True)  # no seq_len -> no pre-warm
+    assert isinstance(model.model.layers[0].self_attn, FlashAttentionWrapper)
 
 
 # ---------------------------------------------------------------------------

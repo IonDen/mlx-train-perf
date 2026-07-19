@@ -13,7 +13,13 @@ import pytest
 
 from mlx_train_perf.attention import api
 from mlx_train_perf.attention.api import flash_attention, resolve_attention_impl
+from mlx_train_perf.attention.kernel.launch import (
+    _BWD_DKV_RATE_CACHE,
+    _BWD_DQ_RATE_CACHE,
+    _FWD_RATE_CACHE,
+)
 from mlx_train_perf.attention.reference import math_attention
+from mlx_train_perf.attention.segments import PackedMask
 from mlx_train_perf.errors import AttentionInputError, UnsupportedAttentionError
 
 
@@ -26,6 +32,42 @@ def _rand_qkv(
     v = mx.random.normal((b, hkv, n, d)).astype(dtype)
     mx.eval(q, k, v)
     return q, k, v
+
+
+def _packed_layout(seg_lens: list[int], b: int) -> tuple[mx.array, mx.array]:
+    """(B, N) int32 seg_id/seg_start for a fixed segment-length list, shared across batch rows
+    (mirrors tests/test_attention_kernel_fwd.py::_packed_layout -- the PackedMask contract:
+    seg_id contiguous ascending, seg_start each position's segment-start index)."""
+    seg_id_row: list[int] = []
+    seg_start_row: list[int] = []
+    start = 0
+    for sid, ln in enumerate(seg_lens):
+        seg_id_row += [sid] * ln
+        seg_start_row += [start] * ln
+        start += ln
+    seg_id = mx.array([seg_id_row] * b, dtype=mx.int32)
+    seg_start = mx.array([seg_start_row] * b, dtype=mx.int32)
+    return seg_id, seg_start
+
+
+def _packed_layout_per_row(rows_seg_lens: list[list[int]]) -> tuple[mx.array, mx.array]:
+    """(B, N) int32 seg_id/seg_start with a DIFFERENT segment layout on each batch row --
+    unlike `_packed_layout`, which broadcasts one row across the batch. Every row's seg_lens
+    must sum to the same N (the sequence axis is uniform). This is what makes a wrong batch
+    index in the kernel's segment-buffer reads observable (see the test below)."""
+    seg_id_rows: list[list[int]] = []
+    seg_start_rows: list[list[int]] = []
+    for seg_lens in rows_seg_lens:
+        seg_id_row: list[int] = []
+        seg_start_row: list[int] = []
+        start = 0
+        for sid, ln in enumerate(seg_lens):
+            seg_id_row += [sid] * ln
+            seg_start_row += [start] * ln
+            start += ln
+        seg_id_rows.append(seg_id_row)
+        seg_start_rows.append(seg_start_row)
+    return mx.array(seg_id_rows, dtype=mx.int32), mx.array(seg_start_rows, dtype=mx.int32)
 
 
 def test_flash_attention_value_matches_math_attention() -> None:
@@ -163,3 +205,302 @@ def test_custom_vjp_engaged_not_autodiff() -> None:
     mx.eval(g)
 
     assert api.VJP_CALLS.get("flash_attention", 0) > 0
+
+
+# =======================================================================================
+# T5 (0.4.0): sequence packing threaded through the public `flash_attention` API.
+# =======================================================================================
+
+
+def test_int_primal_vjp_int_zero_cotangent_matches_autodiff() -> None:
+    """SETTLED (mlx 0.32.0, plan-review empirical probe, verified eager + compiled): a
+    custom_function vjp may return int-dtype zeros for an int primal's cotangent -- the grad
+    wrt the FLOAT primal is unaffected and matches plain autodiff bit-for-bit. This is the
+    contract `flash_attention`'s packed vjp relies on for `seg_id`/`seg_start` (the two int
+    routing primals carry no gradient). Kept executable so the claim can't silently rot."""
+    idx = mx.array([1, 2, 3], dtype=mx.int32)
+
+    @mx.custom_function
+    def scaled(x: mx.array, i: mx.array) -> mx.array:
+        return x * i.astype(x.dtype)
+
+    @scaled.vjp
+    def scaled_vjp(
+        primals: tuple[mx.array, mx.array], cotangents: mx.array, _out: mx.array
+    ) -> tuple[mx.array, mx.array]:
+        x, i = primals
+        return cotangents * i.astype(x.dtype), mx.zeros(i.shape, dtype=i.dtype)
+
+    def plain(x: mx.array, i: mx.array) -> mx.array:
+        return x * i.astype(x.dtype)
+
+    x = mx.array([0.5, -1.5, 2.0])
+    g_custom = mx.grad(lambda x_: scaled(x_, idx).sum())(x)
+    g_plain = mx.grad(lambda x_: plain(x_, idx).sum())(x)
+    mx.eval(g_custom, g_plain)
+
+    assert mx.array_equal(g_custom, g_plain).item()
+
+
+def test_segments_with_non_causal_refuses() -> None:
+    """Packed attention is block-diagonal ON TOP of the causal triangle, so `segments=` with
+    `causal=False` is unsupported -- refused up front (never silently masked, never an assert
+    deep in the oracle). Checked at both the resolver and the public entry point."""
+    q, k, v = _rand_qkv(b=1, hq=4, hkv=2, n=8, d=32, seed=30)
+    seg_id, seg_start = _packed_layout([4, 4], b=1)
+    pm = PackedMask(seg_id=seg_id, seg_start=seg_start)
+    with pytest.raises(UnsupportedAttentionError, match="causal"):
+        resolve_attention_impl(q, k, v, impl="reference", causal=False, segments=pm)
+    with pytest.raises(UnsupportedAttentionError, match="causal"):
+        flash_attention(q, k, v, scale=1.0, causal=False, impl="reference", segments=pm)
+
+
+def test_reference_serves_segments_and_packed_vjp_engages() -> None:
+    """The reference oracle serves `segments=` at tiny N: forward value AND grad match
+    math_attention(segments=) autodiff (the block-diagonal-causal oracle), and the hand vjp
+    fires (VJP_CALLS increments -- a dropped .vjp would autodiff to identical values, per the
+    engagement-sentinel precedent). Fenced to tiny N: the reference backward materializes the
+    (N, N) matrices by design."""
+    b, hq, hkv, n, d = 1, 4, 2, 24, 32
+    scale = 1.0 / math.sqrt(d)
+    q, k, v = _rand_qkv(b=b, hq=hq, hkv=hkv, n=n, d=d, seed=31)
+    seg_id, seg_start = _packed_layout([10, 14], b=b)
+    pm = PackedMask(seg_id=seg_id, seg_start=seg_start)
+    api.VJP_CALLS.clear()
+
+    o_flash = flash_attention(q, k, v, scale=scale, causal=True, impl="reference", segments=pm)
+    o_math = math_attention(q, k, v, scale=scale, causal=True, segments=pm)
+    mx.eval(o_flash, o_math)
+    assert mx.array_equal(o_flash, o_math).item()
+
+    def flash_loss(q_: mx.array, k_: mx.array, v_: mx.array) -> mx.array:
+        return flash_attention(
+            q_, k_, v_, scale=scale, causal=True, impl="reference", segments=pm
+        ).sum()
+
+    def math_loss(q_: mx.array, k_: mx.array, v_: mx.array) -> mx.array:
+        return math_attention(q_, k_, v_, scale=scale, causal=True, segments=pm).sum()
+
+    g_flash = mx.grad(flash_loss, argnums=(0, 1, 2))(q, k, v)
+    g_math = mx.grad(math_loss, argnums=(0, 1, 2))(q, k, v)
+    mx.eval(*g_flash, *g_math)
+    worst = max(
+        float(mx.abs(gf - gm).max().item()) for gf, gm in zip(g_flash, g_math, strict=True)
+    )
+    assert worst < 2e-5, f"reference packed grad worst |diff|={worst}"
+    assert api.VJP_CALLS.get("flash_attention", 0) > 0
+
+
+# Measured-first through the PUBLIC kernel path vs the block-diagonal reference oracle (mlx
+# 0.32.0, M1 Max, fp32, seed=32):
+#   O:    n256 7.153e-7, n1024 8.345e-7 -> pin 2e-6 (~2.4x; same class as the packed O fp32 grid).
+#   grad: n256 7.629e-6, n1024 1.431e-5 -> pin 3e-5 (~2.1x over the n1024 worst; the grad-of-sum
+#         accumulates dQ+dK/dV over all rows, so it runs hotter than the n=24 causal grad pin).
+_PACKED_API_O_TOL = 2e-6
+_PACKED_API_GRAD_TOL = 3e-5
+
+
+@pytest.mark.metal
+@pytest.mark.parametrize("n", [256, 1024])
+def test_packed_parity_through_public_api(n: int) -> None:
+    """The whole packed path THROUGH `flash_attention(impl='kernel', segments=)`: forward value
+    matches the block-diagonal oracle, grads wrt q/k/v match math_attention(segments=) autodiff,
+    and the KERNEL-backward branch fires (`flash_attention_kernel_bwd` increments -- proves the
+    vjp is kernel-backed, not the pure-MLX oracle; value parity alone can't tell them apart)."""
+    b, hq, hkv, d = 1, 4, 2, 64
+    scale = 1.0 / math.sqrt(d)
+    q, k, v = _rand_qkv(b=b, hq=hq, hkv=hkv, n=n, d=d, seed=32)
+    seg_lens = [100, 156] if n == 256 else [400, 300, 324]
+    seg_id, seg_start = _packed_layout(seg_lens, b=b)
+    pm = PackedMask(seg_id=seg_id, seg_start=seg_start)
+    api.VJP_CALLS.clear()
+
+    o_kernel = flash_attention(q, k, v, scale=scale, causal=True, impl="kernel", segments=pm)
+    o_ref = math_attention(q, k, v, scale=scale, causal=True, segments=pm)
+    mx.eval(o_kernel, o_ref)
+    d_o = mx.abs(o_kernel - o_ref).max().item()
+
+    def kernel_loss(q_: mx.array, k_: mx.array, v_: mx.array) -> mx.array:
+        return flash_attention(
+            q_, k_, v_, scale=scale, causal=True, impl="kernel", segments=pm
+        ).sum()
+
+    def math_loss(q_: mx.array, k_: mx.array, v_: mx.array) -> mx.array:
+        return math_attention(q_, k_, v_, scale=scale, causal=True, segments=pm).sum()
+
+    g_kernel = mx.grad(kernel_loss, argnums=(0, 1, 2))(q, k, v)
+    g_math = mx.grad(math_loss, argnums=(0, 1, 2))(q, k, v)
+    mx.eval(*g_kernel, *g_math)
+    worst = max(
+        float(mx.abs(gk - gm).max().item()) for gk, gm in zip(g_kernel, g_math, strict=True)
+    )
+    print(f"[packed API n{n}] O={d_o:.3e} grad_worst={worst:.3e}")
+    assert d_o < _PACKED_API_O_TOL, f"packed API O diff {d_o}"
+    assert worst < _PACKED_API_GRAD_TOL, f"packed API grad worst {worst}"
+    assert api.VJP_CALLS.get("flash_attention_kernel_bwd", 0) > 0
+
+
+@pytest.mark.metal
+def test_packed_parity_per_row_varying_layout() -> None:
+    """DIFFERENT segment layouts per batch row at the SAME n, through the public kernel path
+    forward AND backward -- the one test that can catch a wrong batch index in ANY of the six
+    MSL segment-buffer reads (`seg_off = b * n`: source.py:51/275/695/876 via `b = bh/hq`,
+    :1233/1442 via `b = bkv/hkv`). The rest of the packed kernel grid uses batch-uniform
+    fixtures (`[row] * b`), whose rows are byte-identical -- so a read of the WRONG row's
+    segment content lands on the same bytes and the test stays green. Here row 0 ([100, 156])
+    and row 1 ([40, 60, 50, 66, 40]) carry genuinely different boundaries, so a wrong-row read
+    masks against the other row's layout and O/grad parity breaks. Oracle: math_attention(
+    segments=), whose `segment_allowed` broadcasts per-row (B,1,N,N) and honors distinct rows.
+    Pins reuse the batch-uniform grid's `_PACKED_API_O_TOL` / `_PACKED_API_GRAD_TOL`."""
+    b, hq, hkv, n, d = 2, 4, 2, 256, 64
+    scale = 1.0 / math.sqrt(d)
+    q, k, v = _rand_qkv(b=b, hq=hq, hkv=hkv, n=n, d=d, seed=34)
+    seg_id, seg_start = _packed_layout_per_row([[100, 156], [40, 60, 50, 66, 40]])
+    pm = PackedMask(seg_id=seg_id, seg_start=seg_start)
+
+    o_kernel = flash_attention(q, k, v, scale=scale, causal=True, impl="kernel", segments=pm)
+    o_ref = math_attention(q, k, v, scale=scale, causal=True, segments=pm)
+    mx.eval(o_kernel, o_ref)
+    d_o = mx.abs(o_kernel - o_ref).max().item()
+
+    def kernel_loss(q_: mx.array, k_: mx.array, v_: mx.array) -> mx.array:
+        return flash_attention(
+            q_, k_, v_, scale=scale, causal=True, impl="kernel", segments=pm
+        ).sum()
+
+    def math_loss(q_: mx.array, k_: mx.array, v_: mx.array) -> mx.array:
+        return math_attention(q_, k_, v_, scale=scale, causal=True, segments=pm).sum()
+
+    g_kernel = mx.grad(kernel_loss, argnums=(0, 1, 2))(q, k, v)
+    g_math = mx.grad(math_loss, argnums=(0, 1, 2))(q, k, v)
+    mx.eval(*g_kernel, *g_math)
+    worst = max(
+        float(mx.abs(gk - gm).max().item()) for gk, gm in zip(g_kernel, g_math, strict=True)
+    )
+    print(f"[packed API per-row n{n}] O={d_o:.3e} grad_worst={worst:.3e}")
+    assert d_o < _PACKED_API_O_TOL, f"per-row packed API O diff {d_o}"
+    assert worst < _PACKED_API_GRAD_TOL, f"per-row packed API grad worst {worst}"
+
+
+@pytest.mark.metal
+def test_packed_fresh_segments_refeed_under_compile() -> None:
+    """spec 8.3 / review F2: `seg_id`/`seg_start` are custom_function PRIMALS, never closure
+    captures, so a COMPILED fn re-fed a DIFFERENT segment layout (same shapes -> one trace) must
+    produce DIFFERENT masking. A closure capture would freeze layout A into the trace and layout
+    B would return layout-A's (wrong) output. The oracle says the two layouts differ, and the
+    kernel-backward branch must fire on the packed grad path."""
+    b, hq, hkv, n, d = 1, 4, 2, 64, 64
+    scale = 1.0 / math.sqrt(d)
+    q, k, v = _rand_qkv(b=b, hq=hq, hkv=hkv, n=n, d=d, seed=33)
+    seg_id_a, seg_start_a = _packed_layout([32, 32], b=b)
+    seg_id_b, seg_start_b = _packed_layout([16, 48], b=b)
+
+    def fn(
+        q_: mx.array, k_: mx.array, v_: mx.array, sid: mx.array, sst: mx.array
+    ) -> mx.array:
+        return flash_attention(
+            q_, k_, v_, scale=scale, causal=True, impl="kernel",
+            segments=PackedMask(seg_id=sid, seg_start=sst),
+        )
+
+    compiled = mx.compile(fn)
+    o_a = compiled(q, k, v, seg_id_a, seg_start_a)
+    o_b = compiled(q, k, v, seg_id_b, seg_start_b)
+    o_ref_a = math_attention(
+        q, k, v, scale=scale, causal=True,
+        segments=PackedMask(seg_id=seg_id_a, seg_start=seg_start_a),
+    )
+    o_ref_b = math_attention(
+        q, k, v, scale=scale, causal=True,
+        segments=PackedMask(seg_id=seg_id_b, seg_start=seg_start_b),
+    )
+    mx.eval(o_a, o_b, o_ref_a, o_ref_b)
+
+    # The two layouts genuinely differ (oracle), so a threaded kernel must differ too.
+    assert not mx.array_equal(o_ref_a, o_ref_b).item(), "layouts A/B do not differ -- weak test"
+    assert mx.abs(o_a - o_ref_a).max().item() < 1e-2, "compiled A != oracle A"
+    assert mx.abs(o_b - o_ref_b).max().item() < 1e-2, "compiled B != oracle B"
+    assert not mx.array_equal(o_a, o_b).item(), (
+        "re-fed layout B produced layout A's output -- seg buffers were captured, not threaded"
+    )
+
+    # The packed grad path also fires the kernel-backward branch under compile.
+    api.VJP_CALLS.clear()
+
+    def loss(q_: mx.array, sid: mx.array, sst: mx.array) -> mx.array:
+        return flash_attention(
+            q_, k, v, scale=scale, causal=True, impl="kernel",
+            segments=PackedMask(seg_id=sid, seg_start=sst),
+        ).sum()
+
+    g = mx.compile(mx.grad(loss))(q, seg_id_b, seg_start_b)
+    mx.eval(g)
+    assert api.VJP_CALLS.get("flash_attention_kernel_bwd", 0) > 0
+
+
+@pytest.mark.metal
+def test_calibration_eval_transform_valueerror_wrapped_as_unsupported(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """EXACT-SHAPE CONTRACT mechanic (0.4.0 / T6). IF a rate calibration ever host-syncs on a
+    traced array mid-transform, mlx raises the opaque `[eval] Attempting to eval an array
+    during function transformations` ValueError. `flash_attention`'s kernel path upgrades JUST
+    that error to a clear `UnsupportedAttentionError` naming the shape (batch, n-bucket, packed
+    flag) and the exact `enable_flash_attention(...)` pre-warm call, preserving the original via
+    `from`. The real calibration probes with DETACHED arrays so it never triggers this today
+    (see the sibling no-crash test); this fakes the calibration boundary to prove the guard
+    converts the error rather than letting the opaque one escape. An UNRELATED calibration
+    ValueError must pass through untouched (never masked as a shape problem)."""
+    q, k, v = _rand_qkv(b=1, hq=2, hkv=1, n=32, d=64, seed=42)  # head_dim 64 -> kernel path
+
+    def _raise_eval_transform(**_: object) -> float:
+        raise ValueError(
+            "[eval] Attempting to eval an array during function transformations "
+            "like compile or vmap is not allowed."
+        )
+
+    monkeypatch.setattr(api, "calibrated_fwd_rate", _raise_eval_transform)
+    with pytest.raises(UnsupportedAttentionError, match="enable_flash_attention") as ei:
+        flash_attention(q, k, v, scale=1.0, causal=True, impl="kernel")
+    assert "batch=1" in str(ei.value)
+    assert "n-bucket=512" in str(ei.value)
+    assert isinstance(ei.value.__cause__, ValueError)  # original preserved via `from`
+
+    # An unrelated calibration ValueError is NOT masked as a shape problem -- it escapes as-is.
+    def _raise_other(**_: object) -> float:
+        raise ValueError("some genuine calibration bug")
+
+    monkeypatch.setattr(api, "calibrated_fwd_rate", _raise_other)
+    with pytest.raises(ValueError, match="genuine calibration bug"):
+        flash_attention(q, k, v, scale=1.0, causal=True, impl="kernel")
+
+
+@pytest.mark.metal
+def test_cold_shape_compiled_grad_recalibrates_without_crash() -> None:
+    """Ground-truth of the real EXACT-SHAPE behavior (verified this task): calibration probes
+    with DETACHED arrays, and mlx permits eval'ing detached constants inside a compiled trace
+    (only eval of a TRACED array raises). So a compiled grad at a shape the caches were NEVER
+    warmed for does NOT crash -- it runs a one-time in-region calibration and populates the
+    cache. The seq_len/batch_size hints on `enable_flash_attention` merely avoid that first-step
+    stall; a wrong hint is a perf cost, not a failure. (Complements the warm-cache no-recalibrate
+    pin in test_attention_wrapper.py.)"""
+    hq, hkv, n, d = 2, 1, 32, 64  # n=32 -> n-bucket 512
+    scale = 1.0 / math.sqrt(d)
+    # Isolate: drop every b==2 rate-cache entry so b=2 is genuinely cold for any tile (b is
+    # key index 3: (head_dim, dtype, causal, b, hq, n-bucket, variant, d_slab, packed)).
+    for cache in (_FWD_RATE_CACHE, _BWD_DQ_RATE_CACHE, _BWD_DKV_RATE_CACHE):
+        for key in [k for k in cache if k[3] == 2]:
+            cache.pop(key, None)
+
+    q1, k1, v1 = _rand_qkv(b=1, hq=hq, hkv=hkv, n=n, d=d, seed=40)
+    mx.eval(flash_attention(q1, k1, v1, scale=scale, causal=True, impl="kernel"))  # warm b=1
+
+    q2, k2, v2 = _rand_qkv(b=2, hq=hq, hkv=hkv, n=n, d=d, seed=41)
+
+    def loss(q_: mx.array) -> mx.array:
+        return flash_attention(q_, k2, v2, scale=scale, causal=True, impl="kernel").sum()
+
+    g = mx.compile(mx.grad(loss))(q2)  # cold b=2 -> one-time in-region calibration, no crash
+    mx.eval(g)
+    assert math.isfinite(mx.abs(g).max().item())
+    assert any(key[3] == 2 for key in _FWD_RATE_CACHE), "cold compiled call did not calibrate b=2"

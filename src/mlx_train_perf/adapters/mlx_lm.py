@@ -216,3 +216,82 @@ def make_loss_fn(
         return loss, ntoks
 
     return loss_fn
+
+
+def make_packed_loss_fn(
+    model: Any,
+    *,
+    impl: Literal["auto", "kernel", "chunked", "naive"] = "auto",
+    allow_unverified_mlx: bool = False,
+) -> Callable[
+    [Any, mx.array, mx.array, mx.array, mx.array], tuple[mx.array, mx.array]
+]:
+    """Build the packed-sequence loss callable for mlx-lm's trainer:
+    `loss(model, batch, seg_id, seg_start, loss_mask) -> (loss, ntoks)` -- the 4-array tuple
+    `mlx_train_perf.data.packing.packed_iterate_batches` yields (int32 `(B, L+1)` token rows,
+    int32 `(B, L)` seg_id, int32 `(B, L)` seg_start, bool `(B, L)` loss_mask).
+
+    Unlike `make_loss_fn`, which calls the model's top-level trunk (whose call hardcodes the
+    "causal" mask, `mlx_lm/models/*.py`), this walks the inner model LAYER BY LAYER --
+    `embed_tokens -> for layer: layer(h, mask, cache) -> norm` -- so it can thread a
+    `PackedMask(seg_id, seg_start)` carrier as each block's `mask`. Verified against the
+    installed mlx-lm==0.31.3 (mlx==0.32.0) source (2026-07-18): llama.py:173-197
+    (`LlamaModel.__call__`), qwen2.py:137-155 (`Qwen2Model.__call__`), qwen3.py:142-160
+    (`Qwen3Model.__call__`) are all exactly that shape, with no extra scaling; the three
+    families share `embed_tokens`/`layers`/`norm` (same gate as `make_loss_fn`). The walk
+    stays grad-checkpointed: `grad_checkpoint` patches `type(layer).__call__` at class level,
+    so direct block calls dispatch through the patched method (spec §3.2).
+
+    Fails fast at CONSTRUCTION (`AdapterError`): an unsupported architecture or missing
+    `mlx-lm` (via `split_model`), and -- because only the `FlashAttentionWrapper` can
+    interpret the `PackedMask` carrier (stock SDPA would hand it to
+    `mx.fast.scaled_dot_product_attention` and die opaquely) -- any layer whose `self_attn`
+    is not a wrapper, naming `enable_flash_attention`. As in `make_loss_fn`, the
+    construction-time `(trunk, head)` is discarded and re-derived from the live `model`
+    argument on every call (see the module docstring for the staleness rationale).
+    """
+    from mlx_train_perf.attention.segments import PackedMask  # noqa: PLC0415
+    from mlx_train_perf.attention.wrapper import FlashAttentionWrapper  # noqa: PLC0415
+
+    split_model(model)  # family/head fail-fast, result discarded (as in make_loss_fn)
+    for i, layer in enumerate(model.model.layers):
+        if not isinstance(layer.self_attn, FlashAttentionWrapper):
+            raise AdapterError(
+                f"make_packed_loss_fn requires enable_flash_attention(model) first; "
+                f"layer {i} self_attn is {type(layer.self_attn).__name__!r}"
+            )
+
+    resolved_impl: Literal["kernel", "chunked", "naive"] | None = None
+
+    def loss_fn(
+        model_arg: Any,
+        batch: mx.array,
+        seg_id: mx.array,
+        seg_start: mx.array,
+        loss_mask: mx.array,
+    ) -> tuple[mx.array, mx.array]:
+        nonlocal resolved_impl
+        _, head = split_model(model_arg)  # fresh per call (module docstring: staleness)
+        inner = model_arg.model
+        inputs = batch[:, :-1]
+        targets = batch[:, 1:]
+        pm = PackedMask(seg_id=seg_id, seg_start=seg_start)
+        h = inner.embed_tokens(inputs)
+        for layer in inner.layers:
+            h = layer(h, pm, None)
+        hidden = inner.norm(h)
+        if resolved_impl is None:
+            n = hidden.shape[0] * hidden.shape[1]
+            resolved_impl = resolve_impl(
+                head=head, dtype=hidden.dtype, n=n, impl=impl,
+                allow_unverified_mlx=allow_unverified_mlx,
+            ).impl
+        # validate_targets=False for the same reason as make_loss_fn: the trainer wraps this
+        # step in mx.compile (no host syncs), and the ids are in-range by construction.
+        nll = linear_cross_entropy(hidden, head, targets, impl=resolved_impl,
+                                   reduction="none", validate_targets=False)
+        ntoks = loss_mask.sum()
+        loss = (nll * loss_mask).astype(mx.float32).sum() / ntoks
+        return loss, ntoks
+
+    return loss_fn

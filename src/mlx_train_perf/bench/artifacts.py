@@ -66,6 +66,14 @@ CODE_SHA_DEPS: tuple[Path, ...] = tuple(
         "attention/kernel/launch.py",
         "attention/kernel/dispatch.py",
         "attention/wrapper.py",
+        # Task 12 (0.4.0 packing cycle): the packed_train condition's measured path.
+        # `data/packing.py` supplies the packer/iterator/stats bench/worker.py calls
+        # directly for the packed arm; `attention/segments.py` supplies
+        # PackedMask/segment_allowed, imported by both attention/api.py and
+        # attention/wrapper.py (already listed above) -- a byte-change to either must
+        # invalidate a prior packed_train artifact.
+        "data/packing.py",
+        "attention/segments.py",
     )
 )
 

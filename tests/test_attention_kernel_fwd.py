@@ -29,6 +29,7 @@ from mlx_train_perf.attention.kernel.launch import (
     _fwd_macs_per_row,
     _next_probe_n,
     _start_probe_n,
+    _validate_segments,
     calibrated_fwd_rate,
     causal_pairs,
     check_fwd_budget,
@@ -44,7 +45,8 @@ from mlx_train_perf.attention.reference import (
     kv_head_for,
     math_attention,
 )
-from mlx_train_perf.errors import LaunchBudgetError
+from mlx_train_perf.attention.segments import PackedMask
+from mlx_train_perf.errors import AttentionInputError, LaunchBudgetError
 
 GENEROUS_RATE = 1e13  # parity shapes are microscopic; the budget check must never trip
 
@@ -668,6 +670,241 @@ def test_fwd_drop_diagonal_perturbation_fails_parity(variant: str) -> None:
 
 
 # ---------------------------------------------------------------------------------------
+# 0.4.0 T2: PACKED forward parity (block-diagonal-causal segments). The kernel's packed keep
+# predicate + KV-block lower bound must reproduce the Task-1 block-diagonal oracle
+# (`flash_attention_reference(..., segments=PackedMask(...))`) -- the same fp32 online-softmax
+# math, restricted to same-segment causal keys. Measured worsts are pinned below, per variant.
+# ---------------------------------------------------------------------------------------
+
+
+def _packed_layout(seg_lens: list[int], b: int) -> tuple[mx.array, mx.array]:
+    """Build the (B, N) int32 seg_id/seg_start buffers for a fixed list of segment lengths,
+    shared across every batch row. seg_id is contiguous ascending ids (0,0,..,1,1,..); seg_start
+    is each position's segment-start index (non-decreasing) -- the PackedMask contract."""
+    seg_id_row: list[int] = []
+    seg_start_row: list[int] = []
+    start = 0
+    for sid, ln in enumerate(seg_lens):
+        seg_id_row += [sid] * ln
+        seg_start_row += [start] * ln
+        start += ln
+    seg_id = mx.array([seg_id_row] * b, dtype=mx.int32)        # (b, n) contiguous
+    seg_start = mx.array([seg_start_row] * b, dtype=mx.int32)
+    return seg_id, seg_start
+
+
+# (n, seg_lens): 2-seg and 5-seg layouts, each with a segment boundary NOT aligned to the mma
+# 32-row query-block size (a mid-block boundary -- the case kv_lo + the per-row predicate must
+# still isolate exactly).
+_PACKED_CASES = [
+    (256, [100, 156]),                       # 2-seg, boundary at 100 (mid-block)
+    (256, [40, 60, 50, 66, 40]),             # 5-seg, several mid-block boundaries
+    (1024, [500, 524]),                      # 2-seg at n=1024
+    (1024, [200, 312, 130, 198, 184]),       # 5-seg at n=1024
+]
+
+# Measured worsts over the packed grid (mlx 0.32.0, M1 Max, seed=11), pinned measure-first.
+#   O fp32: scalar 1.132e-6, mma 1.073e-6  -> 2e-6 (both, ~1.8x; same class as causal O fp32).
+#   L fp32: scalar 1.907e-6, mma 9.537e-7  -> scalar 3e-6 (~1.6x), mma 2e-6 (~2.1x). The packed
+#           scalar L reduction order (masked keys skipped) lands ~2 ULP hotter than causal, so
+#           its L pin is a touch looser than mma's -- measured per variant, never shared/padded.
+#   O bf16: measured 1.953e-3 across the whole grid (O ~ 0.5 here -> one bf16 ULP at that scale).
+#           Pinned at 1.2e-2, the SAME ceiling as causal O bf16: O is written with a single
+#           cast-on-store, so a future segment layout with O near 1-2 hits ~1 ULP ~= 7.8e-3, the
+#           identical mechanism -- 1.2e-2 is the honest store-ULP ceiling, not padding over 2e-3.
+#   L bf16: scalar 1.907e-6, mma 9.537e-7 (L is fp32 regardless of input dtype) -> same as L fp32.
+_TOL_PACKED_O = {
+    "scalar": {mx.float32: 2e-6, mx.bfloat16: 1.2e-2},
+    "mma": {mx.float32: 2e-6, mx.bfloat16: 1.2e-2},
+}
+_TOL_PACKED_L = {
+    "scalar": {mx.float32: 3e-6, mx.bfloat16: 3e-6},
+    "mma": {mx.float32: 2e-6, mx.bfloat16: 2e-6},
+}
+
+
+def test_validate_segments_none_pair_is_not_packed() -> None:
+    assert _validate_segments(None, None, b=1, n=8, causal=True) is False
+
+
+def test_validate_segments_accepts_a_well_formed_pair() -> None:
+    seg = mx.zeros((2, 8), dtype=mx.int32)
+    assert _validate_segments(seg, seg, b=2, n=8, causal=True) is True
+
+
+def test_validate_segments_rejects_a_half_pair() -> None:
+    seg = mx.zeros((1, 8), dtype=mx.int32)
+    with pytest.raises(AttentionInputError, match="both or neither"):
+        _validate_segments(seg, None, b=1, n=8, causal=True)
+    with pytest.raises(AttentionInputError, match="both or neither"):
+        _validate_segments(None, seg, b=1, n=8, causal=True)
+
+
+def test_validate_segments_requires_causal() -> None:
+    seg = mx.zeros((1, 8), dtype=mx.int32)
+    with pytest.raises(AttentionInputError, match="causal"):
+        _validate_segments(seg, seg, b=1, n=8, causal=False)
+
+
+def test_validate_segments_rejects_non_int32() -> None:
+    good = mx.zeros((1, 8), dtype=mx.int32)
+    bad = mx.zeros((1, 8), dtype=mx.uint32)
+    with pytest.raises(AttentionInputError, match="int32"):
+        _validate_segments(bad, good, b=1, n=8, causal=True)
+    with pytest.raises(AttentionInputError, match="int32"):
+        _validate_segments(good, bad, b=1, n=8, causal=True)
+
+
+def test_validate_segments_rejects_wrong_shape() -> None:
+    good = mx.zeros((1, 8), dtype=mx.int32)
+    wrong = mx.zeros((1, 7), dtype=mx.int32)
+    with pytest.raises(AttentionInputError, match="N=8"):
+        _validate_segments(wrong, good, b=1, n=8, causal=True)
+
+
+@pytest.mark.metal
+@pytest.mark.parametrize("variant", ["scalar", "mma"])
+@pytest.mark.parametrize(("n", "seg_lens"), _PACKED_CASES)
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16], ids=["fp32", "bf16"])
+def test_fwd_packed_parity_vs_block_diagonal_oracle(
+    variant: str, n: int, seg_lens: list[int], head_dim: int, dtype: mx.Dtype
+) -> None:
+    b, hq, hkv = 2, 4, 2                                        # GQA group_size 2
+    scale = 1.0 / math.sqrt(head_dim)
+    q, k, v = _rand_qkv(b=b, hq=hq, hkv=hkv, n=n, d=head_dim, dtype=dtype, seed=11)
+    seg_id, seg_start = _packed_layout(seg_lens, b)
+    pm = PackedMask(seg_id=seg_id, seg_start=seg_start)
+
+    o_k, l_k = launch_flash_fwd(
+        q, k, v, scale=scale, causal=True, tile=TileShape(bq=32, variant=variant),
+        rate_macs_per_s=GENEROUS_RATE, seg_id=seg_id, seg_start=seg_start,
+    )
+    o_ref, l_ref = flash_attention_reference(q, k, v, scale=scale, causal=True, segments=pm)
+    mx.eval(o_k, l_k, o_ref, l_ref)
+
+    f = mx.float32
+    d_o = mx.abs(o_k.astype(f) - o_ref.astype(f)).max().item()
+    d_l = mx.abs(l_k - l_ref).max().item()
+    print(
+        f"[packed {variant} {['fp32','bf16'][dtype==mx.bfloat16]} n{n} "
+        f"segs{len(seg_lens)} d{head_dim}] O={d_o:.3e} L={d_l:.3e}"
+    )
+    assert d_o < _TOL_PACKED_O[variant][dtype], f"packed O diff {d_o}"
+    assert d_l < _TOL_PACKED_L[variant][dtype], f"packed L diff {d_l}"
+
+
+@pytest.mark.metal
+@pytest.mark.parametrize("variant", ["scalar", "mma"])
+def test_fwd_single_segment_packed_matches_causal_bitwise(variant: str) -> None:
+    """One segment spanning the whole row (seg_id all 0, seg_start all 0) makes the same-segment
+    term uniformly true and kv_lo == 0, so the packed kernel walks the IDENTICAL key set in the
+    IDENTICAL order as the pure-causal kernel -> BIT-IDENTICAL O and L. N=129 exercises a tail
+    block that is not 32-aligned."""
+    b, hq, hkv, n, d = 2, 4, 2, 129, 64
+    scale = 1.0 / math.sqrt(d)
+    q, k, v = _rand_qkv(b=b, hq=hq, hkv=hkv, n=n, d=d, dtype=mx.float32, seed=5)
+    seg_id = mx.zeros((b, n), dtype=mx.int32)
+    seg_start = mx.zeros((b, n), dtype=mx.int32)
+
+    o_c, l_c = launch_flash_fwd(
+        q, k, v, scale=scale, causal=True, tile=TileShape(bq=32, variant=variant),
+        rate_macs_per_s=GENEROUS_RATE,
+    )
+    o_p, l_p = launch_flash_fwd(
+        q, k, v, scale=scale, causal=True, tile=TileShape(bq=32, variant=variant),
+        rate_macs_per_s=GENEROUS_RATE, seg_id=seg_id, seg_start=seg_start,
+    )
+    mx.eval(o_c, l_c, o_p, l_p)
+    assert mx.array_equal(o_c, o_p).item(), "single-segment packed O != causal O"
+    assert mx.array_equal(l_c, l_p).item(), "single-segment packed L != causal L"
+
+
+@pytest.mark.benchmark
+@pytest.mark.metal
+def test_fwd_packed_parity_8k_bucket() -> None:
+    """Gate-A §9a anchor: packed forward parity vs the block-diagonal oracle at the 8k
+    dispatch bucket (the occupancy-saturation regime tile shapes are judged at), bf16,
+    4 segments with non-32-aligned boundaries. The oracle materializes the (N, N) score
+    matrix (~1 GiB fp32 at this shape) — benchmark-gated, never in the default/metal lanes.
+    Gate-A measured (2026-07-18, mlx 0.32.0, M1 Max, seed=42): O 9.766e-4, L 1.907e-6 —
+    inside the packed-grid pins reused here (`_artifacts/gate_packed/parity8k.json`)."""
+    b, hq, hkv, n, d = 1, 4, 2, 8192, 128
+    scale = 1.0 / math.sqrt(d)
+    q, k, v = _rand_qkv(b=b, hq=hq, hkv=hkv, n=n, d=d, dtype=mx.bfloat16, seed=42)
+    seg_id, seg_start = _packed_layout([2000, 1500, 2600, 2092], b)
+    pm = PackedMask(seg_id=seg_id, seg_start=seg_start)
+
+    tile = select_fwd_tile(n, d)
+    o_k, l_k = launch_flash_fwd(
+        q, k, v, scale=scale, causal=True, tile=tile,
+        rate_macs_per_s=GENEROUS_RATE, seg_id=seg_id, seg_start=seg_start,
+    )
+    o_ref, l_ref = flash_attention_reference(q, k, v, scale=scale, causal=True, segments=pm)
+    mx.eval(o_k, l_k, o_ref, l_ref)
+
+    f = mx.float32
+    d_o = mx.abs(o_k.astype(f) - o_ref.astype(f)).max().item()
+    d_l = mx.abs(l_k - l_ref).max().item()
+    print(f"[packed 8k {tile.variant}] O={d_o:.3e} L={d_l:.3e}")
+    assert d_o < _TOL_PACKED_O[tile.variant][mx.bfloat16], f"packed 8k O diff {d_o}"
+    assert d_l < _TOL_PACKED_L[tile.variant][mx.bfloat16], f"packed 8k L diff {d_l}"
+
+
+@pytest.mark.metal
+@pytest.mark.parametrize("variant", ["scalar", "mma"])
+def test_fwd_packed_flip_segments_breaks_parity(variant: str) -> None:
+    """Deliberate cross-segment contamination: build the packed kernel with the segment
+    equality inverted (`flip_segments`, the segment analogue of `flip_causal`). Segment-1 rows
+    attend to earlier segment-0 keys under the flipped predicate (non-empty -> finite), so they
+    MUST diverge from the block-diagonal reference -- if this ever matched, the packed parity
+    grid could not detect a segment-masking bug. Segment-0 rows have no earlier different-segment
+    key (empty keep-set -> NaN), so the check is on segment-1 rows only, mirroring the
+    drop-diagonal test's finite-slice pattern."""
+    b, hq, hkv, d = 2, 4, 2, 64
+    n1, n2 = 48, 48
+    n = n1 + n2
+    scale = 1.0 / math.sqrt(d)
+    q, k, v = _rand_qkv(b=b, hq=hq, hkv=hkv, n=n, d=d, dtype=mx.float32, seed=8)
+    seg_id, seg_start = _packed_layout([n1, n2], b)
+    pm = PackedMask(seg_id=seg_id, seg_start=seg_start)
+
+    builder = build_fwd_mma_source if variant == "mma" else build_fwd_source
+    kernel = mx.fast.metal_kernel(
+        name=f"mtp_test_flipseg_fwd_{variant}",
+        input_names=["q", "k", "v", "qoffs", "scale_in", "seg_id", "seg_start"],
+        output_names=["o_out", "l_out"],
+        source=builder(d, causal=True, packed=True, flip_segments=True),
+    )
+    scale_in = mx.array([scale], dtype=mx.float32)
+    o_bad, l_bad = fwd_launch._dispatch_range(
+        kernel, q, k, v, scale_in, r0=0, r1=n, tile=TileShape(bq=32, variant=variant),
+        seg_id=seg_id, seg_start=seg_start,
+    )
+    o_ref, l_ref = flash_attention_reference(q, k, v, scale=scale, causal=True, segments=pm)
+    mx.eval(o_bad, l_bad, o_ref, l_ref)
+
+    o_seg1 = o_bad[:, :, n1:, :].astype(mx.float32)
+    l_seg1 = l_bad[:, :, n1:]
+    rows_finite = bool(mx.isfinite(o_seg1).all().item()) and bool(
+        mx.isfinite(l_seg1).all().item()
+    )
+    assert rows_finite, (
+        "flip-segments rows in segment 1 went non-finite -- the divergence proof needs finite "
+        "rows there (only segment-0 rows, with no earlier different-segment key, should NaN)"
+    )
+    d_o = mx.abs(o_seg1 - o_ref[:, :, n1:, :].astype(mx.float32)).max().item()
+    d_l = mx.abs(l_seg1 - l_ref[:, :, n1:]).max().item()
+    assert (
+        d_o > 10 * _TOL_PACKED_O[variant][mx.float32]
+        or d_l > 10 * _TOL_PACKED_L[variant][mx.float32]
+    ), (
+        f"flip-segments kernel matched the block-diagonal reference on segment-1 rows "
+        f"(dO={d_o:.3e}, dL={d_l:.3e}) -- the packed parity grid cannot detect a segment bug"
+    )
+
+
+# ---------------------------------------------------------------------------------------
 # Step 5: impl="kernel" wired into the api -- Metal FORWARD, staged pure-MLX BACKWARD.
 # ---------------------------------------------------------------------------------------
 
@@ -818,17 +1055,20 @@ def test_fwd_kernel_cache_key_separates_by_d_slab(monkeypatch: pytest.MonkeyPatc
         fwd_launch._fwd_kernel.cache_clear()
 
 
+@pytest.mark.parametrize("packed", [False, True], ids=["causal", "packed"])
 def test_calibrated_fwd_rate_probes_the_selected_variant_and_d_slab(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, packed: bool
 ) -> None:
     """Finding (T6 rung 3): before this fix, `calibrated_fwd_rate`'s `measure()` always built
     the SCALAR kernel regardless of the caller's `tile` -- rating the scalar kernel while the
     launcher dispatches mma sizes the query-row split from the WRONG rate. Spies on
     `_fwd_kernel` (the kernel-construction seam) with a fake that fabricates zero-cost output
     arrays instead of touching Metal, so this stays in the DEFAULT lane, and asserts the
-    recorded (variant, d_slab) matches the `tile` passed in -- probe what you rate."""
+    recorded (variant, d_slab, packed) matches what the caller selected -- probe what you rate.
+    The `packed` arm (0.4.0) proves a packed-keyed rate builds the PACKED kernel, so the
+    single-segment probe dispatched is the packed kernel the launcher will run."""
     monkeypatch.setattr(fwd_launch, "_FWD_RATE_CACHE", {})
-    calls: list[tuple[str, int | None]] = []
+    calls: list[tuple[str, int | None, bool]] = []
 
     def fake_kernel(
         *, inputs: list[mx.array], template: list[tuple[str, mx.Dtype]],  # noqa: ARG001
@@ -842,20 +1082,21 @@ def test_calibrated_fwd_rate_probes_the_selected_variant_and_d_slab(
 
     def fake_fwd_kernel(
         head_dim: int, causal: bool, flip_causal: bool, variant: str,  # noqa: ARG001
-        d_slab: int | None,
+        d_slab: int | None, packed: bool = False,
     ) -> object:
-        calls.append((variant, d_slab))
+        calls.append((variant, d_slab, packed))
         return fake_kernel
 
     monkeypatch.setattr(fwd_launch, "_fwd_kernel", fake_fwd_kernel)
     tile = TileShape(variant="mma", d_slab=64)
     fwd_launch.calibrated_fwd_rate(
         head_dim=64, dtype=mx.float32, b=1, hq=4, hkv=4, n=256, causal=True, tile=tile,
+        packed=packed,
     )
 
-    assert calls == [("mma", 64)], (
-        f"calibration built {calls}, but the caller selected variant='mma' d_slab=64 -- "
-        "measure() must probe the SAME kernel the launcher will dispatch"
+    assert calls == [("mma", 64, packed)], (
+        f"calibration built {calls}, but the caller selected variant='mma' d_slab=64 "
+        f"packed={packed} -- measure() must probe the SAME kernel the launcher will dispatch"
     )
 
 

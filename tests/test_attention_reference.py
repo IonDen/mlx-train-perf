@@ -18,6 +18,7 @@ import mlx.core as mx
 import pytest
 
 from mlx_train_perf.attention import flash_attention_reference, kv_head_for, math_attention
+from mlx_train_perf.attention.segments import PackedMask
 
 
 def _rand_qkv(
@@ -199,3 +200,18 @@ def test_math_attention_grads_match_finite_differences(
         assert abs(fd - auto) < tol, (
             f"which={which} idx={idx}: finite-diff {fd} vs autodiff {auto}"
         )
+
+
+def test_math_attention_segments_requires_causal_true() -> None:
+    """`segments` composes with the causal triangle (block-diagonal-CAUSAL isolation);
+    causal=False + segments is an unsupported combination and must fail loudly rather
+    than silently attend across the whole row."""
+    n1, n2, d = 3, 5, 8
+    n = n1 + n2
+    q, k, v = _rand_qkv(b=1, hq=2, hkv=1, n=n, d=d, seed=6)
+    seg_id = mx.array([[0] * n1 + [1] * n2], dtype=mx.int32)
+    seg_start = mx.array([[0] * n1 + [n1] * n2], dtype=mx.int32)
+    pm = PackedMask(seg_id=seg_id, seg_start=seg_start)
+
+    with pytest.raises(AssertionError):
+        math_attention(q, k, v, scale=1.0 / (d**0.5), causal=False, segments=pm)

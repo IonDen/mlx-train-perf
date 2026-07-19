@@ -1,3 +1,13 @@
+import pytest
+
+from mlx_train_perf.attention.kernel.source import (
+    build_bwd_dkv_mma_source,
+    build_bwd_dkv_source,
+    build_bwd_dq_mma_source,
+    build_bwd_dq_source,
+    build_fwd_mma_source,
+    build_fwd_source,
+)
 from mlx_train_perf.core.kernel.source import (
     _BACKWARD_DHIDDEN_MMA_TEMPLATE,
     _DENSE_TEMPLATE,
@@ -129,3 +139,249 @@ def test_build_backward_dhidden_mma_source_rejects_bad_row_tiles() -> None:
         except ValueError:
             continue
         raise AssertionError(f"row_tiles={rt} should have been rejected")
+
+
+# ---------------------------------------------------------------------------------------
+# 0.4.0 T2: the PACKED forward variant (scalar + MMA) -- block-diagonal segment-ID keep
+# predicate. `packed=False` (the default) must stay byte-identical to the pre-0.4.0 MSL, so
+# every pre-existing caller (and the whole causal parity grid) is untouched. `packed=True`
+# wraps the causal keep with a same-segment equality; `flip_segments` inverts that equality
+# (the cross-contamination perturbation, the segment analogue of `flip_causal`).
+
+
+def test_fwd_sources_byte_identical_when_not_packed() -> None:
+    # The default (packed off) must equal the explicit packed=False for BOTH fwd builders --
+    # the byte-identity contract that keeps the pre-0.4.0 causal kernels bit-for-bit unchanged.
+    for build in (build_fwd_source, build_fwd_mma_source):
+        assert build(128) == build(128, packed=False)
+
+
+def test_fwd_sources_have_no_segment_text_when_not_packed() -> None:
+    # Stronger byte-identity guard: no packed artifact may leak into the non-packed source
+    # (a stray seg_off/kv_lo would perturb the causal MSL even if the string still "worked").
+    for build in (build_fwd_source, build_fwd_mma_source):
+        s = build(128)
+        assert "seg_id" not in s
+        assert "seg_start" not in s
+        assert "seg_off" not in s
+        assert "kv_lo" not in s
+
+
+def test_fwd_scalar_packed_predicate_wraps_causal_with_segment_equality() -> None:
+    s = build_fwd_source(64, packed=True)
+    assert "uint seg_off = b * n;" in s
+    assert "seg_id[seg_off + kk] == seg_id[seg_off + row]" in s
+    assert "kk <= row" in s  # the base causal predicate is retained inside the wrap
+
+
+def test_fwd_mma_packed_predicate_and_kv_lower_bound() -> None:
+    s = build_fwd_mma_source(64, packed=True)
+    assert "uint seg_off = b * n;" in s
+    # row is clamped (unlike the scalar builder) -- an over-hang lane's row can be >= n
+    assert "seg_id[seg_off + kk] == seg_id[seg_off + metal::min(row, n - 1)]" in s
+    # the KV-block loop starts at the block's segment-floored lower bound, not 0
+    assert "uint kv_lo = " in s
+    assert "for (uint kb0 = kv_lo; kb0 < kv_limit; kb0 += 32) {" in s
+    assert "for (uint kb0 = 0; kb0 < kv_limit; kb0 += 32) {" not in s
+
+
+def test_fwd_mma_packed_seg_id_row_read_is_clamped_for_over_hang_lanes() -> None:
+    # T14 review finding: a partially-over-hang query block (n not 32-aligned) has lanes with
+    # row >= n; the packed predicate's seg_id[seg_off + row] read must clamp row to n-1 (the
+    # kv_lo seg_start read already does this) so those lanes read a valid, in-bounds id -- its
+    # value is irrelevant since over-hang lanes are discarded before the O/L store.
+    s = build_fwd_mma_source(64, packed=True)
+    assert "seg_id[seg_off + kk] == seg_id[seg_off + metal::min(row, n - 1)]" in s
+    assert "seg_id[seg_off + row]" not in s  # no unclamped row read should remain
+
+
+def test_fwd_scalar_packed_seg_id_row_read_is_not_clamped() -> None:
+    # The scalar builder's row (= r0 + local_row; local_row < rows_this, r1 <= n) is always
+    # < n by construction, so it is immune to the MMA over-hang bug and needs no clamp.
+    s = build_fwd_source(64, packed=True)
+    assert "seg_id[seg_off + kk] == seg_id[seg_off + row]" in s
+    assert "metal::min(row, n - 1)" not in s
+
+
+def test_fwd_scalar_flip_segments_inverts_only_the_equality() -> None:
+    s = build_fwd_source(64, packed=True, flip_segments=True)
+    assert "seg_id[seg_off + kk] != seg_id[seg_off + row]" in s
+    assert "seg_id[seg_off + kk] == seg_id[seg_off + row]" not in s
+    assert "kk <= row" in s  # the causal half is untouched -- only the equality flips
+
+
+def test_fwd_mma_flip_segments_inverts_only_the_equality() -> None:
+    s = build_fwd_mma_source(64, packed=True, flip_segments=True)
+    assert "seg_id[seg_off + kk] != seg_id[seg_off + metal::min(row, n - 1)]" in s
+    assert "seg_id[seg_off + kk] == seg_id[seg_off + metal::min(row, n - 1)]" not in s
+
+
+def test_fwd_packed_requires_causal() -> None:
+    with pytest.raises(ValueError, match="packed"):
+        build_fwd_source(128, causal=False, packed=True)
+    with pytest.raises(ValueError, match="packed"):
+        build_fwd_mma_source(128, causal=False, packed=True)
+
+
+def test_flip_segments_requires_packed() -> None:
+    with pytest.raises(ValueError, match="flip_segments"):
+        build_fwd_source(128, flip_segments=True)
+    with pytest.raises(ValueError, match="flip_segments"):
+        build_fwd_mma_source(128, flip_segments=True)
+
+
+def test_flip_segments_mutually_exclusive_with_the_causal_perturbations() -> None:
+    for build in (build_fwd_source, build_fwd_mma_source):
+        with pytest.raises(ValueError, match="flip_segments"):
+            build(64, packed=True, flip_segments=True, flip_causal=True)
+        with pytest.raises(ValueError, match="flip_segments"):
+            build(64, packed=True, flip_segments=True, drop_diagonal=True)
+
+
+# ---------------------------------------------------------------------------------------
+# 0.4.0 T3: the PACKED backward variants (dQ scalar + mma, dK/dV scalar + mma) -- the same
+# block-diagonal segment-ID keep predicate as the forward, applied to each backward body.
+# `packed=False` (the default) MUST stay byte-identical to the pre-0.4.0 causal backward MSL
+# (every existing dQ/dK/dV parity + determinism test is untouched). `packed=True` wraps each
+# body's causal keep with a same-segment equality; `flip_segments` inverts that equality (the
+# cross-contamination perturbation, the segment analogue of `flip_causal`). The four builders
+# take `causal` as a required kwarg, so every call below passes `causal=True` explicitly.
+
+_BWD_BUILDERS = (
+    build_bwd_dq_source, build_bwd_dq_mma_source,
+    build_bwd_dkv_source, build_bwd_dkv_mma_source,
+)
+
+
+def test_bwd_sources_byte_identical_when_not_packed() -> None:
+    # The default (packed off) must equal the explicit packed=False for ALL FOUR backward
+    # builders -- the byte-identity contract that keeps the pre-0.4.0 causal kernels
+    # bit-for-bit unchanged (mirrors test_fwd_sources_byte_identical_when_not_packed).
+    for build in _BWD_BUILDERS:
+        assert build(128, causal=True) == build(128, causal=True, packed=False)
+
+
+def test_bwd_sources_have_no_segment_text_when_not_packed() -> None:
+    # Stronger byte-identity guard: no packed artifact may leak into the non-packed source
+    # (a stray seg_off/kv_lo would perturb the causal MSL even if the string still "worked").
+    for build in _BWD_BUILDERS:
+        s = build(128, causal=True)
+        assert "seg_id" not in s
+        assert "seg_start" not in s
+        assert "seg_off" not in s
+        assert "kv_lo" not in s
+
+
+def test_bwd_dq_scalar_packed_predicate_wraps_causal_with_segment_equality() -> None:
+    s = build_bwd_dq_source(64, causal=True, packed=True)
+    assert "uint seg_off = b * n;" in s
+    assert "seg_id[seg_off + kk] == seg_id[seg_off + row]" in s
+    assert "kk <= row" in s  # the base causal predicate is retained inside the wrap
+
+
+def test_bwd_dq_scalar_packed_seg_id_row_read_is_not_clamped() -> None:
+    # The scalar dQ row (= r0 + local_row; local_row < rows_this, r1 <= n) is always < n by
+    # construction, so it is immune to the MMA over-hang bug and needs no clamp (mirrors the
+    # scalar forward's row analysis).
+    s = build_bwd_dq_source(64, causal=True, packed=True)
+    assert "seg_id[seg_off + kk] == seg_id[seg_off + row]" in s
+    assert "metal::min(row, n - 1)" not in s
+
+
+def test_bwd_dq_mma_packed_predicate_and_kv_lower_bound() -> None:
+    s = build_bwd_dq_mma_source(64, causal=True, packed=True)
+    assert "uint seg_off = b * n;" in s
+    # row is clamped (unlike the scalar builder) -- an over-hang lane's row can be >= n
+    assert "seg_id[seg_off + kk] == seg_id[seg_off + metal::min(row, n - 1)]" in s
+    # the KV-block loop starts at the block's segment-floored lower bound, not 0 (mirrors the
+    # forward MMA -- dQ is query-major with the same kb0 = 0 KV loop structure)
+    assert "uint kv_lo = " in s
+    assert "for (uint kb0 = kv_lo; kb0 < kv_limit; kb0 += 32) {" in s
+    assert "for (uint kb0 = 0; kb0 < kv_limit; kb0 += 32) {" not in s
+
+
+def test_bwd_dq_mma_packed_seg_id_row_read_is_clamped_for_over_hang_lanes() -> None:
+    # A partially-over-hang query block (n not 32-aligned) has lanes with row >= n; the packed
+    # predicate's seg_id[seg_off + row] read must clamp row to n-1 so those lanes read a valid,
+    # in-bounds id -- its value is irrelevant since over-hang lanes are discarded before the
+    # dQ store (mirrors the forward MMA over-hang clamp).
+    s = build_bwd_dq_mma_source(64, causal=True, packed=True)
+    assert "seg_id[seg_off + kk] == seg_id[seg_off + metal::min(row, n - 1)]" in s
+    assert "seg_id[seg_off + row]" not in s  # no unclamped row read should remain
+
+
+def test_bwd_dkv_scalar_packed_predicate_wraps_causal_with_segment_equality() -> None:
+    # KEY-major body: the same-segment term compares the QUERY's seg_id vs the owner KEY's.
+    s = build_bwd_dkv_source(64, causal=True, packed=True)
+    assert "uint seg_off = b * n;" in s
+    assert "seg_id[seg_off + i] == seg_id[seg_off + key]" in s
+    assert "i >= key" in s  # the base causal predicate is retained inside the wrap
+
+
+def test_bwd_dkv_scalar_packed_seg_id_reads_are_not_clamped() -> None:
+    # The scalar dK/dV key (< n after the `if (key >= n) return;` guard) and query i
+    # (loop-bound i < q_hi <= n) are always < n by construction, so both seg reads are immune
+    # to the MMA over-hang bug and need no clamp.
+    s = build_bwd_dkv_source(64, causal=True, packed=True)
+    assert "seg_id[seg_off + i] == seg_id[seg_off + key]" in s
+    assert "metal::min(key, n - 1)" not in s
+
+
+def test_bwd_dkv_mma_packed_predicate_clamps_key_and_keeps_q_start() -> None:
+    s = build_bwd_dkv_mma_source(64, causal=True, packed=True)
+    assert "uint seg_off = b * n;" in s
+    # the owner KEY index can over-hang on the key axis (a partially-full last key block), so
+    # its seg_id read is clamped; the QUERY i is short-circuit-guarded by `i < q_hi` (<= n).
+    assert "seg_id[seg_off + i] == seg_id[seg_off + metal::min(key, n - 1)]" in s
+    assert "seg_id[seg_off + key]" not in s  # no unclamped key read should remain
+    # the query-loop lower bound Q_START stays UNCHANGED (correctness is from the per-query
+    # predicate; the segment-end upper-bound optimization is explicitly skipped -- YAGNI), and
+    # dK/dV is key-major so there is NO kv_lo lower-bound change (unlike the query-major dQ).
+    assert "metal::max(q_lo, key_base)" in s
+    assert "kv_lo" not in s
+
+
+def test_bwd_dq_scalar_flip_segments_inverts_only_the_equality() -> None:
+    s = build_bwd_dq_source(64, causal=True, packed=True, flip_segments=True)
+    assert "seg_id[seg_off + kk] != seg_id[seg_off + row]" in s
+    assert "seg_id[seg_off + kk] == seg_id[seg_off + row]" not in s
+    assert "kk <= row" in s  # the causal half is untouched -- only the equality flips
+
+
+def test_bwd_dq_mma_flip_segments_inverts_only_the_equality() -> None:
+    s = build_bwd_dq_mma_source(64, causal=True, packed=True, flip_segments=True)
+    assert "seg_id[seg_off + kk] != seg_id[seg_off + metal::min(row, n - 1)]" in s
+    assert "seg_id[seg_off + kk] == seg_id[seg_off + metal::min(row, n - 1)]" not in s
+
+
+def test_bwd_dkv_scalar_flip_segments_inverts_only_the_equality() -> None:
+    s = build_bwd_dkv_source(64, causal=True, packed=True, flip_segments=True)
+    assert "seg_id[seg_off + i] != seg_id[seg_off + key]" in s
+    assert "seg_id[seg_off + i] == seg_id[seg_off + key]" not in s
+    assert "i >= key" in s  # the causal half is untouched -- only the equality flips
+
+
+def test_bwd_dkv_mma_flip_segments_inverts_only_the_equality() -> None:
+    s = build_bwd_dkv_mma_source(64, causal=True, packed=True, flip_segments=True)
+    assert "seg_id[seg_off + i] != seg_id[seg_off + metal::min(key, n - 1)]" in s
+    assert "seg_id[seg_off + i] == seg_id[seg_off + metal::min(key, n - 1)]" not in s
+
+
+def test_bwd_packed_requires_causal() -> None:
+    for build in _BWD_BUILDERS:
+        with pytest.raises(ValueError, match="packed"):
+            build(128, causal=False, packed=True)
+
+
+def test_bwd_flip_segments_requires_packed() -> None:
+    for build in _BWD_BUILDERS:
+        with pytest.raises(ValueError, match="flip_segments"):
+            build(128, causal=True, flip_segments=True)
+
+
+def test_bwd_flip_segments_mutually_exclusive_with_the_causal_perturbations() -> None:
+    for build in _BWD_BUILDERS:
+        with pytest.raises(ValueError, match="flip_segments"):
+            build(64, causal=True, packed=True, flip_segments=True, flip_causal=True)
+        with pytest.raises(ValueError, match="flip_segments"):
+            build(64, causal=True, packed=True, flip_segments=True, drop_diagonal=True)
