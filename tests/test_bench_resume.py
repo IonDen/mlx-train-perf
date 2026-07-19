@@ -183,6 +183,38 @@ def test_editing_attention_source_changes_code_sha(
     assert ident_after["code_sha"] != ident_before["code_sha"]
 
 
+_PACKED_CODE_SHA_DEPS: tuple[str, ...] = (
+    "data/packing.py",
+    "attention/segments.py",
+)
+
+
+@pytest.mark.parametrize("rel_path", _PACKED_CODE_SHA_DEPS, ids=_PACKED_CODE_SHA_DEPS)
+def test_editing_packed_path_source_changes_code_sha(
+    rel_path: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each file a measured `packed_train` condition depends on must be declared in
+    `CODE_SHA_DEPS` (Task 12, 0.4.0 packing cycle). `data/packing.py` supplies the
+    packer/iterator/stats `bench/worker.py` calls directly for the packed arm;
+    `attention/segments.py` supplies `PackedMask`/`segment_allowed`, imported by both
+    `attention/api.py` and `attention/wrapper.py` (already-listed deps) -- a byte-change
+    to either must invalidate a prior `packed_train` artifact. Proven the same two ways as
+    `test_editing_attention_source_changes_code_sha`: (1) the real, on-disk file is
+    actually a member of the production `CODE_SHA_DEPS` tuple; (2) editing its bytes flips
+    `code_sha`, isolated to a tmp copy so this test never mutates the real source tree."""
+    real_path = artifacts._PACKAGE_ROOT / rel_path
+    assert real_path in artifacts.CODE_SHA_DEPS, f"{rel_path} must be declared in CODE_SHA_DEPS"
+
+    dep = tmp_path / real_path.name
+    dep.write_bytes(real_path.read_bytes())
+    monkeypatch.setattr(artifacts, "CODE_SHA_DEPS", (dep,))
+
+    ident_before = run_identity(model="m", session_id="s1")
+    dep.write_bytes(dep.read_bytes() + b"\n# perturb\n")
+    ident_after = run_identity(model="m", session_id="s1")
+    assert ident_after["code_sha"] != ident_before["code_sha"]
+
+
 def test_condition_identity_rejects_reserved_param_key_kind() -> None:
     with pytest.raises(BenchInputError, match="kind"):
         condition_identity(kind="loss_layer", session_id="s1", params={"kind": "oops"})
