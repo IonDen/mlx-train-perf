@@ -1,0 +1,35 @@
+@startuml
+title Command-buffer packing at the flagship attention shape
+
+skinparam backgroundColor #FFFFFF
+skinparam shadowing false
+skinparam roundCorner 10
+skinparam defaultFontName Helvetica
+skinparam defaultFontColor #111827
+skinparam ArrowColor #4B5563
+skinparam ArrowFontColor #374151
+skinparam rectangle {
+  BorderColor #4B5563
+  FontColor #111827
+  BackgroundColor #F8FAFC
+}
+
+rectangle "MLX 0.32.0 commit check on applegpu_g13s, after each encoded operation:\ncommit when ops > 50 or floor(elements / 2^20) > 50" as rule #DBEAFE {
+
+  rectangle "Large backward dispatches (dK/dV class)" as laneA {
+    rectangle "Command buffer\npossible smaller prefix work\nthen dK/dV range 1\n~118 M unique elements = 112 units\nover the limit after encoding" as a1 #FECACA
+    rectangle "Command buffer\npossible smaller prefix work\nthen dK/dV range 2\ncounters reset, buffers recounted\ncrosses the limit again" as a2 #FECACA
+  }
+
+  rectangle "Small forward dispatches (scalar class)" as laneB {
+    rectangle "Command buffer\nrange 1: ~48 units, shared q k v count once\neach later range adds ~0.46 units\ncounter crosses 50 near the fifth range" as b1 #DCFCE7
+    rectangle "Command buffer\nthe next 4-6 ranges\npack the same way" as b2 #DCFCE7
+  }
+}
+
+laneA -[hidden]down- laneB
+a1 -right-> a2 : range triggers commit\nafter it is encoded
+b1 -right-> b2 : commit near\nthe fifth range
+
+caption Accounting model derived from pinned MLX 0.32.0 source. Element counts are source-reported arithmetic, not a Metal command-buffer capture.
+@enduml
