@@ -21,6 +21,7 @@ tests because the adapter does not exist yet.
 """
 import mlx.core as mx
 import pytest
+from conftest import needs_comparative_peak_room
 from mlx.utils import tree_map
 
 pytest.importorskip("mlx_lm")
@@ -188,6 +189,7 @@ def test_compiled_packed_step_adds_no_rate_cache_keys() -> None:
 
 
 @pytest.mark.metal
+@needs_comparative_peak_room
 def test_gc_peak_parity_manual_walk_matches_stock_walk() -> None:
     """§9f: with gradient checkpointing, the manual PACKED block-walk peak ≈ the stock CAUSAL
     block-walk peak -- proving the class-level `grad_checkpoint` patch fires for direct block

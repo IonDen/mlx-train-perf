@@ -28,6 +28,7 @@ from pathlib import Path
 
 import mlx.core as mx
 import pytest
+from conftest import needs_comparative_peak_room
 
 from mlx_train_perf.attention.api import flash_attention
 from mlx_train_perf.attention.reference import math_attention
@@ -92,6 +93,7 @@ def test_custom_vjp_fires_inside_checkpoint_under_compile() -> None:
     assert mx.allclose(g, w * _SENTINEL).item()
 
 
+@needs_comparative_peak_room
 def test_checkpoint_recomputes_instead_of_storing_under_compile() -> None:
     """Memory proof of recompute, measured in the regime the trainer actually uses.
     VERIFIED FACT (mlx 0.32.0, this gate, 2026-07-09): mx.checkpoint's peak reduction
