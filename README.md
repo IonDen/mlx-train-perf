@@ -240,6 +240,10 @@ The guard is rank-local: every input it reads is this node's own RAM, availabili
   explains why removing the logits matrix did not extend context once attention backward set the
   peak. It also covers the command-buffer correction that removed a false launch limit, while
   separating source-reported measurements from claims the available controls cannot support.
+- [How MLX packs Metal command buffers](https://github.com/IonDen/mlx-train-perf/blob/main/docs/papers/how-mlx-packs-metal-command-buffers.md)
+  explains the operation and element thresholds that MLX 0.32.0 uses to commit Metal work. It applies
+  them to tiled attention, then explains why a whole-chain launch budget rejected valid work. The
+  macOS watchdog mechanism remains an inference.
 
 ## Community benchmarks
 
