@@ -236,6 +236,10 @@ The guard is rank-local: every input it reads is this node's own RAM, availabili
 - [Fused linear cross-entropy on Apple GPUs](https://github.com/IonDen/mlx-train-perf/blob/main/docs/papers/fused-linear-cross-entropy-apple-gpus.md)
   explains how vocabulary chunking and a fused Metal kernel avoid materializing logits. It covers
   memory costs, the optimization ladder, failed performance models, and the limits of the evidence.
+- [When the bottleneck moved: from fused cross-entropy to FlashAttention on MLX](https://github.com/IonDen/mlx-train-perf/blob/main/docs/papers/when-the-bottleneck-moved.md)
+  explains why removing the logits matrix did not extend context once attention backward set the
+  peak. It also covers the command-buffer correction that removed a false launch limit, while
+  separating source-reported measurements from claims the available controls cannot support.
 
 ## Community benchmarks
 

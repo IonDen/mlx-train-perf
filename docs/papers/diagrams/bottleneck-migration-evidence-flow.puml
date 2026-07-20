@@ -1,0 +1,35 @@
+@startuml
+title Two hypotheses, two corrections
+
+skinparam backgroundColor #FFFFFF
+skinparam shadowing false
+skinparam roundCorner 10
+skinparam defaultFontName Helvetica
+skinparam defaultFontColor #111827
+skinparam ArrowColor #4B5563
+skinparam ArrowFontColor #374151
+skinparam rectangle {
+  BorderColor #4B5563
+  FontColor #111827
+  BackgroundColor #F8FAFC
+}
+
+rectangle "Hypothesis 1\nRemove the (N, V) logits matrix\nto train longer contexts" as h1 #DBEAFE
+rectangle "8,192-token training result\nFused and stock marginal peaks tie\nat 21.39 GiB" as tie #FECACA
+rectangle "Isolated attention probe\nForward-plus-backward reaches 12.75 GiB\nand grows about 3.7-3.8x per doubling" as probe #FEF3C7
+rectangle "Implementation response\nTiled FlashAttention forward and backward\nSaved attention state scales with N x D" as flash #DCFCE7
+rectangle "Hypothesis 2\nThe projected duration of the whole\npacked launch chain is the kill unit" as h2 #DBEAFE
+rectangle "MLX source and packing probe\nLarge production ranges each trigger\na command-buffer commit" as packing #FECACA
+rectangle "Guard correction\nBudget each command buffer separately\nKeep the safety margin unchanged" as guard #DCFCE7
+rectangle "Source-reported later sweep\n23,040 tokens on flash + fused\n7,936 tokens on the stock path" as sweep #EDE9FE
+
+h1 -down-> tie : measured
+tie -down-> probe : investigate shared peak
+probe -down-> flash : change the bottleneck
+flash -right-> h2 : exposes a new limit
+h2 -down-> packing : inspect submission behavior
+packing -down-> guard : correct the model
+guard -down-> sweep : measure after correction
+
+caption Conceptual evidence sequence. Values are source-reported; this is not an allocation-lifetime trace.
+@enduml
