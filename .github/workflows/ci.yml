@@ -2,10 +2,17 @@ name: ci
 # push is main-only: a PR-branch push previously fired the whole matrix twice (push +
 # pull_request), doubling cost for no signal. Tag pushes are covered by publish.yml's
 # own build + metal gate.
+#
+# paths-ignore skips the run when a change touches ONLY docs (a mixed docs+code diff still
+# runs -- paths-ignore skips only when EVERY changed file matches). Safe because `main` has
+# no required status checks; if that changes, a required check + paths-ignore wedges
+# docs-only PRs and needs an always-green sentinel job.
 on:
   push:
     branches: [main]
+    paths-ignore: ['**.md', 'docs/**', 'LICENSE']
   pull_request:
+    paths-ignore: ['**.md', 'docs/**', 'LICENSE']
 jobs:
   checks:
     runs-on: macos-15
