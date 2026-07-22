@@ -651,6 +651,54 @@ def test_fit_memory_coeffs_without_flash_points_keeps_calib_flash() -> None:
             == calib.attn_bytes_per_head_token_flash)
 
 
+def test_fit_memory_coeffs_flash_fit_ols_default_is_byte_identical() -> None:
+    """`flash_fit` defaults to `"ols"` -- omitting the new keyword must reproduce the
+    shipped 0.4.0 behavior exactly (Task 8, 0.5.0)."""
+    shape = _shape()
+    calib = load_calibration()
+    pts = [_synthesize_flash_fit_point(shape=shape, calib=calib, batch=1, seq_len=s,
+                                       lora_rank=8, lora_layers=2, grad_checkpoint=True,
+                                       a_flash=12345.0)
+           for s in (512, 1024, 2048)]
+    c_default = fit_memory_coeffs(pts, calib=calib)
+    c_explicit_ols = fit_memory_coeffs(pts, calib=calib, flash_fit="ols")
+    assert c_default == c_explicit_ols
+
+
+def test_fit_memory_coeffs_flash_fit_envelope_matches_max_ratio() -> None:
+    """`flash_fit="envelope"` (Task 8, 0.5.0): `a_flash = max over flash points of
+    (flash_residual(p) / x_flash(p))`, reusing the SAME private closures the `"ols"`
+    path uses. Three flash FitPoints are synthesized FORWARD from three DIFFERENT true
+    a_flash values, so OLS's weighted-average solution provably diverges from the
+    envelope's max -- both expected values are derived here directly from the
+    synthetic per-point (x_flash, true a_flash) pairs, independent of
+    `fit_memory_coeffs`'s own implementation (noiseless forward construction makes
+    `flash_residual(p) == true_a_flash_i * x_flash(p)` exactly, so OLS's closed form
+    reduces to a weighted average of the true values and the envelope reduces to their
+    max)."""
+    shape = _shape()
+    calib = load_calibration()
+    seq_lens = (512, 1024, 2048)
+    true_a_flash = (1_000.0, 1_500.0, 50_000.0)   # last point is the "under-predicted anchor"
+    pts = [
+        _synthesize_flash_fit_point(shape=shape, calib=calib, batch=1, seq_len=s,
+                                    lora_rank=8, lora_layers=2, grad_checkpoint=True,
+                                    a_flash=a)
+        for s, a in zip(seq_lens, true_a_flash, strict=True)
+    ]
+    x = [1 * shape.heads * s for s in seq_lens]   # x_flash(p) = batch * heads * seq_len
+    expected_ols = (sum(xi ** 2 * ai for xi, ai in zip(x, true_a_flash, strict=True))
+                    / sum(xi ** 2 for xi in x))
+    expected_envelope = max(true_a_flash)
+    assert expected_ols != expected_envelope   # construction sanity: OLS != envelope
+
+    c_ols = fit_memory_coeffs(pts, calib=calib, flash_fit="ols")
+    c_env = fit_memory_coeffs(pts, calib=calib, flash_fit="envelope")
+    assert c_ols["attn_bytes_per_head_token_flash"] == pytest.approx(expected_ols, rel=1e-6)
+    assert (c_env["attn_bytes_per_head_token_flash"]
+            == pytest.approx(expected_envelope, rel=1e-6))
+
+
 def test_predicted_peak_matches_measured_qwen3_8b_flash_within_tolerance() -> None:
     """Measured-vs-predicted acceptance for the flash branch: anchor the model to a T13
     flash train-step measurement -- Qwen3-8B-4bit, seq 8192, grad_checkpoint=True, kernel,
