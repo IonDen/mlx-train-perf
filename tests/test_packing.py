@@ -1,4 +1,5 @@
 import mlx.core as mx
+import numpy as np
 import pytest
 from hypothesis import given
 from hypothesis import strategies as st
@@ -263,3 +264,86 @@ def test_epochs_reshuffle_under_loop():
     epoch1_first = next(looped)[0]
 
     assert epoch0_first.tolist() != epoch1_first.tolist()
+
+
+# ---------------------------------------------------------------------------
+# 0.5.0 T4 -- packer invariant: seg_id AND seg_start are non-decreasing along each
+# row of every yielded batch (spec D2). Not a new guarantee -- `build_row` already
+# lays segments contiguously left-to-right -- this pins it at the packer's public
+# entry point, across seeds/datasets, independent of `test_build_row_worked_example`
+# and the hypothesis `test_gapless_coverage_and_monotone` above (which exercise
+# `build_row` directly, not the batched/int32-array output `packed_iterate_batches`
+# actually yields).
+# ---------------------------------------------------------------------------
+
+
+def _monotone_dataset_a() -> list[tuple[list[int], int]]:
+    # Short, fairly uniform sequence lengths -- many small packs per batch.
+    return [([i % 250 + 1] * ((i % 4) + 1), i % 2) for i in range(30)]
+
+
+def _monotone_dataset_b() -> list[tuple[list[int], int]]:
+    # Wider length spread -- fewer, more varied sequences per pack.
+    return [([i % 250 + 1] * ((i * 7) % 40 + 1), 0) for i in range(50)]
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2])
+@pytest.mark.parametrize(
+    "make_dataset", [_monotone_dataset_a, _monotone_dataset_b],
+    ids=["dataset_a", "dataset_b"],
+)
+def test_packed_batches_have_monotone_seg_id_and_seg_start(seed, make_dataset) -> None:
+    dataset = make_dataset()
+    it = packed_iterate_batches(
+        dataset=dataset, batch_size=2, max_seq_length=64, loop=False, seed=seed,
+    )
+    saw_a_batch = False
+    for _, seg_id, seg_start, _ in it:
+        saw_a_batch = True
+        sid = np.asarray(seg_id)
+        sst = np.asarray(seg_start)
+        assert np.all(np.diff(sid, axis=1) >= 0)
+        assert np.all(np.diff(sst, axis=1) >= 0)
+    assert saw_a_batch  # otherwise the loop above never ran and the test proves nothing
+
+
+@pytest.mark.metal
+def test_validate_never_called_on_the_loss_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`make_packed_loss_fn`'s forward walk builds a `PackedMask` (adapters/mlx_lm.py) but
+    never calls `.validate()` -- the packer's own pack-time assert (this file, above) is
+    the guard on that path, not a per-step host-side check (compile-hostile, spec D2).
+    `PackedMask.validate` is monkeypatched to raise unconditionally; since `validate`
+    itself does `np.asarray` (a real host sync), even a call reached only under tracing
+    would still surface here -- a sound proxy for "never reached", not merely "never
+    called eagerly". One tiny kernel-backed loss evaluation through the real, unpatched
+    wrapper + adapter must not raise. Setup follows
+    tests/test_adapter_packed.py::_parity_losses (tiny llama + enable_flash_attention
+    with packed=True)."""
+    pytest.importorskip("mlx_lm")
+    from test_attention_wrapper import _tiny_llama_hd64  # noqa: PLC0415
+
+    from mlx_train_perf.adapters.mlx_lm import make_packed_loss_fn  # noqa: PLC0415
+    from mlx_train_perf.attention.segments import PackedMask  # noqa: PLC0415
+    from mlx_train_perf.attention.wrapper import enable_flash_attention  # noqa: PLC0415
+
+    def _raise(_self: "PackedMask") -> None:
+        raise AssertionError("PackedMask.validate() must never be called on the loss path")
+
+    monkeypatch.setattr(PackedMask, "validate", _raise)
+
+    pack_len = 16
+    mx.random.seed(0)
+    model = _tiny_llama_hd64()
+    enable_flash_attention(model, impl="kernel", seq_len=pack_len, batch_size=1, packed=True)
+    mx.eval(model.parameters())
+
+    tokens = mx.random.randint(1, 256, (pack_len,)).tolist()
+    row, seg_id, seg_start, loss_mask = build_row([(tokens, 0)], pack_len)
+    batch = mx.array([row], dtype=mx.int32)
+    seg_id_arr = mx.array([seg_id], dtype=mx.int32)
+    seg_start_arr = mx.array([seg_start], dtype=mx.int32)
+    loss_mask_arr = mx.array([loss_mask], dtype=mx.bool_)
+
+    loss_fn = make_packed_loss_fn(model, impl="kernel")  # type: ignore[arg-type]
+    loss, ntoks = loss_fn(model, batch, seg_id_arr, seg_start_arr, loss_mask_arr)
+    mx.eval(loss, ntoks)  # must not raise
