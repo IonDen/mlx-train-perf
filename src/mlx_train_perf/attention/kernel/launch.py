@@ -1129,28 +1129,39 @@ def _validate_bwd_dkv_shapes(
 @functools.cache
 def _bwd_dkv_kernel(
     head_dim: int, causal: bool, flip_causal: bool, variant: str, d_slab: int | None,
-    packed: bool = False,
+    packed: bool = False, segment_bound: bool = True, break_early: bool = False,
 ) -> _MetalKernel:
     """Build (and cache) the dK/dV kernel for a given (head_dim, causal, flip_causal, variant,
-    d_slab, packed). `variant="scalar"` uses the v1 one-thread-per-key body (`d_slab` has no
-    effect on its source, but stays part of the cache key regardless -- a harmless redundant
-    entry, never a correctness issue, if a caller ever varies it for scalar); `"mma"` uses the
-    T9b rung-B2 key-major register-resident D-slabbed body, whose source genuinely changes with
-    `d_slab` (`d_slab=None` builds with the source builder's own default `_BWD_DKV_MMA_D_SLAB`).
-    Both variants share the same (q,k,v,dO,lse,d_arr,dk_in,dv_in,qoffs,scale_in)->(dk_out,dv_out)
-    chained contract, so `_dispatch_bwd_dkv_range` swaps only the grid/threadgroup shape between
-    them. `flip_causal` is TEST-ONLY (see `build_bwd_dkv_source` / `build_bwd_dkv_mma_source`); it
-    stays part of the cache key so a perturbed/correct kernel at the same (head_dim, causal,
-    variant) never collide.
+    d_slab, packed, segment_bound, break_early). `variant="scalar"` uses the v1 one-thread-per-key
+    body (`d_slab` has no effect on its source, but stays part of the cache key regardless -- a
+    harmless redundant entry, never a correctness issue, if a caller ever varies it for scalar);
+    `"mma"` uses the T9b rung-B2 key-major register-resident D-slabbed body, whose source genuinely
+    changes with `d_slab` (`d_slab=None` builds with the source builder's own default
+    `_BWD_DKV_MMA_D_SLAB`). Both variants share the same
+    (q,k,v,dO,lse,d_arr,dk_in,dv_in,qoffs,scale_in)->(dk_out,dv_out) chained contract, so
+    `_dispatch_bwd_dkv_range` swaps only the grid/threadgroup shape between them. `flip_causal` is
+    TEST-ONLY (see `build_bwd_dkv_source` / `build_bwd_dkv_mma_source`); it stays part of the
+    cache key so a perturbed/correct kernel at the same (head_dim, causal, variant) never collide.
 
     `packed=True` (0.4.0) builds the block-diagonal-segment variant (see the source builders'
     packed docstrings): the keep predicate gains a same-segment term and the launcher binds two
     extra int32 buffers (`seg_id`, `seg_start`) appended to `input_names` LAST so the non-packed
     order is untouched (mlx binds positionally). `packed` is the LAST cache-key component and
-    defaults False, so every pre-0.4.0 caller keeps its existing call and cache entry unchanged."""
+    defaults False, so every pre-0.4.0 caller keeps its existing call and cache entry unchanged.
+
+    `segment_bound`/`break_early` (0.5.0, spec D1/D5) add the packed MMA query-block segment-end
+    bound; both are passed to `build_bwd_dkv_mma_source` in the mma arm ONLY -- the scalar builder
+    does not accept them and stays the assumption-free oracle (D3). Both flags are threaded into
+    BOTH the `functools.cache` key (this signature) AND the `mx.fast.metal_kernel` name below,
+    never just one: mlx caches compiled kernels BY NAME, and a call with the same name but
+    different source silently returns the FIRST compiled binary -- so a flag that changed the
+    source but not the name (or vice versa) would risk a stale/wrong kernel on a later call with a
+    different flag value. Defaults (`segment_bound=True, break_early=False`) preserve every
+    pre-0.5.0 call and cache entry."""
     if variant == "mma":
         source = build_bwd_dkv_mma_source(
             head_dim, causal=causal, flip_causal=flip_causal, d_slab=d_slab, packed=packed,
+            segment_bound=segment_bound, break_early=break_early,
         )
     elif variant == "scalar":
         source = build_bwd_dkv_source(
@@ -1169,6 +1180,8 @@ def _bwd_dkv_kernel(
             f"{'c' if causal else 'f'}{'x' if flip_causal else ''}"
             + (f"_s{d_slab}" if variant == "mma" else "")
             + ("_p" if packed else "")
+            + (("" if segment_bound else "_nb") if variant == "mma" else "")
+            + (("_be" if break_early else "") if variant == "mma" else "")
         ),
         input_names=input_names,
         output_names=["dk_out", "dv_out"],
@@ -1228,6 +1241,7 @@ def launch_bwd_dkv(
     scale: float, causal: bool, rate_macs_per_s: float | None = None,
     variant: str = "scalar", d_slab: int | None = None,
     seg_id: mx.array | None = None, seg_start: mx.array | None = None,
+    segment_bound: bool = True, break_early: bool = False,
     _flip_causal: bool = False,
     _force_ranges: list[tuple[int, int]] | None = None,
 ) -> tuple[mx.array, mx.array]:
@@ -1262,6 +1276,14 @@ def launch_bwd_dkv(
     identically regardless of the range split, so a chained split stays bit-identical to a single
     dispatch under packing too.
 
+    `segment_bound`/`break_early` (0.5.0, spec D1/D5, mma variant only): thread straight through
+    to `_bwd_dkv_kernel`, which passes them to `build_bwd_dkv_mma_source` and folds both into the
+    kernel's cache key AND its `mx.fast.metal_kernel` name -- mlx caches compiled kernels BY NAME
+    (verified: same name + different source returns the FIRST compiled binary), so a
+    source-varying flag that lived in only one of the two would risk a later call silently
+    getting back a stale, wrong-flag kernel. Defaults (`segment_bound=True, break_early=False`)
+    preserve every pre-0.5.0 call.
+
     `_flip_causal` is TEST-ONLY (wrong-triangle causal-skip perturbation -- see source.py);
     `_force_ranges` is TEST-ONLY too (the split-forcing seam -- the production planner never
     splits a tiny packed-regime shape; forced ranges for the mma variant must stay 32-aligned
@@ -1281,7 +1303,10 @@ def launch_bwd_dkv(
             block_align=block_align,
         )
 
-    kernel = _bwd_dkv_kernel(d, causal, _flip_causal, variant, d_slab, packed)
+    kernel = _bwd_dkv_kernel(
+        d, causal, _flip_causal, variant, d_slab, packed,
+        segment_bound=segment_bound, break_early=break_early,
+    )
     scale_in = mx.array([scale], dtype=mx.float32)
     dk = mx.zeros((b, hkv, n, d), dtype=mx.float32)
     dv = mx.zeros((b, hkv, n, d), dtype=mx.float32)

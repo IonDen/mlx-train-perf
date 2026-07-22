@@ -31,6 +31,7 @@ from mlx_train_perf.attention.kernel import launch as bwd_launch
 from mlx_train_perf.attention.kernel.dispatch import select_bwd_tiles
 from mlx_train_perf.attention.kernel.launch import (
     TileShape,
+    _bwd_dkv_kernel,
     calibrated_bwd_dkv_rate,
     calibrated_bwd_dq_rate,
     launch_bwd_D,
@@ -2210,3 +2211,26 @@ def test_dkv_packed_flip_segments_breaks_parity(variant: str) -> None:
     )
     assert d_dk > 1e-2, msg
     assert d_dv > 1e-2, msg
+
+
+# ---------------------------------------------------------------------------------------
+# 0.5.0 T2 -- `segment_bound`/`break_early` threaded through the `_bwd_dkv_kernel`
+# `functools.cache` key AND the `mx.fast.metal_kernel` name (DEFAULT lane -- distinct
+# cached objects need no GPU). mlx caches compiled kernels by NAME: a call with the same
+# name but different source silently returns the FIRST compiled binary, so every
+# source-varying flag must appear in both the Python cache key and the name string, or a
+# later call with a different flag value would get back an earlier, wrong kernel.
+#
+# This test proves ONLY Python-cache distinctness (three different flag combinations
+# produce three different cached `_MetalKernel` objects). It does NOT prove the emitted
+# names differ, and it does NOT prove the compiled kernels behave differently on the GPU
+# -- the load-bearing D5 guard (bit-identity + a can-fail `break_early` perturbation) is
+# Task 3's metal-lane tests.
+# ---------------------------------------------------------------------------------------
+
+
+def test_dkv_kernel_cache_distinguishes_segment_bound_and_break_early() -> None:
+    a = _bwd_dkv_kernel(64, True, False, "mma", None, True)                  # bounded default
+    b = _bwd_dkv_kernel(64, True, False, "mma", None, True, False)           # unbounded
+    c = _bwd_dkv_kernel(64, True, False, "mma", None, True, True, True)     # break_early
+    assert a is not b and a is not c and b is not c  # noqa: PT018
