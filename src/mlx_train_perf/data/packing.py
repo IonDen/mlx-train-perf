@@ -156,6 +156,25 @@ def build_row(
     return row, seg_id, seg_start, loss_mask
 
 
+def _assert_pack_time_monotone(sid_arr: Any, sst_arr: Any) -> None:
+    """Vectorized numpy check (spec D2): `seg_id` and `seg_start` must be
+    non-decreasing along each row of a packed batch -- the packed kernels' block-skip
+    bounds (forward/dQ `kv_lo`, the 0.5.0 dK/dV segment-end break) assume contiguous
+    ascending segments, with no in-kernel guard. Called on the numpy host arrays
+    BEFORE the `mx.array` conversion -- never an mx-side check (that would host-sync
+    every batch on the training data path), never a Python per-element loop (real
+    per-step host cost at L=4096). `build_row` already produces this by construction;
+    this is the pack-time assert that guards it (`PackedMask.validate` is the
+    equivalent opt-in check for a hand-built mask that bypasses the packer)."""
+    for name, arr in (("seg_id", sid_arr), ("seg_start", sst_arr)):
+        if not bool(np.all(np.diff(arr.astype(np.int64), axis=1) >= 0)):
+            raise PackingError(
+                f"packed batch {name} must be non-decreasing along each row: the "
+                "packed kernels' block-skip bounds (forward/dQ kv_lo, dK/dV "
+                "segment-end break) assume contiguous ascending segments"
+            )
+
+
 def packed_iterate_batches(
     dataset: Any,
     batch_size: int,
@@ -243,10 +262,16 @@ def packed_iterate_batches(
                 seg_ids.append(seg_id)
                 seg_starts.append(seg_start)
                 loss_masks.append(loss_mask)
+            # Pack-time invariant assert (spec D2). The numpy arrays are built ONCE
+            # here and reused below in the `mx.array` conversion -- no double
+            # conversion.
+            sid_arr = np.array(seg_ids, dtype=np.int32)
+            sst_arr = np.array(seg_starts, dtype=np.int32)
+            _assert_pack_time_monotone(sid_arr, sst_arr)
             yield (
                 mx.array(np.array(rows, dtype=np.int32)),
-                mx.array(np.array(seg_ids, dtype=np.int32)),
-                mx.array(np.array(seg_starts, dtype=np.int32)),
+                mx.array(sid_arr),
+                mx.array(sst_arr),
                 mx.array(np.array(loss_masks, dtype=bool)),
             )
         epoch += 1
