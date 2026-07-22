@@ -269,6 +269,126 @@ def test_plan_config_tool_error_exit_two(capsys: pytest.CaptureFixture[str]) -> 
     assert "Error" in capsys.readouterr().err
 
 
+# --- --max-seq / --max-batch inverse-query mode --------------------------------------
+
+
+def test_plan_forward_mode_missing_batch_exits_two_with_message(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Forward mode (neither --max-seq nor --max-batch) is unchanged behaviorally --
+    both --batch and --seq-len are still required -- but the required-ness is now
+    enforced manually (argparse can no longer express it once both flags become
+    optional), so the missing-arg message comes from our own code, not argparse's."""
+    rc = main(["plan", "--config", str(_config(tmp_path)), "--seq-len", "512",
+               "--lora-rank", "8"])
+    assert rc == 2
+    assert "--batch" in capsys.readouterr().err
+
+
+def test_plan_forward_mode_missing_seq_len_exits_two_with_message(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    rc = main(["plan", "--config", str(_config(tmp_path)), "--batch", "1",
+               "--lora-rank", "8"])
+    assert rc == 2
+    assert "--seq-len" in capsys.readouterr().err
+
+
+def test_plan_max_seq_prints_found_value_and_assumption_block(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    rc = main(["plan", "--config", str(_config(tmp_path)), "--batch", "1",
+               "--lora-rank", "8", "--budget-gb", "8", "--max-seq"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "max seq_len:" in out
+    # same assumption block the forward `plan` rendering prints
+    assert "fits: yes" in out
+    assert "components:" in out
+    assert "provenance:" in out
+
+
+def test_plan_max_batch_prints_found_value_and_assumption_block(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    rc = main(["plan", "--config", str(_config(tmp_path)), "--seq-len", "512",
+               "--lora-rank", "8", "--budget-gb", "8", "--max-batch"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "max batch:" in out
+    assert "fits: yes" in out
+    assert "components:" in out
+    assert "provenance:" in out
+
+
+def test_plan_max_seq_with_seq_len_is_error(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """--seq-len is the value being searched for under --max-seq -- passing it too is a
+    manual validation error, not a silent override."""
+    rc = main(["plan", "--config", str(_config(tmp_path)), "--batch", "1",
+               "--seq-len", "4096", "--lora-rank", "8", "--max-seq"])
+    assert rc == 2
+    assert "--seq-len" in capsys.readouterr().err
+
+
+def test_plan_max_seq_without_batch_is_error(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    rc = main(["plan", "--config", str(_config(tmp_path)), "--lora-rank", "8", "--max-seq"])
+    assert rc == 2
+    assert "--batch" in capsys.readouterr().err
+
+
+def test_plan_max_batch_with_batch_is_error(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    rc = main(["plan", "--config", str(_config(tmp_path)), "--batch", "1",
+               "--seq-len", "512", "--lora-rank", "8", "--max-batch"])
+    assert rc == 2
+    assert "--batch" in capsys.readouterr().err
+
+
+def test_plan_max_batch_without_seq_len_is_error(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    rc = main(["plan", "--config", str(_config(tmp_path)), "--lora-rank", "8", "--max-batch"])
+    assert rc == 2
+    assert "--seq-len" in capsys.readouterr().err
+
+
+def test_plan_max_seq_and_max_batch_together_is_argparse_error(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """`--max-seq`/`--max-batch` are a mutually exclusive `store_true` group -- argparse
+    itself refuses combining them, before `_cmd_plan` ever runs."""
+    rc = main(["plan", "--config", str(_config(tmp_path)), "--batch", "1",
+               "--lora-rank", "8", "--max-seq", "--max-batch"])
+    assert rc == 2
+    assert "not allowed with" in capsys.readouterr().err
+
+
+def test_plan_max_seq_degenerate_budget_exit_one_refused(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A budget too small to fit even the seq_len=1 floor is a refusal (exit 1,
+    `DoesNotFitError` rendered) -- matching the bench exit policy -- never a tool error
+    (exit 2)."""
+    rc = main(["plan", "--config", str(_config(tmp_path)), "--batch", "1",
+               "--lora-rank", "8", "--budget-gb", "0.000001", "--max-seq"])
+    assert rc == 1
+    assert "refused" in capsys.readouterr().err
+
+
+def test_plan_max_batch_degenerate_budget_exit_one_refused(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    rc = main(["plan", "--config", str(_config(tmp_path)), "--seq-len", "512",
+               "--lora-rank", "8", "--budget-gb", "0.000001", "--max-batch"])
+    assert rc == 1
+    assert "refused" in capsys.readouterr().err
+
+
 # --- pure helper: bench suite -> Condition list --------------------------------------
 
 
