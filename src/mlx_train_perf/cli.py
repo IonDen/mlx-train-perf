@@ -26,8 +26,14 @@ from mlx_train_perf.contribute import (
     run_preflight,
     shapes_for_ram,
 )
-from mlx_train_perf.errors import BenchInputError, MlxTrainPerfError, PlanInputError
+from mlx_train_perf.errors import (
+    BenchInputError,
+    DoesNotFitError,
+    MlxTrainPerfError,
+    PlanInputError,
+)
 from mlx_train_perf.plan.estimate import FitReport, ModelShape, TrainConfig, plan_fit
+from mlx_train_perf.plan.inverse import max_batch_for_budget, max_seq_len_for_budget
 
 Command = Callable[[argparse.Namespace], int]
 
@@ -127,14 +133,82 @@ def _plan_exit_code(fit_report: FitReport) -> int:
 def _cmd_plan(args: argparse.Namespace) -> int:
     shape = _load_model_shape(args.config)
     shape = _apply_quant_override(shape, args.quant_bits)
+    budget_bytes = int(args.budget_gb * 1024**3) if args.budget_gb is not None else None
+
+    if args.max_seq or args.max_batch:
+        return _cmd_plan_search(args, shape, budget_bytes)
+
+    if args.batch is None:
+        raise PlanInputError("the following argument is required: --batch")
+    if args.seq_len is None:
+        raise PlanInputError("the following argument is required: --seq-len")
     cfg = _train_config_from_args(
         batch=args.batch, seq_len=args.seq_len, lora_rank=args.lora_rank, impl=args.impl,
         shape_layers=shape.layers, attention=args.attention,
     )
-    budget_bytes = int(args.budget_gb * 1024**3) if args.budget_gb is not None else None
     fit_report = plan_fit(shape, cfg, budget_bytes=budget_bytes)
     rendered = _render_plan_json(fit_report) if args.json else _render_plan_text(fit_report)
     print(rendered)
+    return _plan_exit_code(fit_report)
+
+
+def _cmd_plan_search(
+    args: argparse.Namespace, shape: ModelShape, budget_bytes: int | None,
+) -> int:
+    """Handles `--max-seq`/`--max-batch`: resolves the search variable via
+    `plan.inverse` bisection (the `TrainConfig` is built with a placeholder value of 1
+    for the search variable -- `_train_config_from_args` takes mandatory ints -- and the
+    Task 9 bisection replaces it internally), then renders the SAME `FitReport` block the
+    forward `plan` command prints against the resolved config, with the found value on
+    its own leading line. A `DoesNotFitError` at the search floor (seq_len=1 / batch=1)
+    is a refusal (exit 1, matching the bench exit policy), never a tool error (exit 2)."""
+    if args.max_seq:
+        if args.batch is None:
+            raise PlanInputError("the following argument is required: --batch")
+        if args.seq_len is not None:
+            raise PlanInputError(
+                "argument --seq-len: not allowed with --max-seq (--seq-len is the value "
+                "being searched for)"
+            )
+        cfg = _train_config_from_args(
+            batch=args.batch, seq_len=1, lora_rank=args.lora_rank, impl=args.impl,
+            shape_layers=shape.layers, attention=args.attention,
+        )
+        try:
+            found = max_seq_len_for_budget(shape, cfg, budget_bytes=budget_bytes)
+        except DoesNotFitError as exc:
+            print(f"refused: {exc}", file=sys.stderr)
+            return 1
+        resolved = replace(cfg, seq_len=found)
+        found_key, label = "max_seq_len", f"max seq_len: {found}"
+    else:
+        if args.seq_len is None:
+            raise PlanInputError("the following argument is required: --seq-len")
+        if args.batch is not None:
+            raise PlanInputError(
+                "argument --batch: not allowed with --max-batch (--batch is the value "
+                "being searched for)"
+            )
+        cfg = _train_config_from_args(
+            batch=1, seq_len=args.seq_len, lora_rank=args.lora_rank, impl=args.impl,
+            shape_layers=shape.layers, attention=args.attention,
+        )
+        try:
+            found = max_batch_for_budget(shape, cfg, budget_bytes=budget_bytes)
+        except DoesNotFitError as exc:
+            print(f"refused: {exc}", file=sys.stderr)
+            return 1
+        resolved = replace(cfg, batch=found)
+        found_key, label = "max_batch", f"max batch: {found}"
+
+    fit_report = plan_fit(shape, resolved, budget_bytes=budget_bytes)
+    if args.json:
+        payload: dict[str, object] = {found_key: found}
+        payload.update(json.loads(_render_plan_json(fit_report)))
+        print(json.dumps(payload, indent=2))
+    else:
+        print(label)
+        print(_render_plan_text(fit_report))
     return _plan_exit_code(fit_report)
 
 
@@ -266,8 +340,12 @@ def _cmd_contribute(args: argparse.Namespace) -> int:
 def _add_plan_parser(subparsers: "argparse._SubParsersAction[argparse.ArgumentParser]") -> None:
     plan = subparsers.add_parser("plan", help="check whether a training config fits the RAM budget")
     plan.add_argument("--config", required=True, help="path to a HF config.json")
-    plan.add_argument("--batch", type=int, required=True, help="per-step batch size")
-    plan.add_argument("--seq-len", type=int, required=True, help="sequence length")
+    plan.add_argument("--batch", type=int, required=False, default=None,
+                       help="per-step batch size (required unless --max-batch is given, "
+                            "in which case it must be absent -- it is the search variable)")
+    plan.add_argument("--seq-len", type=int, required=False, default=None,
+                       help="sequence length (required unless --max-seq is given, in "
+                            "which case it must be absent -- it is the search variable)")
     plan.add_argument("--lora-rank", type=int, required=True,
                        help="LoRA rank (0 means full fine-tuning)")
     plan.add_argument("--quant-bits", type=int, default=None,
@@ -282,6 +360,13 @@ def _add_plan_parser(subparsers: "argparse._SubParsersAction[argparse.ArgumentPa
                        help="memory budget in GiB (default: this project's own device-"
                             "clamped wired cap)")
     plan.add_argument("--json", action="store_true", help="render the FitReport as JSON")
+    search = plan.add_mutually_exclusive_group()
+    search.add_argument("--max-seq", action="store_true",
+                         help="search for the largest --seq-len that fits the budget "
+                              "(requires --batch; --seq-len must be omitted)")
+    search.add_argument("--max-batch", action="store_true",
+                         help="search for the largest --batch that fits the budget "
+                              "(requires --seq-len; --batch must be omitted)")
     plan.set_defaults(func=_cmd_plan)
 
 
