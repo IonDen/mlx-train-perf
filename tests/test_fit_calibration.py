@@ -17,7 +17,15 @@ from pathlib import Path
 
 import pytest
 
-from mlx_train_perf.plan.calibration import load_calibration
+from mlx_train_perf.plan.calibration import Calibration, load_calibration
+from mlx_train_perf.plan.estimate import (
+    ModelShape,
+    TrainConfig,
+    _flash_saved_state_bytes,
+    _lora_bytes,
+    _loss_bytes,
+    _optimizer_bytes,
+)
 
 _SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts"
 sys.path.insert(0, str(_SCRIPTS_DIR))
@@ -275,6 +283,126 @@ def test_main_writes_the_updated_calibration_file_without_dry_run(tmp_path: Path
     assert (updated["optimizer_bytes_per_param"]
             == _EXISTING_CALIBRATION["optimizer_bytes_per_param"])
     assert updated["provenance"]["measured_date"]
+
+
+# ---------------------------------------------------------------------------
+# flash_fit selection (Task 8, 0.5.0): main() fits with "ols", checks one-sidedness
+# (predicted cushioned TOTAL >= measured at every flash anchor) via the public
+# estimate_peak, and refits with "envelope" on a violation.
+# ---------------------------------------------------------------------------
+
+
+def _stand_in_calibration() -> Calibration:
+    """The SAME stand-in `Calibration` `main()` builds from `_EXISTING_CALIBRATION`
+    when `--calibration-data` is a non-default (temp) path -- used here to synthesize
+    flash points whose true coefficients `main()` will fit against exactly this calib."""
+    return Calibration(
+        base_transient_bytes=float(_EXISTING_CALIBRATION["base_transient_bytes"]),
+        act_bytes_per_token_hidden_layer_ckpt=float(
+            _EXISTING_CALIBRATION["act_bytes_per_token_hidden_layer_ckpt"]),
+        act_bytes_per_token_hidden_layer_full=float(
+            _EXISTING_CALIBRATION["act_bytes_per_token_hidden_layer_full"]),
+        attn_bytes_per_head_token2=float(_EXISTING_CALIBRATION["attn_bytes_per_head_token2"]),
+        attn_bytes_per_head_token_flash=float(
+            _EXISTING_CALIBRATION["attn_bytes_per_head_token_flash"]),
+        optimizer_bytes_per_param=float(_EXISTING_CALIBRATION["optimizer_bytes_per_param"]),
+        overhead_frac=float(_EXISTING_CALIBRATION["overhead_frac"]),
+        naive_loss_bytes_per_nv=float(_EXISTING_CALIBRATION["naive_loss_bytes_per_nv"]),
+        provenance=dict(_EXISTING_CALIBRATION["provenance"]),
+    )
+
+
+def _write_flash_point(
+    tmp_path: Path, name: str, *, config_path: Path, calib: Calibration, shape: ModelShape,
+    seq_len: int, a_flash: float,
+) -> dict[str, object]:
+    """Synthesizes ONE flash manifest entry (config + artifact) whose measured
+    `marginal_peak_gb` is generated FORWARD from a known `a_flash`, mirroring
+    `test_plan.py::_synthesize_flash_fit_point`'s forward-construction pattern but
+    writing a real artifact JSON file instead of a `FitPoint` object -- this is what
+    lets `main()`'s check-then-select logic be exercised end to end through the real
+    manifest-ingestion path (`load_fit_points`)."""
+    cfg = TrainConfig(batch=1, seq_len=seq_len, dtype="bfloat16", lora_rank=8,
+                      lora_layers=2, grad_checkpoint=True, impl="kernel", attention="flash")
+    analytic = (_lora_bytes(cfg, shape) + _optimizer_bytes(cfg, shape, calib)
+                + _loss_bytes(cfg, shape, calib))
+    a_lin = calib.act_bytes_per_token_hidden_layer_ckpt
+    x_lin = cfg.batch * cfg.seq_len * shape.hidden * shape.layers
+    x_flash = cfg.batch * shape.heads * cfg.seq_len
+    o_l = _flash_saved_state_bytes(cfg, shape)
+    marginal_bytes = calib.base_transient_bytes + a_lin * x_lin + a_flash * x_flash + analytic + o_l
+    artifact_path = tmp_path / f"{name}.json"
+    _write_artifact(artifact_path, marginal_peak_gb=marginal_bytes / 1024**3,
+                    attention_impl="flash")
+    return {"config": str(config_path), "artifact": str(artifact_path), "batch": 1,
+            "seq_len": seq_len, "lora_rank": 8, "lora_layers": 2, "grad_checkpoint": True}
+
+
+def test_main_selects_envelope_flash_fit_when_ols_under_predicts_an_anchor(
+    tmp_path: Path,
+) -> None:
+    """Two flash-only points (a flash-only manifest needs no stock points --
+    `fit_memory_coeffs` keeps the stock coefficients from `existing`) with WIDELY
+    different true `a_flash` -- a small-seq_len anchor with a HUGE true coefficient
+    and a large-seq_len anchor with a TINY one. OLS's weighted average is dominated by
+    the large-seq_len point's own huge `x_flash^2` weight, so it lands far below the
+    small anchor's true coefficient: at that anchor, the OLS candidate's predicted
+    cushioned TOTAL (`estimate_peak`) under-shoots the measured total by orders of
+    magnitude, well past the planner's own 10% `overhead_frac` cushion -- main() must
+    detect the violation and refit with `flash_fit="envelope"`."""
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(_CONFIG))
+    calib = _stand_in_calibration()
+    shape = ModelShape.from_config(_CONFIG)
+    small_seq_huge_a_flash = _write_flash_point(
+        tmp_path, "small_seq_huge_a_flash", config_path=config_path, calib=calib,
+        shape=shape, seq_len=512, a_flash=1_000_000.0,
+    )
+    big_seq_tiny_a_flash = _write_flash_point(
+        tmp_path, "big_seq_tiny_a_flash", config_path=config_path, calib=calib,
+        shape=shape, seq_len=8192, a_flash=1.0,
+    )
+    manifest_path = tmp_path / "manifest.json"
+    _write_manifest(manifest_path, [small_seq_huge_a_flash, big_seq_tiny_a_flash])
+    calibration_path = tmp_path / "calibration_data.json"
+    calibration_path.write_text(json.dumps(_EXISTING_CALIBRATION))
+
+    rc = fit_calibration.main([
+        "--manifest", str(manifest_path), "--calibration-data", str(calibration_path),
+    ])
+    assert rc == 0
+    updated = json.loads(calibration_path.read_text())
+    assert updated["provenance"]["flash_fit"] == "envelope"
+    # the envelope recovers the under-predicted anchor's own true coefficient, not the
+    # OLS weighted average (which lands far below it -- see the docstring above).
+    assert updated["attn_bytes_per_head_token_flash"] == pytest.approx(1_000_000.0, rel=1e-6)
+
+
+def test_main_selects_ols_flash_fit_for_benign_points(tmp_path: Path) -> None:
+    """Counterpart: flash points that all imply the SAME true coefficient never trip
+    the one-sidedness guard (OLS recovers that coefficient exactly, and the 10%
+    `overhead_frac` cushion comfortably covers any float rounding) -- `flash_fit` stays
+    `"ols"`, the shipped default, not the envelope fallback."""
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(_CONFIG))
+    calib = _stand_in_calibration()
+    shape = ModelShape.from_config(_CONFIG)
+    a = _write_flash_point(tmp_path, "a", config_path=config_path, calib=calib, shape=shape,
+                           seq_len=512, a_flash=500.0)
+    b = _write_flash_point(tmp_path, "b", config_path=config_path, calib=calib, shape=shape,
+                           seq_len=1024, a_flash=500.0)
+    manifest_path = tmp_path / "manifest.json"
+    _write_manifest(manifest_path, [a, b])
+    calibration_path = tmp_path / "calibration_data.json"
+    calibration_path.write_text(json.dumps(_EXISTING_CALIBRATION))
+
+    rc = fit_calibration.main([
+        "--manifest", str(manifest_path), "--calibration-data", str(calibration_path),
+    ])
+    assert rc == 0
+    updated = json.loads(calibration_path.read_text())
+    assert updated["provenance"]["flash_fit"] == "ols"
+    assert updated["attn_bytes_per_head_token_flash"] == pytest.approx(500.0, rel=1e-6)
 
 
 def test_help_runs_without_touching_a_model() -> None:

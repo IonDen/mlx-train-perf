@@ -35,7 +35,7 @@ Estimates for `lora_rank == 0` configs are therefore optimistic; `lora_rank > 0`
 """
 from collections.abc import Iterator
 from dataclasses import dataclass, replace
-from typing import Any
+from typing import Any, Literal
 
 import mlx.core as mx
 
@@ -347,7 +347,10 @@ def plan_fit(
     )
 
 
-def fit_memory_coeffs(points: list[FitPoint], *, calib: Calibration) -> dict[str, float]:
+def fit_memory_coeffs(
+    points: list[FitPoint], *, calib: Calibration,
+    flash_fit: Literal["ols", "envelope"] = "ols",
+) -> dict[str, float]:
     """Fit the calibration memory coefficients from kernel-impl `train_step` FitPoints.
 
     Returns a dict with keys `base_transient_bytes`,
@@ -391,6 +394,21 @@ def fit_memory_coeffs(points: list[FitPoint], *, calib: Calibration) -> dict[str
     With no flash points the existing `calib` value is kept. The Llama-3.2-3B flash point
     (a different heads/(hidden*layers) ratio) is used for cross-model VALIDATION, not
     identification.
+
+    `flash_fit` selects HOW the flash coefficient above is computed from the same
+    `flash_residual`/`x_flash` closures: `"ols"` (default) is the shipped 1-variable
+    through-origin least-squares fit described above -- minimizing the summed squared
+    residual across all flash points, which can UNDER-predict an individual anchor
+    whenever the true per-point ratio (`flash_residual(p) / x_flash(p)`) varies across
+    points (e.g. a short/long-context split-regime steepening). `"envelope"` instead
+    takes `a_flash = max(flash_residual(p) / x_flash(p) for p in flash_points)` -- the
+    single largest per-point ratio, reusing the SAME closures (no duplicated residual
+    model). Envelope is a strictly conservative (over-predict-safe) fallback for when
+    OLS's least-squares average violates the planner's own never-under-predict
+    invariant at one or more anchors; the two fits are identical whenever every flash
+    point implies the same ratio. Choosing between them is the calling script's job
+    (`scripts/fit_calibration.py`), not this function's -- `fit_memory_coeffs` only
+    computes whichever one it's asked for.
 
     Every point must be `impl="kernel"` -- `"chunked"`/`"naive"` measure a materially
     different loss-layer memory shape that would contaminate the fit.
@@ -477,8 +495,13 @@ def fit_memory_coeffs(points: list[FitPoint], *, calib: Calibration) -> dict[str
                 "fit_memory_coeffs cannot identify a_flash: the flash design has "
                 "sum(x_flash^2) == 0 (need >= 1 flash FitPoint with batch*heads*seq > 0)"
             )
-        num = sum(flash_residual(p) * x_flash(p) for p in flash_points)
-        a_flash = num / den
+        if flash_fit == "envelope":
+            # The single largest per-point ratio -- reuses flash_residual/x_flash
+            # rather than re-deriving the residual model (drift hazard).
+            a_flash = max(flash_residual(p) / x_flash(p) for p in flash_points)
+        else:
+            num = sum(flash_residual(p) * x_flash(p) for p in flash_points)
+            a_flash = num / den
     else:
         a_flash = calib.attn_bytes_per_head_token_flash
 

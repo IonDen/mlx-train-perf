@@ -16,6 +16,14 @@ defaults True; the fit needs >= 3 grad_checkpoint=True points spanning >= 2 seq_
 (to separate base/linear/quadratic) plus optional grad_checkpoint=False points (for the
 `_full` linear coefficient).
 
+The flash coefficient (`attn_bytes_per_head_token_flash`) is fit twice if needed: first
+by `fit_memory_coeffs(..., flash_fit="ols")` (the least-squares default), then checked
+for one-sidedness (`_flash_fit_is_one_sided` -- the candidate's predicted cushioned
+TOTAL peak, via the public `estimate_peak`, must be >= every flash anchor's own
+measured total). A violation triggers a refit with `flash_fit="envelope"` (the largest
+per-point residual/x_flash ratio, strictly conservative). Whichever one ran is recorded
+as `provenance["flash_fit"]`.
+
 This is BUILD-verified only: `tests/test_fit_calibration.py` exercises this script
 end-to-end against SYNTHETIC (fabricated) manifest/config/artifact files written to a
 temp directory -- never against a real `run_train_step` artifact, since none exist yet
@@ -29,6 +37,7 @@ the flash coefficient was fit on 0.32.0.
 import argparse
 import json
 import platform
+from dataclasses import replace
 from datetime import date
 from pathlib import Path
 
@@ -38,6 +47,7 @@ from mlx_train_perf.plan.estimate import (
     FitPoint,
     ModelShape,
     TrainConfig,
+    estimate_peak,
     fit_memory_coeffs,
 )
 
@@ -81,9 +91,34 @@ def load_fit_points(manifest_path: Path) -> list[FitPoint]:
     return points
 
 
+def _flash_fit_is_one_sided(
+    points: list[FitPoint], *, calib: Calibration, a_flash: float
+) -> bool:
+    """True iff, for EVERY flash `FitPoint`, the candidate `a_flash` coefficient's
+    predicted cushioned TOTAL peak (the public `estimate_peak` call a real planner
+    caller makes) is >= the point's own measured total. The measured total is
+    reconstructed from `estimate_peak`'s own `weights` component (shape/dtype-only,
+    independent of `calib`) plus the point's measured MARGINAL
+    (`marginal_peak_bytes`) -- `estimate_peak`'s remaining components (base +
+    activations + attention + lora + optimizer + loss) are exactly what the marginal
+    measures, by construction (see `fit_memory_coeffs`'s docstring). A violation here
+    is what triggers the `flash_fit="envelope"` fallback in `main()`: the planner's
+    own never-under-predict invariant, not a numeric-accuracy nicety."""
+    candidate = replace(calib, attn_bytes_per_head_token_flash=a_flash)
+    for p in points:
+        if p.cfg.attention != "flash":
+            continue
+        predicted_total, components = estimate_peak(p.shape, p.cfg, candidate)
+        measured_total = components["weights"] + p.marginal_peak_bytes
+        if predicted_total < measured_total:
+            return False
+    return True
+
+
 def build_updated_calibration_data(
     *, existing: dict[str, object], coeffs: dict[str, float],
     optimizer_bytes_per_param: float, manifest_path: Path, num_points: int,
+    flash_fit: str = "ols",
 ) -> dict[str, object]:
     """Preserves `overhead_frac`/`naive_loss_bytes_per_nv` from `existing` UNCHANGED
     (this fit never touches them) and replaces the five fitted memory coefficients (base +
@@ -91,10 +126,13 @@ def build_updated_calibration_data(
     `optimizer_bytes_per_param` (analytic) + `provenance`.
 
     `provenance` keeps the four keys `load_calibration`'s own tests require truthy
-    (`machine`, `macos`, `mlx_version`, `measured_date`). Its `fit_source` PRESERVES the
-    existing note (so a flash-only refit -- which keeps the stock coefficients unchanged --
-    doesn't erase the stock fit's provenance) and appends this run's clause naming the
-    manifest + point count for auditability."""
+    (`machine`, `macos`, `mlx_version`, `measured_date`), plus `flash_fit`
+    (`"ols"|"envelope"`, Task 8 0.5.0) naming which flash-coefficient fit `main()`
+    selected -- `"ols"` unless the one-sidedness check (`_flash_fit_is_one_sided`)
+    found a violation and refit with the envelope fallback. Its `fit_source` PRESERVES
+    the existing note (so a flash-only refit -- which keeps the stock coefficients
+    unchanged -- doesn't erase the stock fit's provenance) and appends this run's
+    clause naming the manifest + point count for auditability."""
     prior_provenance = existing.get("provenance", {})
     prior_source = ""
     if isinstance(prior_provenance, dict):
@@ -122,6 +160,7 @@ def build_updated_calibration_data(
             "mlx_version": _installed_mlx_version(),
             "measured_date": date.today().isoformat(),
             "fit_source": fit_source,
+            "flash_fit": flash_fit,
         },
     }
 
@@ -161,11 +200,19 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     points = load_fit_points(manifest_path)
-    coeffs = fit_memory_coeffs(points, calib=calib)
+    coeffs = fit_memory_coeffs(points, calib=calib, flash_fit="ols")
+    flash_fit = "ols"
+    if not _flash_fit_is_one_sided(
+        points, calib=calib, a_flash=coeffs["attn_bytes_per_head_token_flash"]
+    ):
+        # OLS's least-squares average under-predicted at least one flash anchor's own
+        # cushioned TOTAL -- refit with the conservative (over-predict-safe) envelope.
+        coeffs = fit_memory_coeffs(points, calib=calib, flash_fit="envelope")
+        flash_fit = "envelope"
     updated = build_updated_calibration_data(
         existing=existing, coeffs=coeffs,
         optimizer_bytes_per_param=float(existing["optimizer_bytes_per_param"]),
-        manifest_path=manifest_path, num_points=len(points),
+        manifest_path=manifest_path, num_points=len(points), flash_fit=flash_fit,
     )
     print(json.dumps(updated, indent=2))
     if args.dry_run:
