@@ -677,6 +677,7 @@ def _dkv_kernel(
     variant: str = "scalar", d_slab: int | None = None,
     force_ranges: list[tuple[int, int]] | None = None,
     seg_id: mx.array | None = None, seg_start: mx.array | None = None,
+    segment_bound: bool = True, break_early: bool = False,
 ) -> tuple[mx.array, mx.array]:
     """The kernel dK/dV path: forward reference gives (O, L); T7's `launch_bwd_D` gives D from
     (dO, O); `launch_bwd_dkv` consumes q/k/v/dO/L/D and returns the chained (dK, dV).
@@ -685,7 +686,9 @@ def _dkv_kernel(
     TEST-ONLY split-forcing seam (`_force_ranges`) -- the production planner never splits
     these tiny packed-regime shapes. `seg_id`/`seg_start` (0.4.0, both or neither) switch on
     PACKED block-diagonal-causal attention: the forward reference and the kernel both isolate
-    to same-segment causal (query, key) pairs."""
+    to same-segment causal (query, key) pairs. `segment_bound`/`break_early` (0.5.0 T3) pass
+    straight through to `launch_bwd_dkv`: the mma variant honors them (spec D1/D5), the scalar
+    variant ignores them entirely (D3 -- it stays the assumption-free oracle)."""
     segments = _packed_mask(seg_id, seg_start)
     o, lse = flash_attention_reference(q, k, v, scale=scale, causal=causal, segments=segments)
     d_arr = launch_bwd_D(cot, o)
@@ -694,6 +697,7 @@ def _dkv_kernel(
         rate_macs_per_s=rate_macs_per_s, _flip_causal=flip_causal,
         variant=variant, d_slab=d_slab, _force_ranges=force_ranges,
         seg_id=seg_id, seg_start=seg_start,
+        segment_bound=segment_bound, break_early=break_early,
     )
 
 
@@ -2234,3 +2238,181 @@ def test_dkv_kernel_cache_distinguishes_segment_bound_and_break_early() -> None:
     b = _bwd_dkv_kernel(64, True, False, "mma", None, True, False)           # unbounded
     c = _bwd_dkv_kernel(64, True, False, "mma", None, True, True, True)     # break_early
     assert a is not b and a is not c and b is not c  # noqa: PT018
+
+
+# ---------------------------------------------------------------------------------------
+# 0.5.0 T3 -- packed dK/dV segment-end bound: parity, bit-identity, and RED-perturbation
+# proofs (metal lane, spec D1/D4/D5). `launch_bwd_dkv`'s `segment_bound`/`break_early`
+# (Task 2) gate the packed MMA query-block loop's uniform-break bound; the scalar body
+# never sees either flag (D3 -- it stays the assumption-free oracle, predicate-only).
+#
+# TRAP (review finding): `_dkv_kernel` defaults to `variant="scalar"`, which never sees
+# `segment_bound` -- every bounded/unbounded/break_early comparison below MUST pass
+# `variant="mma"` explicitly, or both arms compile the IDENTICAL scalar source and the
+# bit-identity assertion passes trivially (a false green).
+# ---------------------------------------------------------------------------------------
+
+_BOUND_LAYOUTS = {
+    "mid_key_block_boundary": [40, 216],  # 40 not a multiple of 32: boundary inside a key block
+    "single_token_segments": [1] * 8 + [248],
+    "many_tiny": [8] * 32,
+    "row_filling": [256],
+    "two_uneven": [100, 156],
+}
+
+
+def _bound_case(
+    lens: list[int], seed: int
+) -> tuple[mx.array, mx.array, mx.array, mx.array, float, mx.array, mx.array]:
+    """b=1 q/k/v/dO plus the single-row packed layout for `lens` (sums to n). Fixed
+    hq=4/hkv=2/d=64/scale=0.125 across every `_BOUND_LAYOUTS` case."""
+    n = sum(lens)
+    hq, hkv, d, scale = 4, 2, 64, 0.125
+    mx.random.seed(seed)
+    q = mx.random.normal((1, hq, n, d))
+    k = mx.random.normal((1, hkv, n, d))
+    v = mx.random.normal((1, hkv, n, d))
+    cot = mx.random.normal((1, hq, n, d))
+    seg_id, seg_start = _packed_layout(lens, b=1)
+    return q, k, v, cot, scale, seg_id, seg_start
+
+
+@pytest.mark.metal
+@pytest.mark.parametrize(("name", "lens"), sorted(_BOUND_LAYOUTS.items()))
+def test_bounded_dkv_bit_identical_to_unbounded(name: str, lens: list[int]) -> None:
+    """The segment-end bound only SKIPS query blocks the unbounded predicate would have
+    zeroed anyway (spec D5) -- bounded and unbounded MUST produce bit-identical dK/dV over
+    every layout shape in `_BOUND_LAYOUTS` (a mid-block boundary, all-singleton segments,
+    many tiny segments, one full-row segment, two uneven segments)."""
+    q, k, v, cot, scale, seg_id, seg_start = _bound_case(lens, seed=7)
+    dk_a, dv_a = _dkv_kernel(
+        q, k, v, cot, scale=scale, causal=True, variant="mma",
+        seg_id=seg_id, seg_start=seg_start, segment_bound=True,
+    )
+    dk_b, dv_b = _dkv_kernel(
+        q, k, v, cot, scale=scale, causal=True, variant="mma",
+        seg_id=seg_id, seg_start=seg_start, segment_bound=False,
+    )
+    mx.eval(dk_a, dv_a, dk_b, dv_b)
+    assert mx.array_equal(dk_a, dk_b).item(), f"bounded dK != unbounded dK ({name})"
+    assert mx.array_equal(dv_a, dv_b).item(), f"bounded dV != unbounded dV ({name})"
+
+
+@pytest.mark.metal
+def test_break_early_perturbation_fails_parity() -> None:
+    """The named D4 bug site: `break_early=True` compares against the block's FIRST key
+    instead of the LAST, so a segment boundary falling inside a key block (the
+    `mid_key_block_boundary` layout, boundary at 40) truncates valid queries early. Bounded
+    (correct) and break_early (perturbed) MUST diverge -- if they ever matched, the
+    RED-perturbation test could not detect a wrong-key-in-block bug."""
+    lens = _BOUND_LAYOUTS["mid_key_block_boundary"]                   # boundary inside key block 1
+    q, k, v, cot, scale, seg_id, seg_start = _bound_case(lens, seed=7)
+    dk_ok, dv_ok = _dkv_kernel(
+        q, k, v, cot, scale=scale, causal=True, variant="mma",
+        seg_id=seg_id, seg_start=seg_start, segment_bound=True,
+    )
+    dk_bad, dv_bad = _dkv_kernel(
+        q, k, v, cot, scale=scale, causal=True, variant="mma",
+        seg_id=seg_id, seg_start=seg_start, segment_bound=True, break_early=True,
+    )
+    mx.eval(dk_ok, dv_ok, dk_bad, dv_bad)
+    assert not (mx.array_equal(dk_ok, dk_bad).item() and mx.array_equal(dv_ok, dv_bad).item()), (
+        "break_early perturbation matched the bounded kernel -- "
+        "the RED-perturbation test cannot detect a wrong-key-in-block bug"
+    )
+
+
+@pytest.mark.metal
+def test_bounded_chained_split_inside_segment_bit_identical_to_single() -> None:
+    """A chained (multi-dispatch) plan under `segment_bound=True` must stay bit-identical
+    to a single [0, n) dispatch, exactly like the pre-0.5.0 chained-vs-single proofs -- the
+    bound must not disturb the fp32 accumulator carry across dispatches. Split at 64
+    (32-aligned, the mma block-alignment contract) lands inside segment 0's span (0..99)."""
+    q, k, v, cot, scale, seg_id, seg_start = _bound_case([100, 156], seed=11)
+    single_dk, single_dv = _dkv_kernel(
+        q, k, v, cot, scale=scale, causal=True, variant="mma",
+        seg_id=seg_id, seg_start=seg_start, segment_bound=True,
+        force_ranges=[(0, 256)],
+    )
+    split_dk, split_dv = _dkv_kernel(
+        q, k, v, cot, scale=scale, causal=True, variant="mma",
+        seg_id=seg_id, seg_start=seg_start, segment_bound=True,
+        force_ranges=[(0, 64), (64, 256)],  # 32-aligned, inside segment 0 (0..99)
+    )
+    mx.eval(single_dk, single_dv, split_dk, split_dv)
+    assert mx.array_equal(single_dk, split_dk).item(), "bounded chained split dK != single"
+    assert mx.array_equal(single_dv, split_dv).item(), "bounded chained split dV != single"
+
+
+def _packed_layout_per_row(rows_seg_lens: list[list[int]]) -> tuple[mx.array, mx.array]:
+    """(B, N) int32 seg_id/seg_start with a DIFFERENT segment layout on each batch row --
+    unlike `_packed_layout`, which broadcasts one row across the batch. Every row's seg_lens
+    must sum to the same N (the sequence axis is uniform). Origin: copied verbatim from
+    tests/test_attention_api.py::_packed_layout_per_row (review finding M2 -- the public-API
+    per-row test there exposes no `segment_bound` knob, so this file needs its own copy)."""
+    seg_id_rows: list[list[int]] = []
+    seg_start_rows: list[list[int]] = []
+    for seg_lens in rows_seg_lens:
+        seg_id_row: list[int] = []
+        seg_start_row: list[int] = []
+        start = 0
+        for sid, ln in enumerate(seg_lens):
+            seg_id_row += [sid] * ln
+            seg_start_row += [start] * ln
+            start += ln
+        seg_id_rows.append(seg_id_row)
+        seg_start_rows.append(seg_start_row)
+    return mx.array(seg_id_rows, dtype=mx.int32), mx.array(seg_start_rows, dtype=mx.int32)
+
+
+@pytest.mark.metal
+def test_bounded_dkv_per_row_varying_layout_matches_oracle() -> None:
+    """Different segment layouts per batch row at the SAME n, under `segment_bound=True` --
+    uniquely covers the `seg_off = b * n` addressing under the bound (review finding M2): a
+    wrong-row segment-buffer read would mask against the OTHER row's boundary and break
+    parity against the per-row block-diagonal oracle. Pins reuse this file's existing MMA
+    packed parity tolerance (`_TOL_PACKED_DKV["mma"]`, measure-first -- never widened)."""
+    b, hq, hkv, n, d = 2, 4, 2, 256, 64
+    scale = 1.0 / math.sqrt(d)
+    q, k, v, cot = _rand_qkv_do(b=b, hq=hq, hkv=hkv, n=n, d=d, dtype=mx.float32, seed=68)
+    seg_id, seg_start = _packed_layout_per_row([[40, 216], [100, 156]])
+    pm = PackedMask(seg_id=seg_id, seg_start=seg_start)
+
+    dk_k, dv_k = _dkv_kernel(
+        q, k, v, cot, scale=scale, causal=True, variant="mma", segment_bound=True,
+        seg_id=seg_id, seg_start=seg_start,
+    )
+    dk_ref, dv_ref = _dkv_oracle(q, k, v, cot, scale=scale, causal=True, segments=pm)
+    mx.eval(dk_k, dv_k, dk_ref, dv_ref)
+
+    d_dk = mx.abs(dk_k.astype(mx.float32) - dk_ref.astype(mx.float32)).max().item()
+    d_dv = mx.abs(dv_k.astype(mx.float32) - dv_ref.astype(mx.float32)).max().item()
+    print(f"[dKV-bound per-row mma n{n}] dK={d_dk:.6e} dV={d_dv:.6e}")
+    tol = _TOL_PACKED_DKV["mma"][mx.float32]
+    assert d_dk < tol, f"bounded per-row dK-mma vs oracle diff {d_dk}"
+    assert d_dv < tol, f"bounded per-row dV-mma vs oracle diff {d_dv}"
+
+
+@pytest.mark.metal
+@pytest.mark.parametrize(("name", "lens"), sorted(_BOUND_LAYOUTS.items()))
+def test_bounded_mma_matches_scalar_across_bound_layouts(name: str, lens: list[int]) -> None:
+    """The scalar dK/dV kernel takes NO `segment_bound` at all (D3 -- it stays the
+    assumption-free, predicate-only oracle among kernel variants); the bounded mma kernel
+    must still agree with it, over every `_BOUND_LAYOUTS` shape, at the file's existing
+    pinned packed MMA tolerance (measure-first, never widened)."""
+    q, k, v, cot, scale, seg_id, seg_start = _bound_case(lens, seed=7)
+    dk_s, dv_s = _dkv_kernel(
+        q, k, v, cot, scale=scale, causal=True, variant="scalar",
+        seg_id=seg_id, seg_start=seg_start,
+    )
+    dk_m, dv_m = _dkv_kernel(
+        q, k, v, cot, scale=scale, causal=True, variant="mma",
+        seg_id=seg_id, seg_start=seg_start, segment_bound=True,
+    )
+    mx.eval(dk_s, dv_s, dk_m, dv_m)
+    d_dk = mx.abs(dk_s.astype(mx.float32) - dk_m.astype(mx.float32)).max().item()
+    d_dv = mx.abs(dv_s.astype(mx.float32) - dv_m.astype(mx.float32)).max().item()
+    print(f"[dKV-bound scalar-vs-mma {name}] dK={d_dk:.6e} dV={d_dv:.6e}")
+    tol = _TOL_PACKED_DKV["mma"][mx.float32]
+    assert d_dk < tol, f"scalar-vs-bounded-mma dK diff {d_dk} ({name})"
+    assert d_dv < tol, f"scalar-vs-bounded-mma dV diff {d_dv} ({name})"
