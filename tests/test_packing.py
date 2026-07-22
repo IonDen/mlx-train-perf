@@ -4,7 +4,13 @@ import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
-from mlx_train_perf.data.packing import build_row, pack_indices, pack_stats, packed_iterate_batches
+from mlx_train_perf.data.packing import (
+    _assert_pack_time_monotone,
+    build_row,
+    pack_indices,
+    pack_stats,
+    packed_iterate_batches,
+)
 from mlx_train_perf.errors import PackingError
 
 
@@ -305,6 +311,28 @@ def test_packed_batches_have_monotone_seg_id_and_seg_start(seed, make_dataset) -
         assert np.all(np.diff(sid, axis=1) >= 0)
         assert np.all(np.diff(sst, axis=1) >= 0)
     assert saw_a_batch  # otherwise the loop above never ran and the test proves nothing
+
+
+def test_assert_pack_time_monotone_raises_on_non_monotone_seg_id() -> None:
+    """`_assert_pack_time_monotone`'s raise branch (spec D2) had zero direct coverage --
+    every existing caller only ever fed it packer-produced, already-monotone buffers.
+    Hand-build a seg_id row that decreases along its whole length while seg_start stays
+    non-decreasing, isolating the seg_id check (`seg_id` is checked before `seg_start`,
+    so this also proves the seg_id branch fires first when only seg_id is bad)."""
+    sid_arr = np.array([[3, 2, 1, 0]], dtype=np.int32)      # decreasing throughout
+    sst_arr = np.array([[0, 1, 2, 3]], dtype=np.int32)      # monotone (non-decreasing)
+    with pytest.raises(PackingError, match="seg_id"):
+        _assert_pack_time_monotone(sid_arr, sst_arr)
+
+
+def test_assert_pack_time_monotone_raises_on_non_monotone_seg_start() -> None:
+    """The seg_start counterpart of the test above: seg_id stays non-decreasing
+    throughout while seg_start decreases along its whole length, isolating the
+    seg_start check."""
+    sid_arr = np.array([[0, 1, 2, 3]], dtype=np.int32)      # monotone (non-decreasing)
+    sst_arr = np.array([[3, 2, 1, 0]], dtype=np.int32)      # decreasing throughout
+    with pytest.raises(PackingError, match="seg_start"):
+        _assert_pack_time_monotone(sid_arr, sst_arr)
 
 
 @pytest.mark.metal

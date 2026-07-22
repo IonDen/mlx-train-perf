@@ -1126,6 +1126,27 @@ def _validate_bwd_dkv_shapes(
     _validate_bwd_dq_shapes(q, k, v, d_o, lse, d_arr)
 
 
+def _dkv_kernel_name(
+    head_dim: int, causal: bool, flip_causal: bool, variant: str, d_slab: int | None,
+    packed: bool, segment_bound: bool, break_early: bool,
+) -> str:
+    """Pure `mx.fast.metal_kernel(name=...)` string builder for the dK/dV kernel
+    (checkpoint-A fix, 0.5.0): extracted out of `_bwd_dkv_kernel` so the name<->source
+    correspondence is directly testable in the DEFAULT lane without dispatching a
+    kernel. Byte-identical to the inline expression it replaces. mlx caches compiled
+    kernels BY NAME -- a call with an unchanged name but different source silently
+    returns the FIRST compiled binary -- so every flag that varies `build_bwd_dkv_mma_source`
+    output (`segment_bound`, `break_early`, mma variant only) must also vary this name."""
+    return (
+        f"mtp_flash_bwd_dkv_{variant}_d{head_dim}_"
+        f"{'c' if causal else 'f'}{'x' if flip_causal else ''}"
+        + (f"_s{d_slab}" if variant == "mma" else "")
+        + ("_p" if packed else "")
+        + (("" if segment_bound else "_nb") if variant == "mma" else "")
+        + (("_be" if break_early else "") if variant == "mma" else "")
+    )
+
+
 @functools.cache
 def _bwd_dkv_kernel(
     head_dim: int, causal: bool, flip_causal: bool, variant: str, d_slab: int | None,
@@ -1157,7 +1178,12 @@ def _bwd_dkv_kernel(
     different source silently returns the FIRST compiled binary -- so a flag that changed the
     source but not the name (or vice versa) would risk a stale/wrong kernel on a later call with a
     different flag value. Defaults (`segment_bound=True, break_early=False`) preserve every
-    pre-0.5.0 call and cache entry."""
+    pre-0.5.0 call and cache entry. Raises `ValueError` for `variant="scalar"` combined
+    with `segment_bound=False` or `break_early=True` -- the scalar builder silently
+    ignores both, so a caller that thinks it is toggling scalar behaviour with either
+    flag is misusing the API rather than getting a no-op."""
+    if variant == "scalar" and (segment_bound is False or break_early):
+        raise ValueError("segment_bound/break_early apply to the mma variant only")
     if variant == "mma":
         source = build_bwd_dkv_mma_source(
             head_dim, causal=causal, flip_causal=flip_causal, d_slab=d_slab, packed=packed,
@@ -1175,13 +1201,8 @@ def _bwd_dkv_kernel(
     if packed:
         input_names += ["seg_id", "seg_start"]
     kernel = mx.fast.metal_kernel(
-        name=(
-            f"mtp_flash_bwd_dkv_{variant}_d{head_dim}_"
-            f"{'c' if causal else 'f'}{'x' if flip_causal else ''}"
-            + (f"_s{d_slab}" if variant == "mma" else "")
-            + ("_p" if packed else "")
-            + (("" if segment_bound else "_nb") if variant == "mma" else "")
-            + (("_be" if break_early else "") if variant == "mma" else "")
+        name=_dkv_kernel_name(
+            head_dim, causal, flip_causal, variant, d_slab, packed, segment_bound, break_early,
         ),
         input_names=input_names,
         output_names=["dk_out", "dv_out"],

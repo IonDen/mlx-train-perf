@@ -32,6 +32,7 @@ from mlx_train_perf.attention.kernel.dispatch import select_bwd_tiles
 from mlx_train_perf.attention.kernel.launch import (
     TileShape,
     _bwd_dkv_kernel,
+    _dkv_kernel_name,
     calibrated_bwd_dkv_rate,
     calibrated_bwd_dq_rate,
     launch_bwd_D,
@@ -2241,6 +2242,56 @@ def test_dkv_kernel_cache_distinguishes_segment_bound_and_break_early() -> None:
 
 
 # ---------------------------------------------------------------------------------------
+# Checkpoint-A fix -- `_dkv_kernel_name` is the `_bwd_dkv_kernel` inline
+# `mx.fast.metal_kernel(name=...)` string construction extracted to a module-level pure
+# function, so the name<->source correspondence is directly testable (DEFAULT lane, no
+# GPU) rather than only provable by dispatching. mlx caches compiled kernels BY NAME: a
+# call with an unchanged name but different source silently returns the FIRST compiled
+# binary, so a source-varying flag (segment_bound/break_early, mma variant only) MUST
+# also vary the name.
+# ---------------------------------------------------------------------------------------
+
+
+def test_dkv_kernel_name_distinguishes_segment_bound_and_break_early() -> None:
+    bound_be_false = _dkv_kernel_name(64, True, False, "mma", None, True, True, False)
+    unbound_be_false = _dkv_kernel_name(64, True, False, "mma", None, True, False, False)
+    bound_be_true = _dkv_kernel_name(64, True, False, "mma", None, True, True, True)
+
+    assert bound_be_false != unbound_be_false
+    assert bound_be_false != bound_be_true
+    assert unbound_be_false != bound_be_true
+
+    # `_nb` appears exactly when segment_bound=False; `_be` exactly when break_early=True.
+    assert "_nb" not in bound_be_false
+    assert "_be" not in bound_be_false
+    assert "_nb" in unbound_be_false
+    assert "_be" not in unbound_be_false
+    assert "_nb" not in bound_be_true
+    assert "_be" in bound_be_true
+
+
+def test_dkv_kernel_name_scalar_variant_ignores_both_flags() -> None:
+    """The scalar builder never sees `segment_bound`/`break_early` (D3 -- it stays the
+    assumption-free oracle among kernel variants), so its name must be identical
+    regardless of either flag's value -- distinguishing them would imply a scalar source
+    that does not exist."""
+    a = _dkv_kernel_name(64, True, False, "scalar", None, True, True, False)
+    b = _dkv_kernel_name(64, True, False, "scalar", None, True, False, True)
+    assert a == b
+
+
+def test_bwd_dkv_kernel_rejects_segment_bound_or_break_early_on_scalar() -> None:
+    """`segment_bound`/`break_early` are mma-only knobs (D3 -- the scalar body stays the
+    assumption-free, predicate-only oracle and never accepts either). A caller passing
+    `variant="scalar"` with `segment_bound=False` or `break_early=True` gets a
+    `ValueError` rather than a silently-ignored flag."""
+    with pytest.raises(ValueError, match="segment_bound/break_early apply to the mma variant only"):
+        _bwd_dkv_kernel(64, True, False, "scalar", None, True, False, False)
+    with pytest.raises(ValueError, match="segment_bound/break_early apply to the mma variant only"):
+        _bwd_dkv_kernel(64, True, False, "scalar", None, True, True, True)
+
+
+# ---------------------------------------------------------------------------------------
 # 0.5.0 T3 -- packed dK/dV segment-end bound: parity, bit-identity, and RED-perturbation
 # proofs (metal lane, spec D1/D4/D5). `launch_bwd_dkv`'s `segment_bound`/`break_early`
 # (Task 2) gate the packed MMA query-block loop's uniform-break bound; the scalar body
@@ -2252,6 +2303,14 @@ def test_dkv_kernel_cache_distinguishes_segment_bound_and_break_early() -> None:
 # bit-identity assertion passes trivially (a false green).
 # ---------------------------------------------------------------------------------------
 
+# Own measurement (mlx 0.32.0, M1 Max, seed=7, over every `_BOUND_LAYOUTS` shape): worst
+# dV 2.384186e-06 (mid_key_block_boundary and single_token_segments tied), worst dK
+# 1.430511e-06. Pinned at ~2.1x the measured worst -- NEVER inherited from
+# `_TOL_PACKED_DKV["mma"]` (3e-5, ~12.6x this test's own worst; that pin belongs to the
+# packed-vs-block-diagonal-oracle parity grid, a different comparison at a different
+# measured worst -- this file's own convention is measure-first, per-comparison pins).
+_TOL_BOUNDED_SCALAR_VS_MMA = 5e-6
+
 _BOUND_LAYOUTS = {
     "mid_key_block_boundary": [40, 216],  # 40 not a multiple of 32: boundary inside a key block
     "single_token_segments": [1] * 8 + [248],
@@ -2259,6 +2318,13 @@ _BOUND_LAYOUTS = {
     "row_filling": [256],
     "two_uneven": [100, 156],
 }
+
+# Bit-identity-only extra layout (review finding, Fix 6): the spec's own "many tiny
+# segments (64x64 within 4096)" example at REAL scale -- n=4096, 64 segments of 64 tokens
+# each. Added only to `test_bounded_dkv_bit_identical_to_unbounded` (not the
+# scalar-vs-mma cross-check, which would get slow at this N); the smaller `many_tiny`
+# case in `_BOUND_LAYOUTS` already covers the same shape at test speed.
+_BOUND_LAYOUTS_BIT_IDENTITY = {**_BOUND_LAYOUTS, "spec_scale_64x64": [64] * 64}
 
 
 def _bound_case(
@@ -2278,22 +2344,29 @@ def _bound_case(
 
 
 @pytest.mark.metal
-@pytest.mark.parametrize(("name", "lens"), sorted(_BOUND_LAYOUTS.items()))
+@pytest.mark.parametrize(("name", "lens"), sorted(_BOUND_LAYOUTS_BIT_IDENTITY.items()))
 def test_bounded_dkv_bit_identical_to_unbounded(name: str, lens: list[int]) -> None:
     """The segment-end bound only SKIPS query blocks the unbounded predicate would have
     zeroed anyway (spec D5) -- bounded and unbounded MUST produce bit-identical dK/dV over
-    every layout shape in `_BOUND_LAYOUTS` (a mid-block boundary, all-singleton segments,
-    many tiny segments, one full-row segment, two uneven segments)."""
+    every layout shape in `_BOUND_LAYOUTS_BIT_IDENTITY` (a mid-block boundary,
+    all-singleton segments, many tiny segments, one full-row segment, two uneven
+    segments, and the spec's own many-tiny-segments example at real scale, n=4096)."""
     q, k, v, cot, scale, seg_id, seg_start = _bound_case(lens, seed=7)
     dk_a, dv_a = _dkv_kernel(
         q, k, v, cot, scale=scale, causal=True, variant="mma",
         seg_id=seg_id, seg_start=seg_start, segment_bound=True,
     )
+    # Fully evaluate arm A BEFORE constructing/evaluating arm B: verified on mlx 0.32.0,
+    # co-evaluating two structurally-different freshly-JIT'd `mx.fast.metal_kernel`s in a
+    # single `mx.eval` corrupted BOTH outputs on a cold process (order-dependent; the
+    # full suite was only green because earlier tests had already warmed both kernel
+    # variants). Separating the evals keeps each kernel's JIT compile + dispatch isolated.
+    mx.eval(dk_a, dv_a)
     dk_b, dv_b = _dkv_kernel(
         q, k, v, cot, scale=scale, causal=True, variant="mma",
         seg_id=seg_id, seg_start=seg_start, segment_bound=False,
     )
-    mx.eval(dk_a, dv_a, dk_b, dv_b)
+    mx.eval(dk_b, dv_b)
     assert mx.array_equal(dk_a, dk_b).item(), f"bounded dK != unbounded dK ({name})"
     assert mx.array_equal(dv_a, dv_b).item(), f"bounded dV != unbounded dV ({name})"
 
@@ -2311,11 +2384,17 @@ def test_break_early_perturbation_fails_parity() -> None:
         q, k, v, cot, scale=scale, causal=True, variant="mma",
         seg_id=seg_id, seg_start=seg_start, segment_bound=True,
     )
+    # Fully evaluate arm A BEFORE constructing/evaluating arm B: verified on mlx 0.32.0,
+    # co-evaluating two structurally-different freshly-JIT'd `mx.fast.metal_kernel`s in a
+    # single `mx.eval` corrupted BOTH outputs on a cold process (order-dependent; the
+    # full suite was only green because earlier tests had already warmed both kernel
+    # variants). Separating the evals keeps each kernel's JIT compile + dispatch isolated.
+    mx.eval(dk_ok, dv_ok)
     dk_bad, dv_bad = _dkv_kernel(
         q, k, v, cot, scale=scale, causal=True, variant="mma",
         seg_id=seg_id, seg_start=seg_start, segment_bound=True, break_early=True,
     )
-    mx.eval(dk_ok, dv_ok, dk_bad, dv_bad)
+    mx.eval(dk_bad, dv_bad)
     assert not (mx.array_equal(dk_ok, dk_bad).item() and mx.array_equal(dv_ok, dv_bad).item()), (
         "break_early perturbation matched the bounded kernel -- "
         "the RED-perturbation test cannot detect a wrong-key-in-block bug"
@@ -2398,21 +2477,27 @@ def test_bounded_dkv_per_row_varying_layout_matches_oracle() -> None:
 def test_bounded_mma_matches_scalar_across_bound_layouts(name: str, lens: list[int]) -> None:
     """The scalar dK/dV kernel takes NO `segment_bound` at all (D3 -- it stays the
     assumption-free, predicate-only oracle among kernel variants); the bounded mma kernel
-    must still agree with it, over every `_BOUND_LAYOUTS` shape, at the file's existing
-    pinned packed MMA tolerance (measure-first, never widened)."""
+    must still agree with it, over every `_BOUND_LAYOUTS` shape, at this comparison's own
+    measured-worst pin (`_TOL_BOUNDED_SCALAR_VS_MMA`, measure-first, never widened)."""
     q, k, v, cot, scale, seg_id, seg_start = _bound_case(lens, seed=7)
     dk_s, dv_s = _dkv_kernel(
         q, k, v, cot, scale=scale, causal=True, variant="scalar",
         seg_id=seg_id, seg_start=seg_start,
     )
+    # Fully evaluate arm A BEFORE constructing/evaluating arm B: verified on mlx 0.32.0,
+    # co-evaluating two structurally-different freshly-JIT'd `mx.fast.metal_kernel`s in a
+    # single `mx.eval` corrupted BOTH outputs on a cold process (order-dependent; the
+    # full suite was only green because earlier tests had already warmed both kernel
+    # variants). Separating the evals keeps each kernel's JIT compile + dispatch isolated.
+    mx.eval(dk_s, dv_s)
     dk_m, dv_m = _dkv_kernel(
         q, k, v, cot, scale=scale, causal=True, variant="mma",
         seg_id=seg_id, seg_start=seg_start, segment_bound=True,
     )
-    mx.eval(dk_s, dv_s, dk_m, dv_m)
+    mx.eval(dk_m, dv_m)
     d_dk = mx.abs(dk_s.astype(mx.float32) - dk_m.astype(mx.float32)).max().item()
     d_dv = mx.abs(dv_s.astype(mx.float32) - dv_m.astype(mx.float32)).max().item()
     print(f"[dKV-bound scalar-vs-mma {name}] dK={d_dk:.6e} dV={d_dv:.6e}")
-    tol = _TOL_PACKED_DKV["mma"][mx.float32]
+    tol = _TOL_BOUNDED_SCALAR_VS_MMA
     assert d_dk < tol, f"scalar-vs-bounded-mma dK diff {d_dk} ({name})"
     assert d_dv < tol, f"scalar-vs-bounded-mma dV diff {d_dv} ({name})"
