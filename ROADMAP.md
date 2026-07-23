@@ -2,6 +2,23 @@
 
 ## Released
 
+### 0.5.0 - 2026-07-23
+- Packed dK/dV block skipping. The packed backward kernel now bounds its query walk at
+  each key block's segment end instead of masking cross-segment work per element.
+  Measured with identical dispatch ranges on both arms, the dK/dV pass on an Alpaca-like
+  row runs 6.2× faster at 4,096 tokens and 8.4× at 8,192; a single-segment row is
+  unchanged. End to end on Qwen3-8B-4bit, packing's real-token throughput moves from
+  2.72× to 3.00× against unpacked batching, and the packed arm's median step drops from
+  44.7 s to 40.4 s.
+- Planner anchors past 8,192 tokens, with a safer flash fit. New measured anchors at
+  10,240 and 12,288 tokens showed the flash memory coefficient under-predicting the
+  stock-loss arm at long context. The fit now takes an envelope over the worst measured
+  arm, so `plan --attention flash` never under-predicts within its validated range
+  (2,048-12,288 tokens), at the cost of reading more conservatively for the fused loss.
+- Planner inverse queries. `plan --max-seq` and `--max-batch` return the largest sequence
+  length or batch size that fits a memory budget, instead of checking one config at a
+  time.
+
 ### 0.4.0 - 2026-07-19
 - Sequence packing for instruction tuning. Short examples share fixed 4,096-token training
   rows, kept independent by a block-diagonal mask enforced inside the flash kernels with an
@@ -64,20 +81,6 @@ context-ceiling one — 0.3.0 already made the context ceiling memory-bound.
 ### Fused backward kernel for the loss
 The loss ships a fused forward paired with a proven chunked backward. A fully fused backward
 kernel is a further memory reduction for the loss layer itself.
-
-### Packed dK/dV block skipping
-The packed forward and dQ kernels skip cross-segment key blocks and run about 3× faster
-than causal on real multi-segment rows; the dK/dV kernel masks per element instead of
-bounding its loop, so it does the causal amount of work. Bounding its query loop at each
-key's segment end is the remaining ~2× for packed backward throughput.
-
-### Planner anchors beyond 8192
-The flash planner coefficient is fit to anchors up to 8192 tokens. Add measured anchors past
-8192 so the flash fit is validated at longer context instead of extrapolated.
-
-### Planner inverse queries
-Ask the planner for the largest batch or sequence length that fits a given memory budget,
-instead of checking one config at a time.
 
 ## Not doing
 - Trainer UX or a training-loop framework. That is the lane of tools like mlx-lm-lora and

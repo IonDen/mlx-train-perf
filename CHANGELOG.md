@@ -4,6 +4,46 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-07-23
+
+Bounds the packed dK/dV backward kernel's query walk at each key block's segment end,
+instead of masking cross-segment work after computing it. Measured with identical
+dispatch ranges on both arms, interleaved reps (`scripts/bench_packed_dkv.py`), the dK/dV
+pass on an Alpaca-like layout (about 45 segments per 4,096-token row) runs 6.2× faster at
+4,096 tokens and 8.4× at 8,192; a single-segment row is unchanged (1.00×, 1.02×). End to
+end on Qwen3-8B-4bit (LoRA, gradient checkpointing, batch 1, both arms measured fresh at
+this release's code, `scripts/bench_packed_training.py`), packed throughput is 99.2 real
+tokens/sec against 33.1 unpacked, 3.00× (0.4.0 measured 2.72×), and the packed arm's
+median step drops from 44.7 s to 40.4 s. Also widens the planner's flash-attention fit
+past 8,192 tokens and adds inverse queries for the largest sequence length or batch a
+memory budget allows.
+
+### Added
+- Packed dK/dV block skipping: the dK/dV pass is one slice of the training step, so the
+  6-8× kernel win (above) lands as about a 10% cut to the whole step. The unpacked arm is
+  within 0.4% of its 0.4.0 measurement, which is what pins the end-to-end gain to the
+  packed backward rather than to bench noise. This release's runs also set the compute
+  dtype to bfloat16 explicitly, where the prior run left it at the model default; the
+  unpacked arm's flatness shows that change contributes nothing material. The op bench
+  dispatches through fixed 1,024-row chunks to isolate the block-skip from the dispatch
+  planner; production dispatches the full row at these shapes, and the skip logic is the
+  same either way. Single-segment packed output stays bit-identical to before. A new
+  pack-time check rejects non-monotone segment buffers — the packer's own output was
+  always monotone, so this closes a gap only for a hand-built `PackedMask` that bypasses
+  the packer (`PackedMask.validate()`, opt-in, not called on the packer/loss path).
+- Planner anchors to 12,288 and a more conservative flash fit: new measured anchors at
+  10,240 and 12,288 tokens (both loss implementations) showed the flash memory coefficient
+  under-predicting the stock-loss arm at long context. The fit now takes an envelope over
+  the worst measured arm, so `plan --attention flash` never under-predicts at any measured
+  anchor, at the cost of reading more conservatively for the fused loss: up to about 1.4×
+  the measured peak on the fitted model, about 1.6× cross-model. Flash plans and inverse
+  answers come out more conservative than in 0.4.0. The validated range is 2,048-12,288
+  tokens; past that the fit extrapolates. Reproducer: `scripts/bench_train_step.py` plus
+  `scripts/fit_calibration.py` against the committed manifest.
+- Planner inverse queries: `mlx-train-perf plan --max-seq` and `--max-batch` return the
+  largest sequence length or batch size that fits the memory budget, instead of checking
+  one config at a time. A config that cannot fit at all is refused with a typed error.
+
 ## [0.4.0] - 2026-07-19
 
 Adds sequence packing for instruction-tuning data: many short sequences share one
@@ -207,6 +247,8 @@ Silicon, with an mlx-lm adapter, a RAM-fit planner, and a benchmark harness.
   `ROADMAP.md`).
 - Architectures: Llama and Qwen3 only. Training: LoRA / QLoRA. Apple Silicon only.
 
+[0.5.0]: https://github.com/IonDen/mlx-train-perf/releases/tag/v0.5.0
+[0.4.0]: https://github.com/IonDen/mlx-train-perf/releases/tag/v0.4.0
 [0.3.1]: https://github.com/IonDen/mlx-train-perf/releases/tag/v0.3.1
 [0.3.0]: https://github.com/IonDen/mlx-train-perf/releases/tag/v0.3.0
 [0.2.0]: https://github.com/IonDen/mlx-train-perf/releases/tag/v0.2.0
