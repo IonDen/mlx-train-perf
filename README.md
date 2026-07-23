@@ -101,7 +101,7 @@ Samples per hour move the same way: 1,415 → 4,246 on Qwen3-8B and 2,617 → 7,
 
 Where the win comes from matters for whether you will see it too. At batch size 1, stock batching loses little to padding (17% on this dataset, mostly round-to-32 alignment) — the win comes from amortization. A packed row carries roughly 40–50 Alpaca sequences (47.6 on average under Qwen3's tokenizer, 38.1 under Llama's), so the fixed step cost is paid once per ~4,000 real tokens instead of once per 84, and attention runs at its 4,096-token efficiency instead of a ~100-token shape. A dataset of long sequences packs fewer per row and gains less; one that already fills the context gains nothing. The stock arm's per-step median also includes `mx.compile`'s first trace of each batch width (stock widths vary; packed rows are one constant shape, which is itself part of the win), and a long training run amortizes those traces away. Reading the stock arm at its fastest repeated warm step instead of its median gives a conservative bound of about 2.0–2.3×, so the honest range is 2–2.7× on this dataset. The packed arm's own walls are flat to within 5%.
 
-0.5.0 tightens the packed backward: the dK/dV kernel now bounds its query walk at each key block's segment end instead of masking cross-segment work after computing it. Timed with identical dispatch ranges on both arms (`scripts/bench_packed_dkv.py`), the dK/dV pass on an Alpaca-like row runs 6.2× faster at 4,096 tokens and 8.4× at 8,192; a single-segment row is unchanged. That pass is one slice of the training step, so the win on the full step is smaller: on Qwen3-8B-4bit the packed arm's median step drops from 44.7 s to 40.4 s (+10.7% tokens/sec, with the unpacked arm within 0.4% of its prior measurement — the control that pins the gain to the packed backward). The table above is this release's measurement of both models.
+0.5.0 tightens the packed backward: the dK/dV kernel now bounds its query walk at each key block's segment end instead of masking cross-segment work after computing it. Timed with identical dispatch ranges on both arms (`scripts/bench_packed_dkv.py`), the dK/dV pass on an Alpaca-like row runs 6.2× faster at 4,096 tokens and 8.3× at 8,192; a single-segment row is unchanged. That pass is one slice of the training step, so the win on the full step is smaller: on Qwen3-8B-4bit the packed arm's median step drops from 44.7 s to 40.4 s (+10.7% tokens/sec, with the unpacked arm within half a percent of its prior measurement — the control that pins the gain to the packed backward). The table above is this release's measurement of both models.
 
 ### Training packed
 
@@ -223,19 +223,22 @@ python scripts/bench_train_step.py --model mlx-community/Qwen3-8B-4bit --seq-len
 python scripts/bench_train_step.py --model mlx-community/Qwen3-8B-4bit --seq-len 8192 \
     --attention stock --impl kernel --compute-dtype bfloat16 --grad-checkpoint --out _artifacts/stock
 python scripts/northstar_context_sweep.py # the max-context sweep (1-2 h; heavy)
-# the packed dK/dV block-skip ratios (6.2x / 8.4x): one invocation per layout and length
+# the packed dK/dV block-skip ratios (6.2x / 8.3x): one invocation per layout and length
 python scripts/bench_packed_dkv.py --n 4096 --layout alpaca --out _artifacts/packed_dkv
+python scripts/bench_packed_dkv.py --n 8192 --layout alpaca --out _artifacts/packed_dkv
 # the planner's flash-fit anchors and refit (envelope over the committed manifest)
 python scripts/fit_calibration.py --manifest _artifacts/calib_050/refit_manifest.json --dry-run
-# the 2.72x packing table: prep the dataset once per model, then run each arm into its own --out dir
+# the packing table (3.00x / 2.95x): prep the dataset once per model, then run each arm
+# into its own --out dir (30 timed steps per arm, the script default, matching the
+# committed artifacts)
 python scripts/prep_alpaca.py --model mlx-community/Qwen3-8B-4bit \
     --out _artifacts/packed_bench/alpaca_qwen3.jsonl --batch-size 1 --pack-len 4096 --max-samples 4000 --seed 42
 python scripts/bench_packed_training.py --model mlx-community/Qwen3-8B-4bit \
     --data _artifacts/packed_bench/alpaca_qwen3.jsonl --arm stock --pack-len 4096 --batch-size 1 \
-    --steps 60 --grad-checkpoint --compute-dtype bfloat16 --out _artifacts/packed_bench/qwen3_stock
+    --grad-checkpoint --compute-dtype bfloat16 --out _artifacts/packed_bench_050
 python scripts/bench_packed_training.py --model mlx-community/Qwen3-8B-4bit \
     --data _artifacts/packed_bench/alpaca_qwen3.jsonl --arm packed --pack-len 4096 --batch-size 1 \
-    --steps 30 --grad-checkpoint --compute-dtype bfloat16 --out _artifacts/packed_bench/qwen3_packed
+    --grad-checkpoint --compute-dtype bfloat16 --out _artifacts/packed_bench_050
 ```
 
 ## Memory safety net

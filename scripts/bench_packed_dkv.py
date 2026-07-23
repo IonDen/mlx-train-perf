@@ -1,4 +1,4 @@
-"""Op-level bench for the packed dK/dV segment-end bound (0.5.0, backlog 0030, Task 5):
+"""Op-level bench for the packed dK/dV segment-end bound (new in 0.5.0):
 bounded (`segment_bound=True`) vs unbounded (`segment_bound=False`) at the SAME shape and
 the SAME dispatch plan, isolating the block-skip's own wall-time effect from every other
 variable.
@@ -100,8 +100,7 @@ def two_seg_lengths(n: int) -> list[int]:
 
 def single_lengths(n: int) -> list[int]:
     """`--layout single`: no packing at all (one segment covering every row) -- the
-    no-win control the plan's interpretation note calls for (a bounded/unbounded ratio
-    near 1.0x here is expected, not a bug)."""
+    no-win control (a bounded/unbounded ratio near 1.0x here is expected, not a bug)."""
     return [n]
 
 
@@ -166,9 +165,10 @@ def build_result(
     bounded_ms: list[float], unbounded_ms: list[float],
     peak_gb: float, code_sha: str,
 ) -> dict[str, object]:
-    """Pure artifact-shape builder (no mx/GPU dependency) -- the exact schema Task 5
-    specifies: both arms' medians + raw reps, the ratio, the forced ranges, code_sha, and
-    the run's marginal peak memory."""
+    """Pure artifact-shape builder (no mx/GPU dependency): both arms' medians + raw reps,
+    the ratio, the forced ranges, code_sha, and the run's peak memory since the pre-loop
+    reset (the bench inputs stay resident through the window, so this is a total peak,
+    not a marginal one)."""
     bounded_median = statistics.median(bounded_ms)
     unbounded_median = statistics.median(unbounded_ms)
     ratio = unbounded_median / bounded_median if bounded_median > 0 else None

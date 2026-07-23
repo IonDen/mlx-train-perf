@@ -706,8 +706,8 @@ def test_predicted_peak_one_sided_and_bounded_qwen3_8b_flash() -> None:
     8192, -4.1 at 12288); the envelope fit covers the worst measured arm instead, so
     the FUSED-loss anchor here reads deliberately conservative rather than accurate.
     Contract pinned: predicted >= measured (never under), AND predicted <= 1.5x
-    measured (measured ratio 1.405 at this anchor under the envelope calibration --
-    ~7% margin, own measurement, never inherited). Anchor: Qwen3-8B-4bit, seq 8192,
+    measured (measured ratio ~1.41 at this anchor under the envelope calibration --
+    ~6% margin, own measurement, never inherited). Anchor: Qwen3-8B-4bit, seq 8192,
     gc=True, kernel, attention=flash, MEASURED total 12.7462 GB
     (`_artifacts/bench_train_step_flash/..._seq8192_ours.json`)."""
     qwen = ModelShape(vocab=151936, hidden=4096, layers=36, intermediate=12288, heads=32,
@@ -817,5 +817,36 @@ def test_flash_never_under_predicts_stock_loss_anchors() -> None:
         measured_total = components["weights"] + marginal_peak_gb * 1024**3
         assert predicted_total >= measured_total, (
             f"under-predicted the stock-loss anchor at seq_len={seq_len}: "
+            f"predicted={predicted_total} measured_total={measured_total}"
+        )
+
+
+def test_flash_never_under_predicts_fused_loss_anchors_past_8192() -> None:
+    """Final-gate review fix: the release claims the refit is validated for BOTH loss
+    impls to seq 12288, but the fused-loss ("ours") arm's NEW anchors had no
+    never-under-predict pin -- only the old seq-8192 ours anchor (in
+    `test_predicted_peak_one_sided_and_bounded_qwen3_8b_flash`) was covered, so a
+    future coefficient regression hitting specifically the fused arm at long context
+    (the mirror of the stock-arm gap the refit fixed) would have passed the suite.
+    Anchors: `_artifacts/calib_050/flash_n10240/..._ours.json`
+    (marginal_peak_gb=10.4289) and `_artifacts/calib_050/flash_n12288/..._ours.json`
+    (marginal_peak_gb=12.4794); same TrainConfig shape as the sibling stock-anchor
+    test. The committed envelope coefficient clears both at ratio ~1.416 (own
+    measurement, final-gate review)."""
+    qwen = ModelShape(vocab=151936, hidden=4096, layers=36, intermediate=12288, heads=32,
+                      kv_heads=8, tied=False, quant_bits=4, quant_group=64)
+    calib = load_calibration()
+    anchors = (
+        (10240, 10.4289),   # _artifacts/calib_050/flash_n10240/..._ours.json
+        (12288, 12.4794),   # _artifacts/calib_050/flash_n12288/..._ours.json
+    )
+    for seq_len, marginal_peak_gb in anchors:
+        cfg = TrainConfig(batch=1, seq_len=seq_len, dtype="bfloat16", lora_rank=8,
+                          lora_layers=36, grad_checkpoint=True, impl="kernel",
+                          attention="flash")
+        predicted_total, components = estimate_peak(qwen, cfg, calib)
+        measured_total = components["weights"] + marginal_peak_gb * 1024**3
+        assert predicted_total >= measured_total, (
+            f"under-predicted the fused-loss anchor at seq_len={seq_len}: "
             f"predicted={predicted_total} measured_total={measured_total}"
         )

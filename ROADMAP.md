@@ -6,7 +6,7 @@
 - Packed dK/dV block skipping. The packed backward kernel now bounds its query walk at
   each key block's segment end instead of masking cross-segment work per element.
   Measured with identical dispatch ranges on both arms, the dK/dV pass on an Alpaca-like
-  row runs 6.2× faster at 4,096 tokens and 8.4× at 8,192; a single-segment row is
+  row runs 6.2× faster at 4,096 tokens and 8.3× at 8,192; a single-segment row is
   unchanged. End to end on Qwen3-8B-4bit, packing's real-token throughput moves from
   2.72× to 3.00× against unpacked batching, and the packed arm's median step drops from
   44.7 s to 40.4 s.

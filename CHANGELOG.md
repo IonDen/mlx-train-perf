@@ -10,7 +10,7 @@ Bounds the packed dK/dV backward kernel's query walk at each key block's segment
 instead of masking cross-segment work after computing it. Measured with identical
 dispatch ranges on both arms, interleaved reps (`scripts/bench_packed_dkv.py`), the dK/dV
 pass on an Alpaca-like layout (about 45 segments per 4,096-token row) runs 6.2× faster at
-4,096 tokens and 8.4× at 8,192; a single-segment row is unchanged (1.00×, 1.02×). End to
+4,096 tokens and 8.3× at 8,192; a single-segment row is unchanged (1.00×, 1.02×). End to
 end on Qwen3-8B-4bit (LoRA, gradient checkpointing, batch 1, both arms measured fresh at
 this release's code, `scripts/bench_packed_training.py`), packed throughput is 99.2 real
 tokens/sec against 33.1 unpacked, 3.00× (0.4.0 measured 2.72×), and the packed arm's
@@ -21,8 +21,8 @@ memory budget allows.
 ### Added
 - Packed dK/dV block skipping: the dK/dV pass is one slice of the training step, so the
   6-8× kernel win (above) lands as about a 10% cut to the whole step. The unpacked arm is
-  within 0.4% of its 0.4.0 measurement, which is what pins the end-to-end gain to the
-  packed backward rather than to bench noise. This release's runs also set the compute
+  within half a percent of its 0.4.0 measurement, which is what pins the end-to-end gain
+  to the packed backward rather than to bench noise. This release's runs also set the compute
   dtype to bfloat16 explicitly, where the prior run left it at the model default; the
   unpacked arm's flatness shows that change contributes nothing material. The op bench
   dispatches through fixed 1,024-row chunks to isolate the block-skip from the dispatch
