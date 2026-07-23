@@ -1,0 +1,30 @@
+{
+  "identity": {
+    "schema_version": 1,
+    "mlx_version": "0.32.0",
+    "mlx_lm_version": "0.31.3",
+    "machine": "arm64",
+    "macos": "26.5.2",
+    "code_sha": "fbfc6294e39dc547",
+    "package_version": "0.3.2.dev1+g5c64ffceb",
+    "kind": "train_step",
+    "session_id": "9f3357a98e67492fbe78aebb6624a76c",
+    "attention_impl": "flash",
+    "model": "mlx-community/Qwen3-8B-4bit",
+    "revision": null,
+    "seq_len": 16384,
+    "batch": 1,
+    "steps": 20,
+    "lora_rank": 8,
+    "lora_layers": -1,
+    "impl": "kernel",
+    "stock": true,
+    "learning_rate": 1e-05,
+    "seed": 0,
+    "compute_dtype": "bfloat16",
+    "grad_checkpoint": true,
+    "script_sha": "89ee79937c01655a"
+  },
+  "status": "refused_environment",
+  "error": "effective memory ceiling 3839377408 B is below the safe-start floor 8589934592 B (memory_size // 4); measured available 5986861056 B -- the machine is too crowded to start this run safely"
+}

@@ -699,16 +699,17 @@ def test_fit_memory_coeffs_flash_fit_envelope_matches_max_ratio() -> None:
             == pytest.approx(expected_envelope, rel=1e-6))
 
 
-def test_predicted_peak_matches_measured_qwen3_8b_flash_within_tolerance() -> None:
-    """Measured-vs-predicted acceptance for the flash branch: anchor the model to a T13
-    flash train-step measurement -- Qwen3-8B-4bit, seq 8192, grad_checkpoint=True, kernel,
-    attention=flash, MEASURED total peak 12.7462 GB
-    (`_artifacts/bench_train_step_flash/..._seq8192_ours.json`). The committed calibration
-    predicts within 15% and OVER-predicts (the safe direction). The measured over-
-    prediction is ~8.2% -- the ~1.10 overhead_frac cushion covers the small marginal-level
-    under-fit at this anchor. The whole point of the flash branch is visible here: the
-    stock O(N^2) term would predict ~17 GB of attention alone (grossly over the true
-    12.7 GB total), whereas the flash O(N) term tracks the real drop."""
+def test_predicted_peak_one_sided_and_bounded_qwen3_8b_flash() -> None:
+    """Measured-vs-predicted acceptance for the flash branch under the 0.5.0 ENVELOPE
+    contract. The 0.5.0 refit (anchors to seq 12288, BOTH loss impls) showed the old
+    OLS coefficient UNDER-predicted the stock-loss flash arm from 8192 up (-2.1 GiB at
+    8192, -4.1 at 12288); the envelope fit covers the worst measured arm instead, so
+    the FUSED-loss anchor here reads deliberately conservative rather than accurate.
+    Contract pinned: predicted >= measured (never under), AND predicted <= 1.5x
+    measured (measured ratio 1.405 at this anchor under the envelope calibration --
+    ~7% margin, own measurement, never inherited). Anchor: Qwen3-8B-4bit, seq 8192,
+    gc=True, kernel, attention=flash, MEASURED total 12.7462 GB
+    (`_artifacts/bench_train_step_flash/..._seq8192_ours.json`)."""
     qwen = ModelShape(vocab=151936, hidden=4096, layers=36, intermediate=12288, heads=32,
                       kv_heads=8, tied=False, quant_bits=4, quant_group=64)
     calib = load_calibration()
@@ -716,18 +717,22 @@ def test_predicted_peak_matches_measured_qwen3_8b_flash_within_tolerance() -> No
                       grad_checkpoint=True, impl="kernel", attention="flash")
     peak, _ = estimate_peak(qwen, cfg, calib)
     measured_bytes = 12.7462 * 1024**3
-    assert abs(peak - measured_bytes) / measured_bytes < 0.15
-    assert peak >= measured_bytes  # over-predicts -- the safe direction for a fit planner
+    assert peak >= measured_bytes          # never under -- the planner's core promise
+    assert peak <= measured_bytes * 1.5    # bounded conservatism (measured 1.405)
 
 
 def test_flash_cross_model_validation_on_llama3b() -> None:
     """Cross-model validation of the Qwen-fitted a_flash on Llama-3.2-3B-Instruct-4bit --
     a DIFFERENT heads/(hidden*layers) ratio than the identification model, so this checks
-    generality, not fit. The Qwen-fitted coefficient predicts the measured Llama-3B flash
+    generality, not fit. The Qwen-fitted coefficient bounds the measured Llama-3B flash
     train-step TOTAL peak (seq 8192, gc=True, kernel;
     `_artifacts/bench_train_step_flash_llama3b/..._seq8192_ours.json`, total 7.5133 GB)
-    within 20% and OVER-predicts (safe). Measured over-prediction ~15.4% -- consistent with
-    the stock model's own cross-model spread and always in the conservative direction."""
+    under the 0.5.0 ENVELOPE contract: one-sided (never under) with bounded
+    conservatism. The 0.5.0 refit covers the worst measured loss arm, so the fused-loss
+    anchor here reads conservative; the cross-model ratio is WIDER than the
+    identification model's (measured 1.566 here vs 1.405 on Qwen under the envelope
+    calibration -- Llama's heads/(hidden*layers) ratio amplifies the shared
+    coefficient), so this test pins its OWN bound (own measurement, never inherited)."""
     llama = ModelShape(vocab=128256, hidden=3072, layers=28, intermediate=8192, heads=24,
                        kv_heads=8, tied=True, quant_bits=4, quant_group=64)
     calib = load_calibration()
@@ -735,5 +740,5 @@ def test_flash_cross_model_validation_on_llama3b() -> None:
                       grad_checkpoint=True, impl="kernel", attention="flash")
     peak, _ = estimate_peak(llama, cfg, calib)
     measured_bytes = 7.5133 * 1024**3
-    assert abs(peak - measured_bytes) / measured_bytes < 0.20
-    assert peak >= measured_bytes  # over-predicts on the validation model too
+    assert peak >= measured_bytes          # never under, cross-model too
+    assert peak <= measured_bytes * 1.7    # bounded conservatism (measured 1.566)
