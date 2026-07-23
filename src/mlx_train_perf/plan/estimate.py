@@ -33,7 +33,7 @@ trainable, not just a low-rank adapter) are not modeled anywhere in this planner
 Estimates for `lora_rank == 0` configs are therefore optimistic; `lora_rank > 0`
 (LoRA/QLoRA) is the case this planner actually models end to end.
 """
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, replace
 from typing import Any, Literal
 
@@ -350,6 +350,24 @@ def plan_fit(
     )
 
 
+def _guard_envelope_x_flash_positive(
+    flash_points: list[FitPoint], x_flash: Callable[[FitPoint], float]
+) -> None:
+    """`fit_memory_coeffs`'s envelope flash fit divides by `x_flash(p)` per point --
+    each point must individually have `x_flash(p) > 0` (e.g. `batch=0` breaks this).
+    The aggregate `sum(x_flash(p)**2) > 0` guard in the caller only bounds the SUM of
+    squares, so a single degenerate point mixed with well-formed ones still passes
+    that check but would raise a raw, unnamed `ZeroDivisionError` deep inside the
+    envelope `max()`; this raises `PlanInputError` naming the offending point instead."""
+    for p in flash_points:
+        if x_flash(p) <= 0:
+            raise PlanInputError(
+                "fit_memory_coeffs cannot compute the envelope flash fit: "
+                f"FitPoint (seq_len={p.cfg.seq_len}, batch={p.cfg.batch}) has "
+                f"x_flash=batch*heads*seq_len={x_flash(p)!r} <= 0"
+            )
+
+
 def fit_memory_coeffs(
     points: list[FitPoint], *, calib: Calibration,
     flash_fit: Literal["ols", "envelope"] = "ols",
@@ -500,7 +518,12 @@ def fit_memory_coeffs(
             )
         if flash_fit == "envelope":
             # The single largest per-point ratio -- reuses flash_residual/x_flash
-            # rather than re-deriving the residual model (drift hazard).
+            # rather than re-deriving the residual model (drift hazard). The aggregate
+            # `den > 0` check above only bounds the SUM of squares, so a manifest with
+            # one degenerate point (batch=0) mixed with other, well-formed points still
+            # passes that check but would raise a raw ZeroDivisionError here --
+            # `_guard_envelope_x_flash_positive` names the offending point instead.
+            _guard_envelope_x_flash_positive(flash_points, x_flash)
             a_flash = max(flash_residual(p) / x_flash(p) for p in flash_points)
         else:
             num = sum(flash_residual(p) * x_flash(p) for p in flash_points)
