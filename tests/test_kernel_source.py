@@ -385,3 +385,45 @@ def test_bwd_flip_segments_mutually_exclusive_with_the_causal_perturbations() ->
             build(64, causal=True, packed=True, flip_segments=True, flip_causal=True)
         with pytest.raises(ValueError, match="flip_segments"):
             build(64, causal=True, packed=True, flip_segments=True, drop_diagonal=True)
+
+
+# ---------------------------------------------------------------------------------------
+# 0.5.0 T1: packed dK/dV MMA segment-end block skip (spec D1/D4/D5) -- `segment_bound`
+# bounds the query-block loop at each key block's segment end; `break_early` is the
+# TEST-ONLY named-bug-site perturbation comparing against the block's FIRST key instead
+# of its last (D4).
+
+def test_dkv_mma_packed_default_emits_segment_bound_break() -> None:
+    src = build_bwd_dkv_mma_source(64, causal=True, packed=True)
+    assert "owner_hi_seg" in src
+    assert "if (seg_id[seg_off + qb0] > owner_hi_seg) break;" in src
+
+
+def test_dkv_mma_segment_bound_false_omits_the_break() -> None:
+    src = build_bwd_dkv_mma_source(64, causal=True, packed=True, segment_bound=False)
+    assert "owner_hi_seg" not in src
+    assert "break;" not in src
+    # and it matches the 0.4.0 packed emission exactly: the only packed injection is
+    # seg_off + the predicate term (no other diff vs packed default minus the break lines)
+
+
+def test_dkv_mma_packed_false_byte_identical_for_either_segment_bound() -> None:
+    base = build_bwd_dkv_mma_source(64, causal=True)
+    assert build_bwd_dkv_mma_source(64, causal=True, segment_bound=False) == base
+    assert build_bwd_dkv_mma_source(64, causal=True, segment_bound=True) == base
+
+
+def test_dkv_mma_break_early_uses_first_key_seg() -> None:
+    src = build_bwd_dkv_mma_source(
+        64, causal=True, packed=True, break_early=True
+    )
+    assert "seg_id[seg_off + metal::min(key_base, n - 1)]" in src   # WRONG bound on purpose
+
+
+def test_dkv_mma_flag_validation() -> None:
+    with pytest.raises(ValueError, match="break_early"):   # needs packed+segment_bound
+        build_bwd_dkv_mma_source(64, causal=True, break_early=True)
+    with pytest.raises(ValueError, match="break_early"):   # break_early w/o segment_bound
+        build_bwd_dkv_mma_source(
+            64, causal=True, packed=True, segment_bound=False, break_early=True
+        )

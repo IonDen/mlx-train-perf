@@ -103,6 +103,7 @@ _FWD_TEMPLATE = """
 def _validate_predicate_flags(
     *, causal: bool, flip_causal: bool, drop_diagonal: bool,
     packed: bool, flip_segments: bool,
+    segment_bound: bool = True, break_early: bool = False,
 ) -> None:
     """Shared keep-predicate flag validation for ALL SIX attention source builders -- the two
     forward bodies (scalar + MMA) and the four backward bodies (dQ scalar/MMA, dK/dV scalar/MMA).
@@ -110,7 +111,10 @@ def _validate_predicate_flags(
     `flip_causal`/`drop_diagonal` are the causal-mask perturbations (each needs `causal`, and
     they are mutually exclusive); `packed` is block-diagonal-causal segment isolation (needs
     `causal`); `flip_segments` is the packed cross-contamination perturbation (needs `packed`,
-    and is exclusive with the causal perturbations). Raises `ValueError` on any misuse."""
+    and is exclusive with the causal perturbations). `segment_bound` (0.5.0, MMA dK/dV only)
+    is inert at `packed=False` by design -- no coupling check. `break_early` (0.5.0, TEST-ONLY,
+    MMA dK/dV only) is the named-bug-site perturbation of `segment_bound` and requires
+    `packed=True` and `segment_bound=True`. Raises `ValueError` on any misuse."""
     if flip_causal and not causal:
         raise ValueError("flip_causal is only meaningful with causal=True")
     if drop_diagonal and not causal:
@@ -123,6 +127,8 @@ def _validate_predicate_flags(
         raise ValueError("flip_segments requires packed=True")
     if flip_segments and (flip_causal or drop_diagonal):
         raise ValueError("flip_segments is mutually exclusive with flip_causal/drop_diagonal")
+    if break_early and not (packed and segment_bound):
+        raise ValueError("break_early requires packed=True and segment_bound=True")
 
 
 def build_fwd_source(
@@ -1303,10 +1309,13 @@ def build_bwd_dkv_source(
     same packed segment AND causal. The scalar dK/dV `key` (< n after the `if (key >= n) return;`
     guard) and query `i` (loop-bound `i < q_hi <= n`) are provably < n, so both seg reads need NO
     clamp -- the scalar body is immune to the MMA over-hang bug. The query-loop lower bound `q_lo`
-    stays UNCHANGED (correctness is from the per-query predicate; the segment-end upper-bound
-    optimization is explicitly skipped -- YAGNI). `flip_segments` is TEST-ONLY (requires `packed`)
-    -- it inverts ONLY the equality to `!=`. `packed=False` (the default) leaves the emitted MSL
-    BYTE-IDENTICAL to the pre-0.4.0 causal kernel."""
+    stays UNCHANGED (correctness is from the per-query predicate). The 0.5.0 segment-end
+    upper-bound optimization (`segment_bound`/`break_early`, see `build_bwd_dkv_mma_source`) lives
+    in the MMA variant only, by design -- the scalar stays the assumption-free oracle, with no
+    bound and no reliance on the packer's monotonicity invariant, so a scalar-vs-bounded-MMA
+    parity run independently catches both a wrong bound and an invariant violation. `flip_segments`
+    is TEST-ONLY (requires `packed`) -- it inverts ONLY the equality to `!=`. `packed=False` (the
+    default) leaves the emitted MSL BYTE-IDENTICAL to the pre-0.4.0 causal kernel."""
     if head_dim not in _KERNEL_HEAD_DIMS:
         raise ValueError(
             f"head_dim must be one of {_KERNEL_HEAD_DIMS}, got {head_dim}"
@@ -1688,6 +1697,7 @@ def build_bwd_dkv_mma_source(
     head_dim: int, *, causal: bool, flip_causal: bool = False,
     drop_diagonal: bool = False, d_slab: int | None = None,
     packed: bool = False, flip_segments: bool = False,
+    segment_bound: bool = True, break_early: bool = False,
 ) -> str:
     """MSL function body for the 4x4 simdgroup-matrix (MMA) dK/dV backward kernel -- the key-major,
     register-resident D-slabbed, CHAINED throughput restructure of the v1 scalar one-owner-per-key
@@ -1721,12 +1731,34 @@ def build_bwd_dkv_mma_source(
     discarded by the `if (key < n)` store guard). The query `i` needs NO clamp: the P-formation
     reads seg_id only inside `(i < q_hi) && (...)`, and q_hi <= n short-circuits the read for
     out-of-range queries. The query-loop lower bound `Q_START` stays UNCHANGED (correctness is from
-    the per-query predicate; the segment-end upper-bound optimization is explicitly skipped --
-    YAGNI), and there is NO kv_lo lower-bound change (dK/dV is key-major, unlike the query-major
-    dQ). NO empty-block NaN guard is needed: dK/dV use the SAVED L directly with
+    the per-query predicate), and there is NO kv_lo lower-bound change (dK/dV is key-major, unlike
+    the query-major dQ). NO empty-block NaN guard is needed: dK/dV use the SAVED L directly with
     `p = exp(...) : 0.0f` (masked queries take the 0 branch, no exp of -inf). `flip_segments` is
     TEST-ONLY (requires `packed`) -- inverts ONLY the equality to `!=`. `packed=False` (the
-    default) leaves the emitted MSL BYTE-IDENTICAL to the pre-0.4.0 causal kernel."""
+    default) leaves the emitted MSL BYTE-IDENTICAL to the pre-0.4.0 causal kernel.
+
+    `segment_bound=True` (0.5.0, the default, requires `packed`; inert -- no coupling check -- at
+    `packed=False`) bounds the query-block loop at each key block's segment end instead of walking
+    the full causal range and relying on the per-element predicate alone (0.4.0 behavior, still
+    available via `segment_bound=False` for same-session bounded-vs-unbounded parity/bench pairs).
+    A per-key `owner_hi_seg` is hoisted ONCE at function-body scope, right after `seg_off`'s
+    declaration (never inside the D-slab loop, per the forward MMA over-hang-clamp lesson):
+    `owner_hi_seg = seg_id[seg_off + metal::min(key_base + 31, n - 1)]`. At the top of the `qb0`
+    query-block loop, before any GEMM: `if (seg_id[seg_off + qb0] > owner_hi_seg) break;`. Hard
+    constraint (Metal/simdgroup uniformity): the break reads ONLY threadgroup-uniform quantities
+    (`seg_off`, the loop variable `qb0`, the hoisted `owner_hi_seg`) and exits the whole
+    query-block loop before any `simdgroup_multiply_accumulate`, so all 32 lanes exit together --
+    it must NEVER be derived from a lane-local index (`fm`/`fn`/`lane`) and must never be folded
+    into the per-element `KEEP_CMP` predicate (which is lane-dependent), since a lane-divergent
+    break mid-simdgroup corrupts MMA state. This is correct iff seg_id is non-decreasing along each
+    packed row (the packer's invariant, see `data/packing.py`) -- then every row in this and all
+    later query blocks is in a later segment than every key of the owner block, so nothing valid
+    remains; the keep predicate is unchanged and still masks the partial blocks at segment
+    boundaries. `break_early` is TEST-ONLY (requires `packed=True` and `segment_bound=True`) -- the
+    named-bug-site perturbation: it compares against the key block's FIRST key's seg_id
+    (`key_base`) instead of the last's (`key_base + 31`), so on any layout with a segment boundary
+    inside a key block it truncates valid queries and a parity run against the causal/scalar oracle
+    MUST fail."""
     if head_dim not in _KERNEL_HEAD_DIMS:
         raise ValueError(
             f"head_dim must be one of {_KERNEL_HEAD_DIMS}, got {head_dim}"
@@ -1734,6 +1766,7 @@ def build_bwd_dkv_mma_source(
     _validate_predicate_flags(
         causal=causal, flip_causal=flip_causal, drop_diagonal=drop_diagonal,
         packed=packed, flip_segments=flip_segments,
+        segment_bound=segment_bound, break_early=break_early,
     )
     slab = _BWD_DKV_MMA_D_SLAB if d_slab is None else d_slab
     if slab <= 0 or slab % 8 != 0 or head_dim % slab != 0:
@@ -1771,6 +1804,19 @@ def build_bwd_dkv_mma_source(
             "    uint q_start = Q_START;",
             "    uint q_start = Q_START;\n    uint seg_off = b * n;",
         )
+        if segment_bound:
+            hi = "key_base" if break_early else "key_base + 31"
+            src = src.replace(
+                "    uint q_start = Q_START;\n    uint seg_off = b * n;",
+                "    uint q_start = Q_START;\n    uint seg_off = b * n;\n"
+                "    uint owner_hi_seg = "
+                f"seg_id[seg_off + metal::min({hi}, n - 1)];",
+            )
+            src = src.replace(
+                "        for (uint qb0 = q_start; qb0 < q_hi; qb0 += 32) {",
+                "        for (uint qb0 = q_start; qb0 < q_hi; qb0 += 32) {\n"
+                "            if (seg_id[seg_off + qb0] > owner_hi_seg) break;",
+            )
     return (
         src.replace("HEAD_DIM", str(head_dim))
         .replace("D_SLAB_TILES", str(slab // 8))

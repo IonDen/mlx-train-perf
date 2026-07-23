@@ -94,12 +94,14 @@ Measured on Alpaca (pinned revision, 4,000-example sample, seed 42), LoRA rank 8
 
 | real tokens/sec | stock batching | packed | ratio |
 |---|---|---|---|
-| Qwen3-8B-4bit | 32.9 | 89.6 | 2.72× |
-| Llama-3.2-3B-4bit | 71.5 | 194.4 | 2.72× |
+| Qwen3-8B-4bit | 33.1 | 99.2 | 3.00× |
+| Llama-3.2-3B-4bit | 76.7 | 226.3 | 2.95× |
 
-Samples per hour move the same way: 1,408 → 3,835 on Qwen3-8B and 2,441 → 6,638 on Llama-3.2-3B. "Real tokens" counts sequence content only, never padding or separators.
+Samples per hour move the same way: 1,415 → 4,246 on Qwen3-8B and 2,617 → 7,726 on Llama-3.2-3B. "Real tokens" counts sequence content only, never padding or separators. Both arms of each pair were measured in one session at this release's code state.
 
 Where the win comes from matters for whether you will see it too. At batch size 1, stock batching loses little to padding (17% on this dataset, mostly round-to-32 alignment) — the win comes from amortization. A packed row carries roughly 40–50 Alpaca sequences (47.6 on average under Qwen3's tokenizer, 38.1 under Llama's), so the fixed step cost is paid once per ~4,000 real tokens instead of once per 84, and attention runs at its 4,096-token efficiency instead of a ~100-token shape. A dataset of long sequences packs fewer per row and gains less; one that already fills the context gains nothing. The stock arm's per-step median also includes `mx.compile`'s first trace of each batch width (stock widths vary; packed rows are one constant shape, which is itself part of the win), and a long training run amortizes those traces away. Reading the stock arm at its fastest repeated warm step instead of its median gives a conservative bound of about 2.0–2.3×, so the honest range is 2–2.7× on this dataset. The packed arm's own walls are flat to within 5%.
+
+0.5.0 tightens the packed backward: the dK/dV kernel now bounds its query walk at each key block's segment end instead of masking cross-segment work after computing it. Timed with identical dispatch ranges on both arms (`scripts/bench_packed_dkv.py`), the dK/dV pass on an Alpaca-like row runs 6.2× faster at 4,096 tokens and 8.3× at 8,192; a single-segment row is unchanged. That pass is one slice of the training step, so the win on the full step is smaller: on Qwen3-8B-4bit the packed arm's median step drops from 44.7 s to 40.4 s (+10.7% tokens/sec, with the unpacked arm within half a percent of its prior measurement — the control that pins the gain to the packed backward). The table above is this release's measurement of both models.
 
 ### Training packed
 
@@ -190,7 +192,16 @@ Pass `--attention flash` to price the flash-attention path instead of the stock 
 mlx-train-perf plan --config path/to/config.json --batch 1 --seq-len 8192 --lora-rank 8 --attention flash
 ```
 
-The flash model is an analytic saved-state term plus one measured linear coefficient. Across the four measured anchors up to 8192 tokens it over-predicts the cushioned total by 8% to 20% — again on the safe side.
+The flash model is an analytic saved-state term plus one measured linear coefficient, fit as an envelope over the worst-case measured loss arm so it never under-predicts at a measured anchor. That makes it read more conservatively for the fused loss in particular: up to about 1.4× the measured peak on the fitted model, about 1.6× cross-model. The validated range is 2,048 to 12,288 tokens; past that the fit extrapolates.
+
+Instead of checking one config at a time, ask the planner for the largest sequence length or batch size that fits your budget:
+
+```bash
+mlx-train-perf plan --config path/to/config.json --batch 1 --lora-rank 8 --attention flash --max-seq
+mlx-train-perf plan --config path/to/config.json --seq-len 8192 --lora-rank 8 --attention flash --max-batch
+```
+
+`--max-seq` searches for the largest `--seq-len` and still needs `--batch`; `--max-batch` searches for the largest `--batch` and still needs `--seq-len`. A budget that nothing fits, even at the smallest value searched, is refused with a typed error.
 
 ## Supported models
 
@@ -212,15 +223,22 @@ python scripts/bench_train_step.py --model mlx-community/Qwen3-8B-4bit --seq-len
 python scripts/bench_train_step.py --model mlx-community/Qwen3-8B-4bit --seq-len 8192 \
     --attention stock --impl kernel --compute-dtype bfloat16 --grad-checkpoint --out _artifacts/stock
 python scripts/northstar_context_sweep.py # the max-context sweep (1-2 h; heavy)
-# the 2.72x packing table: prep the dataset once per model, then run each arm into its own --out dir
+# the packed dK/dV block-skip ratios (6.2x / 8.3x): one invocation per layout and length
+python scripts/bench_packed_dkv.py --n 4096 --layout alpaca --out _artifacts/packed_dkv
+python scripts/bench_packed_dkv.py --n 8192 --layout alpaca --out _artifacts/packed_dkv
+# the planner's flash-fit anchors and refit (envelope over the committed manifest)
+python scripts/fit_calibration.py --manifest _artifacts/calib_050/refit_manifest.json --dry-run
+# the packing table (3.00x / 2.95x): prep the dataset once per model, then run each arm
+# into its own --out dir (30 timed steps per arm, the script default, matching the
+# committed artifacts)
 python scripts/prep_alpaca.py --model mlx-community/Qwen3-8B-4bit \
     --out _artifacts/packed_bench/alpaca_qwen3.jsonl --batch-size 1 --pack-len 4096 --max-samples 4000 --seed 42
 python scripts/bench_packed_training.py --model mlx-community/Qwen3-8B-4bit \
     --data _artifacts/packed_bench/alpaca_qwen3.jsonl --arm stock --pack-len 4096 --batch-size 1 \
-    --steps 60 --grad-checkpoint --compute-dtype bfloat16 --out _artifacts/packed_bench/qwen3_stock
+    --grad-checkpoint --compute-dtype bfloat16 --out _artifacts/packed_bench_050
 python scripts/bench_packed_training.py --model mlx-community/Qwen3-8B-4bit \
     --data _artifacts/packed_bench/alpaca_qwen3.jsonl --arm packed --pack-len 4096 --batch-size 1 \
-    --steps 30 --grad-checkpoint --compute-dtype bfloat16 --out _artifacts/packed_bench/qwen3_packed
+    --grad-checkpoint --compute-dtype bfloat16 --out _artifacts/packed_bench_050
 ```
 
 ## Memory safety net

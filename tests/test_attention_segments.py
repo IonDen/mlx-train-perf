@@ -16,6 +16,7 @@ import pytest
 from mlx_train_perf.attention import api
 from mlx_train_perf.attention.reference import flash_attention_reference, math_attention
 from mlx_train_perf.attention.segments import PackedMask, segment_allowed
+from mlx_train_perf.errors import PackingError
 
 
 def _two_segment_inputs(n1: int = 3, n2: int = 5, hq: int = 2, hkv: int = 1, d: int = 8):
@@ -142,3 +143,31 @@ def test_flash_attention_backward_requires_causal_true() -> None:
     with pytest.raises(AssertionError):
         api._flash_attention_backward(
             q, k, v, o, lse, d_o, scale=scale, causal=False, segments=pm)
+
+
+# ---------------------------------------------------------------------------
+# 0.5.0 T4 -- PackedMask.validate() (spec D2): the host-side, explicit opt-in
+# monotonicity guard for HAND-BUILT masks. Never called on the packer/loss path
+# (see tests/test_packing.py::test_validate_never_called_on_the_loss_path) --
+# the packer's own pack-time assert covers that path instead.
+# ---------------------------------------------------------------------------
+
+
+def test_validate_accepts_monotone_mask() -> None:
+    seg_id = mx.array([[0, 0, 1, 1]], dtype=mx.int32)
+    seg_start = mx.array([[0, 0, 2, 2]], dtype=mx.int32)
+    PackedMask(seg_id=seg_id, seg_start=seg_start).validate()   # no raise
+
+
+@pytest.mark.parametrize(
+    ("seg_id", "seg_start"),
+    [
+        ([[1, 0, 0, 0]], [[0, 1, 1, 1]]),      # seg_id decreases
+        ([[0, 0, 1, 1]], [[0, 0, 2, 1]]),      # seg_start decreases
+    ],
+)
+def test_validate_rejects_non_monotone(seg_id: list, seg_start: list) -> None:
+    m = PackedMask(seg_id=mx.array(seg_id, dtype=mx.int32),
+                   seg_start=mx.array(seg_start, dtype=mx.int32))
+    with pytest.raises(PackingError):
+        m.validate()

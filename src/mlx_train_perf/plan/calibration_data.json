@@ -3,15 +3,16 @@
   "act_bytes_per_token_hidden_layer_ckpt": 1.867,
   "act_bytes_per_token_hidden_layer_full": 85.12,
   "attn_bytes_per_head_token2": 8.716,
-  "attn_bytes_per_head_token_flash": 18633.411713264017,
+  "attn_bytes_per_head_token_flash": 34125.414004182945,
   "optimizer_bytes_per_param": 8.0,
   "overhead_frac": 0.1,
   "naive_loss_bytes_per_nv": 12.0,
   "provenance": {
-    "machine": "arm64-M1Max-32GB",
-    "macos": "26.5.1",
+    "machine": "arm64",
+    "macos": "26.5.2",
     "mlx_version": "0.32.0",
-    "measured_date": "2026-07-12",
-    "fit_source": "Provenance: the stock memory coefficients (base_transient_bytes, act_bytes_per_token_hidden_layer_ckpt/_full, attn_bytes_per_head_token2) are the original 0.31.2-era Qwen3-8B-4bit measurement campaign carried forward unchanged; only attn_bytes_per_head_token_flash was fit later, on mlx 0.32.0 (2026-07-12). Stock fit: base_transient_bytes, act_bytes_per_token_hidden_layer_ckpt, and attn_bytes_per_head_token2 fitted (OLS) from 5 Qwen3-8B-4bit kernel-impl train_step marginal peaks (grad_checkpoint=True, seq 1024-8448, RMSE 0.21 GB); act_bytes_per_token_hidden_layer_full fitted from 2 grad_checkpoint=False points; cross-model validated on Llama-3.2-3B-4bit within +/-9%. optimizer_bytes_per_param is analytic AdamW (two fp32 moments). attn_bytes_per_head_token2 is bf16-calibrated (dtype folded in). naive_loss_bytes_per_nv unchanged (prior gate-artifact fit). The linear activation term under-models nothing new; the quadratic attention term is the one-layer O(N^2) SDPA backward that dominates peak training memory at long context. Flash fit (mlx 0.32.0, 2026-07-12): attn_bytes_per_head_token_flash fitted via fit_memory_coeffs from 2 train_step (impl='kernel') marginal peaks by 1-var residual OLS holding base/a_lin fixed, with the stock terms above held at their carried-forward values (a branch with no points keeps its prior value); optimizer_bytes_per_param analytic (AdamW, 8 B/param); manifest=qwen_flash_manifest.json"
+    "measured_date": "2026-07-23",
+    "fit_source": "Provenance: the stock memory coefficients (base_transient_bytes, act_bytes_per_token_hidden_layer_ckpt/_full, attn_bytes_per_head_token2) are the original 0.31.2-era Qwen3-8B-4bit measurement campaign carried forward unchanged; only attn_bytes_per_head_token_flash was fit later, on mlx 0.32.0 (2026-07-12). Stock fit: base_transient_bytes, act_bytes_per_token_hidden_layer_ckpt, and attn_bytes_per_head_token2 fitted (OLS) from 5 Qwen3-8B-4bit kernel-impl train_step marginal peaks (grad_checkpoint=True, seq 1024-8448, RMSE 0.21 GB); act_bytes_per_token_hidden_layer_full fitted from 2 grad_checkpoint=False points; cross-model validated on Llama-3.2-3B-4bit within +/-9%. optimizer_bytes_per_param is analytic AdamW (two fp32 moments). attn_bytes_per_head_token2 is bf16-calibrated (dtype folded in). naive_loss_bytes_per_nv unchanged (prior gate-artifact fit). The linear activation term under-models nothing new; the quadratic attention term is the one-layer O(N^2) SDPA backward that dominates peak training memory at long context. Flash fit (mlx 0.32.0, 2026-07-12): attn_bytes_per_head_token_flash fitted via fit_memory_coeffs from 2 train_step (impl='kernel') marginal peaks by 1-var residual OLS holding base/a_lin fixed, with the stock terms above held at their carried-forward values (a branch with no points keeps its prior value); optimizer_bytes_per_param analytic (AdamW, 8 B/param); manifest=qwen_flash_manifest.json || refit via fit_memory_coeffs from 8 train_step (impl='kernel') marginal peaks (stock points fit base/gc-aware-linear/O(N^2)-attention by full-rank OLS; flash points fit attn_bytes_per_head_token_flash by 1-var residual OLS holding base/a_lin fixed; a branch with no points keeps its prior value); optimizer_bytes_per_param analytic (AdamW, 8 B/param); manifest=refit_manifest.json",
+    "flash_fit": "envelope"
   }
 }

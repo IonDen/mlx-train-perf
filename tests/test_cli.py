@@ -7,6 +7,7 @@ default (non-metal) lane.
 """
 import io
 import json
+import re
 import subprocess
 import sys
 from contextlib import redirect_stdout
@@ -39,6 +40,7 @@ from mlx_train_perf.errors import (
     PlanInputError,
 )
 from mlx_train_perf.plan.estimate import FitReport, ModelShape, TrainConfig
+from mlx_train_perf.plan.inverse import max_batch_for_budget, max_seq_len_for_budget
 
 
 def _machine_refuses_worker_start() -> bool:
@@ -267,6 +269,194 @@ def test_plan_config_tool_error_exit_two(capsys: pytest.CaptureFixture[str]) -> 
                "--seq-len", "512", "--lora-rank", "8"])
     assert rc == 2
     assert "Error" in capsys.readouterr().err
+
+
+# --- --max-seq / --max-batch inverse-query mode --------------------------------------
+
+
+def test_plan_forward_mode_missing_batch_exits_two_with_message(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Forward mode (neither --max-seq nor --max-batch) is unchanged behaviorally --
+    both --batch and --seq-len are still required -- but the required-ness is now
+    enforced manually (argparse can no longer express it once both flags become
+    optional), so the missing-arg message comes from our own code, not argparse's."""
+    rc = main(["plan", "--config", str(_config(tmp_path)), "--seq-len", "512",
+               "--lora-rank", "8"])
+    assert rc == 2
+    assert "--batch" in capsys.readouterr().err
+
+
+def test_plan_forward_mode_missing_seq_len_exits_two_with_message(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    rc = main(["plan", "--config", str(_config(tmp_path)), "--batch", "1",
+               "--lora-rank", "8"])
+    assert rc == 2
+    assert "--seq-len" in capsys.readouterr().err
+
+
+def test_plan_max_seq_prints_found_value_and_assumption_block(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    rc = main(["plan", "--config", str(_config(tmp_path)), "--batch", "1",
+               "--lora-rank", "8", "--budget-gb", "8", "--max-seq"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "max seq_len:" in out
+    # same assumption block the forward `plan` rendering prints
+    assert "fits: yes" in out
+    assert "components:" in out
+    assert "provenance:" in out
+    # Checkpoint C review fix (item 5, Medium): the assertions above only check that
+    # SOME number was printed under a "max seq_len:" label -- a wrong-axis wiring bug
+    # (e.g. `_cmd_plan_search`'s --max-seq branch accidentally calling
+    # `max_batch_for_budget`) still prints a plausible-looking number under that same
+    # label and would satisfy every assertion above (mutation-proven: see this item's
+    # test-plan notes). Independently resolve the SAME search via the public
+    # `plan.inverse` API with the exact shape/cfg/budget `_cmd_plan_search` builds, and
+    # assert the CLI's printed number equals it.
+    shape = _apply_quant_override(_load_model_shape(str(_config(tmp_path))), None)
+    cfg = _train_config_from_args(batch=1, seq_len=1, lora_rank=8, impl="kernel",
+                                  shape_layers=shape.layers, attention="stock")
+    expected = max_seq_len_for_budget(shape, cfg, budget_bytes=(8 * 1024**3))
+    match = re.search(r"max seq_len: (\d+)", out)
+    assert match is not None
+    assert int(match.group(1)) == expected
+
+
+def test_plan_max_batch_prints_found_value_and_assumption_block(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    rc = main(["plan", "--config", str(_config(tmp_path)), "--seq-len", "512",
+               "--lora-rank", "8", "--budget-gb", "8", "--max-batch"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "max batch:" in out
+    assert "fits: yes" in out
+    assert "components:" in out
+    assert "provenance:" in out
+    # Checkpoint C review fix (item 5, Medium): symmetric mutation-proofing for
+    # --max-batch -- see the --max-seq test above for the full rationale.
+    shape = _apply_quant_override(_load_model_shape(str(_config(tmp_path))), None)
+    cfg = _train_config_from_args(batch=1, seq_len=512, lora_rank=8, impl="kernel",
+                                  shape_layers=shape.layers, attention="stock")
+    expected = max_batch_for_budget(shape, cfg, budget_bytes=(8 * 1024**3))
+    match = re.search(r"max batch: (\d+)", out)
+    assert match is not None
+    assert int(match.group(1)) == expected
+
+
+def test_plan_max_seq_json_includes_max_seq_len_and_fit_report_keys(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Checkpoint C review fix (item 6, Low): `--json` mode for `--max-seq` --
+    exercises the `found_key`/payload-merge path in `_cmd_plan_search` (untested
+    before this fix) and pins both the found value's exact key name (`max_seq_len`)
+    and its value against the independently-computed `plan.inverse` result, plus the
+    presence of the standard `FitReport` keys `_render_plan_json`/payload-merge is
+    supposed to carry alongside it."""
+    rc = main(["plan", "--config", str(_config(tmp_path)), "--batch", "1",
+               "--lora-rank", "8", "--budget-gb", "8", "--max-seq", "--json"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    payload = json.loads(out)
+    shape = _apply_quant_override(_load_model_shape(str(_config(tmp_path))), None)
+    cfg = _train_config_from_args(batch=1, seq_len=1, lora_rank=8, impl="kernel",
+                                  shape_layers=shape.layers, attention="stock")
+    expected = max_seq_len_for_budget(shape, cfg, budget_bytes=(8 * 1024**3))
+    assert payload["max_seq_len"] == expected
+    for key in ("fits", "predicted_peak_bytes", "budget_bytes", "headroom_bytes",
+               "components", "suggestion", "is_estimate", "provenance"):
+        assert key in payload
+
+
+def test_plan_max_batch_json_includes_max_batch_and_fit_report_keys(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Checkpoint C review fix (item 6, Low): symmetric `--json` coverage for
+    `--max-batch` -- see the `--max-seq` test above for the full rationale."""
+    rc = main(["plan", "--config", str(_config(tmp_path)), "--seq-len", "512",
+               "--lora-rank", "8", "--budget-gb", "8", "--max-batch", "--json"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    payload = json.loads(out)
+    shape = _apply_quant_override(_load_model_shape(str(_config(tmp_path))), None)
+    cfg = _train_config_from_args(batch=1, seq_len=512, lora_rank=8, impl="kernel",
+                                  shape_layers=shape.layers, attention="stock")
+    expected = max_batch_for_budget(shape, cfg, budget_bytes=(8 * 1024**3))
+    assert payload["max_batch"] == expected
+    for key in ("fits", "predicted_peak_bytes", "budget_bytes", "headroom_bytes",
+               "components", "suggestion", "is_estimate", "provenance"):
+        assert key in payload
+
+
+def test_plan_max_seq_with_seq_len_is_error(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """--seq-len is the value being searched for under --max-seq -- passing it too is a
+    manual validation error, not a silent override."""
+    rc = main(["plan", "--config", str(_config(tmp_path)), "--batch", "1",
+               "--seq-len", "4096", "--lora-rank", "8", "--max-seq"])
+    assert rc == 2
+    assert "--seq-len" in capsys.readouterr().err
+
+
+def test_plan_max_seq_without_batch_is_error(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    rc = main(["plan", "--config", str(_config(tmp_path)), "--lora-rank", "8", "--max-seq"])
+    assert rc == 2
+    assert "--batch" in capsys.readouterr().err
+
+
+def test_plan_max_batch_with_batch_is_error(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    rc = main(["plan", "--config", str(_config(tmp_path)), "--batch", "1",
+               "--seq-len", "512", "--lora-rank", "8", "--max-batch"])
+    assert rc == 2
+    assert "--batch" in capsys.readouterr().err
+
+
+def test_plan_max_batch_without_seq_len_is_error(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    rc = main(["plan", "--config", str(_config(tmp_path)), "--lora-rank", "8", "--max-batch"])
+    assert rc == 2
+    assert "--seq-len" in capsys.readouterr().err
+
+
+def test_plan_max_seq_and_max_batch_together_is_argparse_error(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """`--max-seq`/`--max-batch` are a mutually exclusive `store_true` group -- argparse
+    itself refuses combining them, before `_cmd_plan` ever runs."""
+    rc = main(["plan", "--config", str(_config(tmp_path)), "--batch", "1",
+               "--lora-rank", "8", "--max-seq", "--max-batch"])
+    assert rc == 2
+    assert "not allowed with" in capsys.readouterr().err
+
+
+def test_plan_max_seq_degenerate_budget_exit_one_refused(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A budget too small to fit even the seq_len=1 floor is a refusal (exit 1,
+    `DoesNotFitError` rendered) -- matching the bench exit policy -- never a tool error
+    (exit 2)."""
+    rc = main(["plan", "--config", str(_config(tmp_path)), "--batch", "1",
+               "--lora-rank", "8", "--budget-gb", "0.000001", "--max-seq"])
+    assert rc == 1
+    assert "refused" in capsys.readouterr().err
+
+
+def test_plan_max_batch_degenerate_budget_exit_one_refused(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    rc = main(["plan", "--config", str(_config(tmp_path)), "--seq-len", "512",
+               "--lora-rank", "8", "--budget-gb", "0.000001", "--max-batch"])
+    assert rc == 1
+    assert "refused" in capsys.readouterr().err
 
 
 # --- pure helper: bench suite -> Condition list --------------------------------------
