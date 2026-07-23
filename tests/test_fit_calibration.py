@@ -405,6 +405,86 @@ def test_main_selects_ols_flash_fit_for_benign_points(tmp_path: Path) -> None:
     assert updated["attn_bytes_per_head_token_flash"] == pytest.approx(500.0, rel=1e-6)
 
 
+def test_main_detects_under_prediction_from_a_mixed_stock_flash_manifest(
+    tmp_path: Path,
+) -> None:
+    """Checkpoint C review fix (item 2, High): the OLD `_flash_fit_is_one_sided`
+    candidate was `replace(calib, attn_bytes_per_head_token_flash=a_flash)` -- the
+    STALE, pre-refit `calib`'s own base/a_lin, with only `a_flash` swapped in. With a
+    MIXED stock+flash manifest the freshly-fit base/a_lin/a_quad (from the stock
+    points) can differ sharply from the existing calibration's own values, and the
+    combination actually shipped (fresh base/a_lin + fresh a_flash) was never
+    validated -- only the stale-base/a_lin + fresh-a_flash combination was.
+
+    This manifest constructs exactly that mismatch: 3 stock gc=True points (distinct
+    seq_len -- full rank) that fit exactly to a TINY fresh stock model (base=100,
+    a_lin=0.5), while the ONE flash point is synthesized FORWARD holding the EXISTING
+    (huge: base=5e9, a_lin=50) calibration's own base/a_lin fixed -- mirroring
+    `_write_flash_point` exactly, i.e. how the real flash residual fit works. The OLD
+    check re-derives the flash point's own construction almost exactly (huge stale
+    base/a_lin, unchanged by the stock refit), so it reports one-sided (bug: stays
+    "ols") even though the shipped combination -- fresh (tiny) base/a_lin + the fitted
+    a_flash -- under-predicts this same anchor by several GB (own measurement, not
+    inherited from the reviewer's ~49.9 MB repro). RED first: this assertion FAILS
+    against the current (unfixed) code (`flash_fit` stays `"ols"`, verified by a
+    scratch run before this fix landed). The FIXED check validates the candidate
+    actually built from the post-fit coeffs and must detect the violation, refitting
+    with `flash_fit="envelope"`."""
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(_CONFIG))
+    calibration_path = tmp_path / "calibration_data.json"
+    existing = dict(_EXISTING_CALIBRATION)
+    existing["base_transient_bytes"] = 5_000_000_000.0
+    existing["act_bytes_per_token_hidden_layer_ckpt"] = 50.0
+    calibration_path.write_text(json.dumps(existing))
+    calib = Calibration(
+        base_transient_bytes=float(existing["base_transient_bytes"]),
+        act_bytes_per_token_hidden_layer_ckpt=float(
+            existing["act_bytes_per_token_hidden_layer_ckpt"]),
+        act_bytes_per_token_hidden_layer_full=float(
+            existing["act_bytes_per_token_hidden_layer_full"]),
+        attn_bytes_per_head_token2=float(existing["attn_bytes_per_head_token2"]),
+        attn_bytes_per_head_token_flash=float(existing["attn_bytes_per_head_token_flash"]),
+        optimizer_bytes_per_param=float(existing["optimizer_bytes_per_param"]),
+        overhead_frac=float(existing["overhead_frac"]),
+        naive_loss_bytes_per_nv=float(existing["naive_loss_bytes_per_nv"]),
+        provenance=dict(existing["provenance"]),
+    )
+    shape = ModelShape.from_config(_CONFIG)
+
+    def _write_stock_point(
+        name: str, seq_len: int, base: float, a_lin: float, a_quad: float,
+    ) -> dict[str, object]:
+        cfg = TrainConfig(batch=1, seq_len=seq_len, dtype="bfloat16", lora_rank=8,
+                          lora_layers=2, grad_checkpoint=True, impl="kernel")
+        analytic = (_lora_bytes(cfg, shape) + _optimizer_bytes(cfg, shape, calib)
+                    + _loss_bytes(cfg, shape, calib))
+        x_lin = cfg.batch * cfg.seq_len * shape.hidden * shape.layers
+        x_quad = cfg.batch * shape.heads * cfg.seq_len ** 2
+        marginal = base + a_lin * x_lin + a_quad * x_quad + analytic
+        artifact_path = tmp_path / f"{name}.json"
+        _write_artifact(artifact_path, marginal_peak_gb=marginal / 1024**3,
+                        attention_impl="stock")
+        return {"config": str(config_path), "artifact": str(artifact_path), "batch": 1,
+                "seq_len": seq_len, "lora_rank": 8, "lora_layers": 2,
+                "grad_checkpoint": True}
+
+    stock_entries = [_write_stock_point(f"stock_{s}", s, 100.0, 0.5, 1.0)
+                     for s in (512, 1024, 2048)]
+    flash_entry = _write_flash_point(tmp_path, "flash", config_path=config_path,
+                                     calib=calib, shape=shape, seq_len=4096,
+                                     a_flash=2000.0)
+    manifest_path = tmp_path / "manifest.json"
+    _write_manifest(manifest_path, [*stock_entries, flash_entry])
+
+    rc = fit_calibration.main([
+        "--manifest", str(manifest_path), "--calibration-data", str(calibration_path),
+    ])
+    assert rc == 0
+    updated = json.loads(calibration_path.read_text())
+    assert updated["provenance"]["flash_fit"] == "envelope"
+
+
 def test_help_runs_without_touching_a_model() -> None:
     proc = subprocess.run(
         [sys.executable, str(_SCRIPT_PATH), "--help"],

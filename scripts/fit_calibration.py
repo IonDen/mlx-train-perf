@@ -91,20 +91,40 @@ def load_fit_points(manifest_path: Path) -> list[FitPoint]:
     return points
 
 
-def _flash_fit_is_one_sided(
-    points: list[FitPoint], *, calib: Calibration, a_flash: float
-) -> bool:
-    """True iff, for EVERY flash `FitPoint`, the candidate `a_flash` coefficient's
-    predicted cushioned TOTAL peak (the public `estimate_peak` call a real planner
-    caller makes) is >= the point's own measured total. The measured total is
-    reconstructed from `estimate_peak`'s own `weights` component (shape/dtype-only,
-    independent of `calib`) plus the point's measured MARGINAL
-    (`marginal_peak_bytes`) -- `estimate_peak`'s remaining components (base +
-    activations + attention + lora + optimizer + loss) are exactly what the marginal
-    measures, by construction (see `fit_memory_coeffs`'s docstring). A violation here
-    is what triggers the `flash_fit="envelope"` fallback in `main()`: the planner's
-    own never-under-predict invariant, not a numeric-accuracy nicety."""
-    candidate = replace(calib, attn_bytes_per_head_token_flash=a_flash)
+def _candidate_calibration(*, calib: Calibration, coeffs: dict[str, float]) -> Calibration:
+    """Builds the FULL candidate `Calibration` `main()` is about to ship -- all five
+    post-fit memory coefficients (base + gc-aware linear + O(N^2) stock attention +
+    O(N) flash attention), not just `calib` with `attn_bytes_per_head_token_flash`
+    swapped in. A mixed stock+flash manifest refits base/a_lin/a_quad from the stock
+    points too, and those fitted values can differ sharply from `calib`'s own
+    (pre-refit) values -- validating only `replace(calib, attn_bytes_per_head_token_flash=...)`
+    left the actually-shipped combination unchecked (reviewer reproduced a
+    ~49.9 MB under-prediction that passed the old, stale-base/a_lin check)."""
+    return replace(
+        calib,
+        base_transient_bytes=coeffs["base_transient_bytes"],
+        act_bytes_per_token_hidden_layer_ckpt=coeffs["act_bytes_per_token_hidden_layer_ckpt"],
+        act_bytes_per_token_hidden_layer_full=coeffs["act_bytes_per_token_hidden_layer_full"],
+        attn_bytes_per_head_token2=coeffs["attn_bytes_per_head_token2"],
+        attn_bytes_per_head_token_flash=coeffs["attn_bytes_per_head_token_flash"],
+    )
+
+
+def _flash_fit_is_one_sided(points: list[FitPoint], *, candidate: Calibration) -> bool:
+    """True iff, for EVERY flash `FitPoint`, the CANDIDATE calibration's predicted
+    cushioned TOTAL peak (the public `estimate_peak` call a real planner caller makes)
+    is >= the point's own measured total. `candidate` must be the FULL post-fit
+    `Calibration` `main()` is about to write (see `_candidate_calibration`) -- checking
+    a stale `calib` with only `attn_bytes_per_head_token_flash` swapped in validates a
+    combination that is never actually shipped whenever a mixed stock+flash manifest
+    also refits base/a_lin/a_quad. The measured total is reconstructed from
+    `estimate_peak`'s own `weights` component (shape/dtype-only, independent of
+    `calib`) plus the point's measured MARGINAL (`marginal_peak_bytes`) --
+    `estimate_peak`'s remaining components (base + activations + attention + lora +
+    optimizer + loss) are exactly what the marginal measures, by construction (see
+    `fit_memory_coeffs`'s docstring). A violation here is what triggers the
+    `flash_fit="envelope"` fallback in `main()`: the planner's own never-under-predict
+    invariant, not a numeric-accuracy nicety."""
     for p in points:
         if p.cfg.attention != "flash":
             continue
@@ -202,13 +222,15 @@ def main(argv: list[str] | None = None) -> int:
     points = load_fit_points(manifest_path)
     coeffs = fit_memory_coeffs(points, calib=calib, flash_fit="ols")
     flash_fit = "ols"
-    if not _flash_fit_is_one_sided(
-        points, calib=calib, a_flash=coeffs["attn_bytes_per_head_token_flash"]
-    ):
+    candidate = _candidate_calibration(calib=calib, coeffs=coeffs)
+    if not _flash_fit_is_one_sided(points, candidate=candidate):
         # OLS's least-squares average under-predicted at least one flash anchor's own
-        # cushioned TOTAL -- refit with the conservative (over-predict-safe) envelope.
+        # cushioned TOTAL, checked against the FULL candidate (not a stale calib with
+        # only a_flash swapped) -- refit with the conservative (over-predict-safe)
+        # envelope.
         coeffs = fit_memory_coeffs(points, calib=calib, flash_fit="envelope")
         flash_fit = "envelope"
+        candidate = _candidate_calibration(calib=calib, coeffs=coeffs)
     updated = build_updated_calibration_data(
         existing=existing, coeffs=coeffs,
         optimizer_bytes_per_param=float(existing["optimizer_bytes_per_param"]),
