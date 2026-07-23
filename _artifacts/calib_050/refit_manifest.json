@@ -1,0 +1,74 @@
+[
+ {
+  "config": "_artifacts/calib_050/qwen3-8b-4bit.config.json",
+  "artifact": "_artifacts/bench_train_step_flash/train_step_mlx-community__Qwen3-8B-4bit_seq2048_ours.json",
+  "batch": 1,
+  "seq_len": 2048,
+  "lora_rank": 8,
+  "lora_layers": -1,
+  "grad_checkpoint": true
+ },
+ {
+  "config": "_artifacts/calib_050/qwen3-8b-4bit.config.json",
+  "artifact": "_artifacts/bench_train_step_flash/train_step_mlx-community__Qwen3-8B-4bit_seq2048_stock.json",
+  "batch": 1,
+  "seq_len": 2048,
+  "lora_rank": 8,
+  "lora_layers": -1,
+  "grad_checkpoint": true
+ },
+ {
+  "config": "_artifacts/calib_050/qwen3-8b-4bit.config.json",
+  "artifact": "_artifacts/bench_train_step_flash/train_step_mlx-community__Qwen3-8B-4bit_seq8192_ours.json",
+  "batch": 1,
+  "seq_len": 8192,
+  "lora_rank": 8,
+  "lora_layers": -1,
+  "grad_checkpoint": true
+ },
+ {
+  "config": "_artifacts/calib_050/qwen3-8b-4bit.config.json",
+  "artifact": "_artifacts/bench_train_step_flash/train_step_mlx-community__Qwen3-8B-4bit_seq8192_stock.json",
+  "batch": 1,
+  "seq_len": 8192,
+  "lora_rank": 8,
+  "lora_layers": -1,
+  "grad_checkpoint": true
+ },
+ {
+  "config": "_artifacts/calib_050/qwen3-8b-4bit.config.json",
+  "artifact": "_artifacts/calib_050/flash_n10240/train_step_mlx-community__Qwen3-8B-4bit_seq10240_attn-flash_ours.json",
+  "batch": 1,
+  "seq_len": 10240,
+  "lora_rank": 8,
+  "lora_layers": -1,
+  "grad_checkpoint": true
+ },
+ {
+  "config": "_artifacts/calib_050/qwen3-8b-4bit.config.json",
+  "artifact": "_artifacts/calib_050/flash_n10240/train_step_mlx-community__Qwen3-8B-4bit_seq10240_attn-flash_stock.json",
+  "batch": 1,
+  "seq_len": 10240,
+  "lora_rank": 8,
+  "lora_layers": -1,
+  "grad_checkpoint": true
+ },
+ {
+  "config": "_artifacts/calib_050/qwen3-8b-4bit.config.json",
+  "artifact": "_artifacts/calib_050/flash_n12288/train_step_mlx-community__Qwen3-8B-4bit_seq12288_attn-flash_ours.json",
+  "batch": 1,
+  "seq_len": 12288,
+  "lora_rank": 8,
+  "lora_layers": -1,
+  "grad_checkpoint": true
+ },
+ {
+  "config": "_artifacts/calib_050/qwen3-8b-4bit.config.json",
+  "artifact": "_artifacts/calib_050/flash_n12288/train_step_mlx-community__Qwen3-8B-4bit_seq12288_attn-flash_stock.json",
+  "batch": 1,
+  "seq_len": 12288,
+  "lora_rank": 8,
+  "lora_layers": -1,
+  "grad_checkpoint": true
+ }
+]
