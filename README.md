@@ -249,6 +249,8 @@ The guard sets an active-memory ceiling from the machine's own RAM. It is anchor
 
 The guard is rank-local: every input it reads is this node's own RAM, availability, and process memory. On a multi-node `mx.distributed` job each rank sizes its own ceiling and flags its own crowding, and a breach hard-exits that rank — so run distributed training under a launcher (`mpirun` or `mlx.launch`) that propagates a rank failure to the whole job.
 
+The incident that motivated this guard, and what the watchdog does and does not cover, is documented in [When an MLX memory cap is not a safety boundary](https://github.com/IonDen/mlx-train-perf/blob/main/docs/papers/when-an-mlx-memory-cap-is-not-a-safety-boundary.md).
+
 ## Research
 
 - [Fused linear cross-entropy on Apple GPUs](https://github.com/IonDen/mlx-train-perf/blob/main/docs/papers/fused-linear-cross-entropy-apple-gpus.md)
@@ -262,6 +264,11 @@ The guard is rank-local: every input it reads is this node's own RAM, availabili
   explains the operation and element thresholds that MLX 0.32.0 uses to commit Metal work. It applies
   them to tiled attention, then explains why a whole-chain launch budget rejected valid work. The
   macOS watchdog mechanism remains an inference.
+- [When an MLX memory cap is not a safety boundary](https://github.com/IonDen/mlx-train-perf/blob/main/docs/papers/when-an-mlx-memory-cap-is-not-a-safety-boundary.md)
+  reports the kernel-panic incident behind the memory guard: a wired limit that caps residency
+  without rejecting allocation, an advisory soft limit, and the active-memory watchdog added as a
+  third layer. It separates the observed record from reconstruction and keeps the panic-trigger
+  mechanism labeled as an unverified hypothesis.
 
 ## Community benchmarks
 
