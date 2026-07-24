@@ -1,0 +1,33 @@
+@startuml
+title Three controls, and where an over-budget allocation actually stops
+
+skinparam backgroundColor #FFFFFF
+skinparam shadowing false
+skinparam roundCorner 10
+skinparam defaultFontName Helvetica
+skinparam defaultFontColor #111827
+skinparam ArrowColor #4B5563
+skinparam ArrowFontColor #374151
+skinparam rectangle {
+  BorderColor #4B5563
+  FontColor #111827
+  BackgroundColor #F8FAFC
+}
+
+rectangle "Over-budget GPU allocation\non a 32 GB M1 Max" as start #EDE9FE
+
+rectangle "mx.set_wired_limit\nResidency cap on non-pageable memory\nBounds the wired set; does not reject the allocation" as wired #FEF3C7
+rectangle "mx.set_memory_limit\nAdvisory guideline\nDoes not stop evaluation; allocation may continue into swap" as soft #FEF3C7
+rectangle "Excess buffers stay unwired and pageable\nAllocation continues toward RAM plus swap" as pageable #FEF3C7
+
+rectangle "Before the fix: no process-local stop\nSustained pageable GPU pressure\nKernel panic at IOGPUMemory.cpp:550\n(driver trigger unverified)" as panic #FECACA
+rectangle "After the fix: active-memory watchdog\nSamples mx.get_active_memory() about twice per second\nCrosses min(28.0 GiB static, available_at_start - 2 GiB)\nWrites aborted_memory_ceiling, then hard-exits" as abort #DCFCE7
+
+start -down-> wired
+wired -down-> soft : does not reject
+soft -down-> pageable : does not reject
+pageable -down-> panic
+pageable -down-> abort
+
+caption Layered view of the incident and its mitigation. The panic trigger is an unverified hypothesis; the watchdog is a best-effort process-local guard, not a hard machine boundary.
+@enduml
