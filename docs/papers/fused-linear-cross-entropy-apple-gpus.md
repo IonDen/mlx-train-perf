@@ -2,6 +2,8 @@
 
 *Memory savings, tiling limits, and lessons from failed performance models*
 
+> 📄 [Read on the website](https://ineshin.space/papers/fused-linear-cross-entropy-apple-gpus/) — same paper, formatted for reading.
+
 Training a language model often allocates a huge logits matrix just to compute cross-entropy. For `N`
 tokens and a vocabulary of size `V`, that matrix has shape `(N, V)`. Yet the loss needs only a
 log-sum-exp and one target logit from each row. We built a fused MLX/Metal forward kernel that computes

@@ -2,6 +2,8 @@
 
 *An Apple unified-memory incident report and the process-local watchdog added afterward*
 
+> 📄 [Read on the website](https://ineshin.space/papers/when-an-mlx-memory-cap-is-not-a-safety-boundary/) — same paper, formatted for reading.
+
 A configured memory limit can be real without being a hard stop. That distinction matters on Apple
 Silicon, where CPU and GPU workloads share physical memory and some GPU allocations remain pageable.
 

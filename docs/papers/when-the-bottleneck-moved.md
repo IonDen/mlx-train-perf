@@ -2,6 +2,8 @@
 
 *Two corrected system models and a tiled attention path for Apple GPUs*
 
+> 📄 [Read on the website](https://ineshin.space/papers/when-the-bottleneck-moved/) — same paper, formatted for reading.
+
 Removing a large allocation does not necessarily move a system's memory ceiling. It moves the
 ceiling only when that allocation is alive at the peak.
 
