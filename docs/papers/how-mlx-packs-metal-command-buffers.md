@@ -3,6 +3,8 @@
 *A source-based account of operation limits, element accounting, and launch planning on an
 M1 Max running macOS 26.5*
 
+> 📄 [Read on the website](https://ineshin.space/papers/how-mlx-packs-metal-command-buffers/) — same paper, formatted for reading.
+
 A chain of Metal kernels is not necessarily one Metal command buffer. That distinction matters when
 software estimates whether a long GPU workload is safe to submit.
 
