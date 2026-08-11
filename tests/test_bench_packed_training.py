@@ -208,7 +208,9 @@ def test_worker_main_packed_train_dispatches_and_writes_ok(
 ) -> None:
     captured: dict[str, object] = {}
 
-    def _fake_run(params: dict[str, object]) -> dict[str, object]:
+    def _fake_run(
+        params: dict[str, object], *, checkpoint: object,  # noqa: ARG001
+    ) -> dict[str, object]:
         captured["params"] = params
         return {"arm": params["arm"], "real_tokens_per_second": 1.0, "loss_all": [1.0]}
 
@@ -238,7 +240,9 @@ def test_worker_main_packed_train_launch_budget_refusal_is_recorded(
     """A `LaunchBudgetError` out of the flash path is a RESULT (`status="refused"`,
     rc 0), the same envelope `run_train_step`'s refusals use -- the script turns it into
     a nonzero process exit (the repo bench exit policy), tested separately below."""
-    def _raise(_params: dict[str, object]) -> dict[str, object]:
+    def _raise(
+        _params: dict[str, object], *, checkpoint: object,  # noqa: ARG001
+    ) -> dict[str, object]:
         raise LaunchBudgetError("no launch budget at this shape")
 
     monkeypatch.setattr(worker, "run_packed_train", _raise)

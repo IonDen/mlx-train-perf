@@ -48,6 +48,7 @@ _PACKAGE_ROOT = Path(__file__).resolve().parent.parent  # .../src/mlx_train_perf
 CODE_SHA_DEPS: tuple[Path, ...] = tuple(
     _PACKAGE_ROOT / rel for rel in (
         "bench/worker.py",
+        "bench/checkpoint.py",
         "core/loss.py",
         "core/chunked.py",
         "core/naive.py",

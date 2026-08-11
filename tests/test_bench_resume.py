@@ -591,7 +591,9 @@ def test_worker_main_records_refusal_not_a_crash(
         "out": str(out),
     }))
 
-    def _refuse(_params: dict[str, object]) -> dict[str, object]:
+    def _refuse(
+        _params: dict[str, object], *, checkpoint: object,  # noqa: ARG001
+    ) -> dict[str, object]:
         raise LaunchBudgetError("projected dispatch exceeds the watchdog budget")
 
     monkeypatch.setattr(worker, "run_loss_layer", _refuse)
@@ -652,7 +654,11 @@ def test_worker_main_installs_guardrails_first(
     }))
     calls: list[str] = []
     monkeypatch.setattr(worker, "install_guardrails", lambda: calls.append("guardrails"))
-    monkeypatch.setattr(worker, "run_loss_layer", lambda _params: calls.append("run") or {})  # type: ignore[func-returns-value]
+    monkeypatch.setattr(
+        worker,
+        "run_loss_layer",
+        lambda _params, *, checkpoint: calls.append("run") or {},  # noqa: ARG005
+    )
     worker.main(["--config", str(cfg)])
     assert calls == ["guardrails", "run"]
 

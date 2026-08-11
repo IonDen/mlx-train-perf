@@ -43,6 +43,7 @@ from mlx_train_perf.bench.artifacts import (
     make_watchdog_on_breach,
     write_result,
 )
+from mlx_train_perf.bench.checkpoint import CheckpointSession, connect_external_checkpoint
 from mlx_train_perf.core.guards import (
     DEFAULT_WALL_BUDGET_S,
     clamped_caps,
@@ -90,7 +91,9 @@ def _build_head(*, v: int, d: int, dtype: mx.Dtype, quantized: bool, group_size:
     return QuantizedHead(w_q=w_q, scales=scales, biases=biases, group_size=group_size, bits=bits)
 
 
-def run_loss_layer(params: dict[str, object]) -> dict[str, object]:
+def run_loss_layer(
+    params: dict[str, object], *, checkpoint: CheckpointSession | None = None,
+) -> dict[str, object]:
     """Times `linear_cross_entropy` at one synthetic grid point. Reset-peak semantics
     (warmup pays Metal JIT OUTSIDE the measured window; `active_before` is snapshotted
     right before the reset so `marginal_peak_gb` is the incremental cost of the forward
@@ -124,11 +127,14 @@ def run_loss_layer(params: dict[str, object]) -> dict[str, object]:
     active_before = mx.get_active_memory()
     mx.reset_peak_memory()
     walls: list[float] = []
-    for _ in range(reps):
+    for rep in range(reps):
         t0 = time.perf_counter()
         loss = run_once()
         mx.eval(loss)
         walls.append(time.perf_counter() - t0)
+        if checkpoint is not None:
+            checkpoint.mark(stage="loss_layer", completed=rep + 1, total=reps)
+            checkpoint.poll()
     marginal_peak_gb = (mx.get_peak_memory() - active_before) / 1024**3
     med = statistics.median(walls)
     g_mac_per_s = (n * v * d) / med / 1e9
@@ -227,11 +233,27 @@ class _RecordingCallback:
     `val_dataset`, which `train()`'s own `if val_dataset and (...)` guard treats as "no
     validation configured"."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        checkpoint: CheckpointSession | None = None,
+        stage: str = "train_step",
+        total: int = 0,
+    ) -> None:
         self.train_info: list[dict[str, object]] = []
+        self._checkpoint = checkpoint
+        self._stage = stage
+        self._total = total
 
     def on_train_loss_report(self, train_info: dict[str, object]) -> None:
         self.train_info.append(dict(train_info))
+        if self._checkpoint is not None:
+            self._checkpoint.mark(
+                stage=self._stage,
+                completed=len(self.train_info),
+                total=self._total,
+            )
+            self._checkpoint.poll()
 
     def on_val_loss_report(self, val_info: dict[str, object]) -> None:  # noqa: ARG002
         # `val_info` unused: required for interface parity with `TrainingCallback` --
@@ -272,6 +294,7 @@ def _run_train_steps(
     seq_len: int,
     steps: int,
     grad_checkpoint: bool,
+    checkpoint: CheckpointSession | None = None,
 ) -> list[dict[str, object]]:
     """Drives `steps` real fine-tune iterations through the compiled
     `mlx_lm.tuner.trainer.train()` -- used for BOTH arms. Stock's `default_loss` and
@@ -280,7 +303,7 @@ def _run_train_steps(
     and the tok/s comparison is apples to apples."""
     from mlx_lm.tuner.trainer import TrainingArgs, train  # noqa: PLC0415
 
-    callback = _RecordingCallback()
+    callback = _RecordingCallback(checkpoint=checkpoint, stage="train_step", total=steps)
     train_set = _SyntheticDataset(examples)
     with tempfile.TemporaryDirectory(prefix="mlx-train-perf-bench-") as tmp_dir:
         args = TrainingArgs(
@@ -299,7 +322,10 @@ def _run_train_steps(
 
 
 def run_train_step(
-    params: dict[str, object], *, attention_impl: str | None = None,
+    params: dict[str, object],
+    *,
+    attention_impl: str | None = None,
+    checkpoint: CheckpointSession | None = None,
 ) -> dict[str, object]:
     """Times `steps` real mlx-lm LoRA fine-tune steps end to end against a real
     (`mlx_lm.load`-resolved) model: ours, via the adapter (`make_loss_fn`), or
@@ -424,7 +450,7 @@ def run_train_step(
     # `mx.compile` forbids, so the tok/s comparison is compiled-vs-compiled, apples to apples.
     step_reports = _run_train_steps(
         model, opt, loss_fn, examples, batch=batch, seq_len=seq_len, steps=steps,
-        grad_checkpoint=grad_checkpoint,
+        grad_checkpoint=grad_checkpoint, checkpoint=checkpoint,
     )
     marginal_peak_gb = (mx.get_peak_memory() - active_before) / 1024**3
 
@@ -572,6 +598,7 @@ def _run_packed_train_steps(
     steps: int,
     grad_checkpoint: bool,
     iterate_batches: Any,
+    checkpoint: CheckpointSession | None = None,
 ) -> list[dict[str, object]]:
     """Drive `steps` real fine-tune iterations through the compiled `train()`. The packed
     arm passes `iterate_batches=partial(packed_iterate_batches, ...)`; the stock arm passes
@@ -580,7 +607,7 @@ def _run_packed_train_steps(
     sizes them), stock pads up to `pack_len`."""
     from mlx_lm.tuner.trainer import TrainingArgs, train  # noqa: PLC0415
 
-    callback = _RecordingCallback()
+    callback = _RecordingCallback(checkpoint=checkpoint, stage="packed_train", total=steps)
     with tempfile.TemporaryDirectory(prefix="mlx-train-perf-packed-") as tmp_dir:
         args = TrainingArgs(
             batch_size=batch, iters=steps, val_batches=0, steps_per_report=1,
@@ -651,7 +678,9 @@ def _packed_summary(
     }
 
 
-def run_packed_train(params: dict[str, object]) -> dict[str, object]:
+def run_packed_train(
+    params: dict[str, object], *, checkpoint: CheckpointSession | None = None,
+) -> dict[str, object]:
     """Time `steps` real mlx-lm LoRA fine-tune steps for ONE batching arm against a real
     (`mlx_lm.load`-resolved) model and a real prepped dataset (`params["data"]`, a
     prep_alpaca jsonl). Both arms enable flash attention and the fused CE loss -- the ONLY
@@ -733,7 +762,7 @@ def run_packed_train(params: dict[str, object]) -> dict[str, object]:
     mx.reset_peak_memory()
     step_reports = _run_packed_train_steps(
         model, opt, loss_fn, dataset, batch=batch, pack_len=pack_len, steps=steps,
-        grad_checkpoint=grad_checkpoint, iterate_batches=iterate,
+        grad_checkpoint=grad_checkpoint, iterate_batches=iterate, checkpoint=checkpoint,
     )
     marginal_peak_gb = (mx.get_peak_memory() - active_before) / 1024**3
 
@@ -821,17 +850,23 @@ def main(argv: list[str] | None = None) -> int:
         ceiling_bytes=ceiling_bytes, wall_budget_s=wall_budget_s,
         on_breach=make_watchdog_on_breach(out, ident, ceiling_bytes),
     )
+    checkpoint_session: CheckpointSession | None = None
     try:
+        checkpoint_session = connect_external_checkpoint(out, ident)
         try:
             if kind == "loss_layer":
-                fields = run_loss_layer(params)
+                fields = run_loss_layer(params, checkpoint=checkpoint_session)
             elif kind == "train_step":
-                fields = run_train_step(params, attention_impl=attention_impl)
+                fields = run_train_step(
+                    params,
+                    attention_impl=attention_impl,
+                    checkpoint=checkpoint_session,
+                )
             elif kind == "packed_train":
                 # attention_impl rides the identity (always "flash" for this kind) but is
                 # not an execution knob here -- run_packed_train always enables flash on
                 # both arms; the batching strategy is the only variable.
-                fields = run_packed_train(params)
+                fields = run_packed_train(params, checkpoint=checkpoint_session)
             else:
                 # Deliberately uncaught: an unsupported kind is a program error (a bad
                 # Condition was constructed), not a recorded run outcome -- it crashes this
@@ -855,6 +890,8 @@ def main(argv: list[str] | None = None) -> int:
         write_result(out, ident, "ok", **fields, **warning_field)
         return 0
     finally:
+        if checkpoint_session is not None:
+            checkpoint_session.close()
         # Normal completion / refusal / uncaught crash all stop the sampler thread so an
         # in-process caller never leaks it. A breach never reaches here -- `on_breach`
         # already hard-exited the process.

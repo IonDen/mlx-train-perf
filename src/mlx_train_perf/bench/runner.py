@@ -7,6 +7,7 @@ condition whose artifact is already fresh is skipped entirely, never spawned; a 
 that exits nonzero (crashes) gets its failure recorded as a `status="error"` result here,
 on the CALLER's side, so one bad condition never aborts the rest of the sweep.
 """
+import importlib
 import json
 import subprocess
 import sys
@@ -45,6 +46,41 @@ class Condition:
     wall_budget_s: float | None = None
 
 
+@dataclass(frozen=True, slots=True, kw_only=True)
+class ExternalGuardConfig:
+    """Opt-in external supervision limits for each condition worker."""
+
+    max_footprint_bytes: int
+    sample_interval_ms: int = 50
+    wall_time_ms: int | None = None
+
+    def __post_init__(self) -> None:
+        limit = self.max_footprint_bytes
+        if type(limit) is not int or not 2 <= limit <= (1 << 64) - 1:
+            raise ValueError("max_footprint_bytes must be within 2..=u64::MAX")
+        if limit + max(limit // 10, 1) > (1 << 64) - 1:
+            raise ValueError("max_footprint_bytes cannot represent the emergency band")
+        if (
+            type(self.sample_interval_ms) is not int
+            or not 10 <= self.sample_interval_ms <= 10_000
+        ):
+            raise ValueError("sample_interval_ms must be within 10..=10000")
+        wall_time = self.wall_time_ms
+        if wall_time is not None and (
+            type(wall_time) is not int or not 1 <= wall_time <= 30 * 24 * 60 * 60 * 1000
+        ):
+            raise ValueError("wall_time_ms must be within 1ms..=30d")
+
+
+@dataclass(frozen=True, slots=True)
+class GuardedWorkerResult:
+    """Worker process result plus launch-boundary supervision metadata."""
+
+    process: subprocess.CompletedProcess[str]
+    fallback_reason: str | None
+    client_error: str | None
+
+
 def _spawn_worker(config_path: Path) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [sys.executable, "-m", "mlx_train_perf.bench.worker", "--config", str(config_path)],
@@ -52,10 +88,81 @@ def _spawn_worker(config_path: Path) -> subprocess.CompletedProcess[str]:
     )
 
 
+def _spawn_guarded_worker(
+    config_path: Path,
+    report_path: Path,
+    policy: ExternalGuardConfig,
+) -> GuardedWorkerResult:
+    """Supervise one worker, falling back only on pre-launch discovery failures."""
+    try:
+        mlx_guard = importlib.import_module("mlx_guard")
+    except ModuleNotFoundError as error:
+        if error.name not in (None, "mlx_guard"):
+            raise
+        return GuardedWorkerResult(
+            process=_spawn_worker(config_path),
+            fallback_reason="mlx-guard package is unavailable",
+            client_error=None,
+        )
+
+    command = (
+        sys.executable,
+        "-m",
+        "mlx_train_perf.bench.worker",
+        "--config",
+        str(config_path),
+    )
+    config = mlx_guard.RunConfig(
+        command=command,
+        report=report_path,
+        max_footprint_bytes=policy.max_footprint_bytes,
+        sample_interval_ms=policy.sample_interval_ms,
+        wall_time_ms=policy.wall_time_ms,
+    )
+    try:
+        result = mlx_guard.run(config, capture_output=True)
+    except mlx_guard.SupervisorDiscoveryError:
+        return GuardedWorkerResult(
+            process=_spawn_worker(config_path),
+            fallback_reason="mlx-guard supervisor discovery failed",
+            client_error=None,
+        )
+    except Exception as error:
+        return GuardedWorkerResult(
+            process=subprocess.CompletedProcess(command, 70, "", ""),
+            fallback_reason=None,
+            client_error=f"guard client failed after launch: {type(error).__name__}",
+        )
+    return GuardedWorkerResult(
+        process=subprocess.CompletedProcess(
+            command,
+            result.returncode,
+            _text_output(result.stdout),
+            _text_output(result.stderr),
+        ),
+        fallback_reason=None,
+        client_error=None,
+    )
+
+
+def _text_output(value: object) -> str:
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return value if isinstance(value, str) else ""
+
+
 def run_conditions(
-    conditions: list[Condition], out_dir: Path, *, session_id: str,
+    conditions: list[Condition],
+    out_dir: Path,
+    *,
+    session_id: str,
+    guard: ExternalGuardConfig | None = None,
 ) -> list[Path]:
     out_dir.mkdir(parents=True, exist_ok=True)
+    guard_dir = out_dir / "_mlx_guard"
+    if guard is not None:
+        guard_dir.mkdir(parents=True, exist_ok=True)
+        guard_dir.chmod(0o700)
     paths: list[Path] = []
     for condition in conditions:
         out_path = out_dir / f"{condition.name}.json"
@@ -89,7 +196,31 @@ def run_conditions(
             json.dump(config, f)
             config_path = Path(f.name)
         try:
-            proc = _spawn_worker(config_path)
+            if guard is None:
+                proc = _spawn_worker(config_path)
+            else:
+                guard_report = guard_dir / f"{condition.name}.json"
+                fallback_record = guard_dir / f"{condition.name}.launch.json"
+                client_record = guard_dir / f"{condition.name}.client.json"
+                guard_report.unlink(missing_ok=True)
+                fallback_record.unlink(missing_ok=True)
+                client_record.unlink(missing_ok=True)
+                guarded = _spawn_guarded_worker(config_path, guard_report, guard)
+                proc = guarded.process
+                if guarded.fallback_reason is not None:
+                    write_result(
+                        fallback_record,
+                        ident,
+                        "guard_fallback",
+                        reason=guarded.fallback_reason,
+                    )
+                if guarded.client_error is not None:
+                    write_result(
+                        client_record,
+                        ident,
+                        "guard_client_error",
+                        error=guarded.client_error,
+                    )
             if proc.returncode != 0 and not out_path.exists():
                 # A nonzero exit that left NO artifact: the worker crashed before/without
                 # reaching any `write_result`. THIS is the sweep-level failure envelope,

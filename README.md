@@ -448,6 +448,41 @@ The guard is rank-local: every input it reads is this node's own RAM, availabili
 
 The incident that motivated this guard, and what the watchdog does and does not cover, is documented in [When an MLX memory cap is not a safety boundary](https://ineshin.space/papers/when-an-mlx-memory-cap-is-not-a-safety-boundary/).
 
+### Optional external supervision
+
+Benchmark callers can also place each condition under
+[mlx-guard](https://github.com/IonDen/mlx-guard) process-group supervision. Install
+mlx-guard separately, then pass an explicit policy to the benchmark runner:
+
+~~~python
+from mlx_train_perf.bench.runner import (
+    Condition,
+    ExternalGuardConfig,
+    run_conditions,
+)
+
+paths = run_conditions(
+    conditions,
+    out_dir,
+    session_id=session_id,
+    guard=ExternalGuardConfig(
+        max_footprint_bytes=28 * 1024**3,
+        wall_time_ms=60 * 60 * 1000,
+    ),
+)
+~~~
+
+The worker polls for checkpoint requests only after a completed repetition or training
+step. It writes and syncs status="checkpointed_partial" before acknowledging. Native
+reports are stored in the private _mlx_guard/ directory below out_dir.
+
+If the optional package or its verified binary is unavailable, the runner records a
+guard_fallback launch record and uses the existing direct worker path. Once the
+supervisor starts, the condition is never launched a second time: client or report
+failures are written separately as guard_client_error, and any worker artifact is
+preserved. The existing MLX wired limit and active-memory watchdog remain enabled in both
+modes.
+
 ## Research
 
 Four write-ups cover the work behind this library in more depth than a README can, including the
