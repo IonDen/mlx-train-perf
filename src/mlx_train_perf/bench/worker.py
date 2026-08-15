@@ -302,7 +302,7 @@ def run_train_step(
     params: dict[str, object], *, attention_impl: str | None = None,
 ) -> dict[str, object]:
     """Times `steps` real mlx-lm LoRA fine-tune steps end to end against a real
-    (`mlx_lm.load`-resolved) model: ours, via the T12 adapter (`make_loss_fn`), or
+    (`mlx_lm.load`-resolved) model: ours, via the adapter (`make_loss_fn`), or
     stock's own `mlx_lm.tuner.trainer.default_loss` when `params["stock"]` is true.
     Records tokens/sec (median + per-step), per-step loss, and the memory story
     (active-before / marginal-peak / total-peak, matching `run_loss_layer`'s own
@@ -331,7 +331,7 @@ def run_train_step(
     identity input `bench.runner.Condition` carries out of `params` and `worker.main`
     forwards here, so identity and execution read one authoritative value. `None`
     (unset -- every 0.1.0-era config) and "stock" both leave attention untouched; "flash"
-    routes every decoder layer's attention through T12's `enable_flash_attention`, hinted
+    routes every decoder layer's attention through `enable_flash_attention`, hinted
     with THIS run's `seq_len`/`batch` so a compiled `train()` traces with warm kernel rate
     caches. Any other value raises `MlxTrainPerfError`.
     """

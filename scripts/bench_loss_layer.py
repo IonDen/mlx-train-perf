@@ -16,7 +16,7 @@ a SEPARATE directory so a tiny verification run can never collide with (or be mi
 for) an actual production measurement.
 
 In-script acceptance check: kernel forward wall <= 1.7x naive forward wall at n=8192,
-same session (the spec bar; the spike measured 1.63x) -- read directly from the two
+same session (the spike measured 1.63x) -- read directly from the two
 n=8192 artifacts rather than through `runner.report`'s aggregate `ratios` dict, which
 is keyed only by "slower-impl/faster-impl" and would collide across different `n`
 groups that happen to share the same slower/faster pairing.
@@ -29,7 +29,7 @@ condition's `params` -- an edit to this script's own measurement/acceptance logi
 still invalidates a previously-written artifact.
 
 Heavy GPU run at production shape -- main session only, ETA ~10-15 min for the full
-3x3 grid (per the task brief's step-1 budget). Pre-flight `memory_pressure` before
+3x3 grid. Pre-flight `memory_pressure` before
 running; never invoke a production-shape condition from an agent session -- `--tiny`
 is the only mode safe to run outside the main session's heavy-run protocol.
 """

@@ -1,0 +1,47 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 340" width="720" height="340" role="img" aria-label="Training step peak memory at 8192 tokens on Qwen3-8B-4bit. Stock attention peaks at 25.68 GiB, above the roughly 24.5 GiB a 32 GB Mac can actually use. Flash attention peaks at 12.75 GiB.">
+  <rect x="0" y="0" width="720" height="340" fill="#ffffff" rx="6"/>
+  <style>
+    .t  { font: 600 16px -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; fill: #0f172a; }
+    .s  { font: 400 12.5px -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; fill: #475569; }
+    .l  { font: 500 13px -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; fill: #0f172a; }
+    .v  { font: 600 13px -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; fill: #0f172a; }
+    .ax { font: 400 11px -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; fill: #64748b; }
+    .cap{ font: 400 11.5px -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; fill: #64748b; }
+  </style>
+
+  <text class="t" x="24" y="30">One training step, 8192 tokens, Qwen3-8B-4bit QLoRA</text>
+  <text class="s" x="24" y="50">Peak memory, LoRA rank 8, batch 1, gradient checkpointing, bf16</text>
+
+  <!-- ceiling line -->
+  <line x1="598.8" y1="72" x2="598.8" y2="212" stroke="#b91c1c" stroke-width="1.5" stroke-dasharray="5 4"/>
+  <text class="ax" x="594.8" y="68" text-anchor="end" fill="#b91c1c">usable on a 32 GB Mac (~24.5 GiB)</text>
+
+  <!-- stock bar -->
+  <text class="l" x="160" y="115" text-anchor="end">stock attention</text>
+  <rect x="170" y="92" width="76.5" height="40" fill="#64748b" rx="2"/>
+  <rect x="246.5" y="92" width="372.9" height="40" fill="#dc2626" rx="2"/>
+  <text class="v" x="631" y="116">25.68 GiB</text>
+
+  <!-- flash bar -->
+  <text class="l" x="160" y="185" text-anchor="end">flash attention</text>
+  <rect x="170" y="162" width="76.5" height="40" fill="#64748b" rx="2"/>
+  <rect x="246.5" y="162" width="146.5" height="40" fill="#0d9488" rx="2"/>
+  <text class="v" x="405" y="186">12.75 GiB</text>
+
+  <!-- axis -->
+  <line x1="170" y1="212" x2="660" y2="212" stroke="#cbd5e1" stroke-width="1"/>
+  <text class="ax" x="170" y="228" text-anchor="middle">0</text>
+  <text class="ax" x="345" y="228" text-anchor="middle">10</text>
+  <text class="ax" x="520" y="228" text-anchor="middle">20</text>
+  <text class="ax" x="660" y="228" text-anchor="middle">28 GiB</text>
+
+  <!-- legend -->
+  <rect x="170" y="246" width="11" height="11" fill="#64748b" rx="2"/>
+  <text class="cap" x="187" y="256">weights, adapters, optimizer (shared by both)</text>
+  <rect x="170" y="268" width="11" height="11" fill="#dc2626" rx="2"/>
+  <text class="cap" x="187" y="278">rest of the step, dominated by attention backward, O(N²)</text>
+  <rect x="170" y="290" width="11" height="11" fill="#0d9488" rx="2"/>
+  <text class="cap" x="187" y="300">rest of the step, with an O(N) attention backward</text>
+
+  <text class="cap" x="24" y="328">scripts/bench_train_step.py, one M1 Max 32 GB, macOS 26.5, mlx 0.32.0</text>
+</svg>

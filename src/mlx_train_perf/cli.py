@@ -158,7 +158,7 @@ def _cmd_plan_search(
     """Handles `--max-seq`/`--max-batch`: resolves the search variable via
     `plan.inverse` bisection (the `TrainConfig` is built with a placeholder value of 1
     for the search variable -- `_train_config_from_args` takes mandatory ints -- and the
-    Task 9 bisection replaces it internally), then renders the SAME `FitReport` block the
+    bisection replaces it internally), then renders the SAME `FitReport` block the
     forward `plan` command prints against the resolved config, with the found value on
     its own leading line. A `DoesNotFitError` at the search floor (seq_len=1 / batch=1)
     is a refusal (exit 1, matching the bench exit policy), never a tool error (exit 2)."""

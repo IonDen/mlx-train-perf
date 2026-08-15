@@ -1,5 +1,5 @@
 """Production-shape (n=8192, V=151936, D=4096) release-threshold bench for the
-dequant-in-kernel quantized forward (Task 10 / backlog 0009).
+dequant-in-kernel quantized forward.
 
 Conditions (subprocess-per-condition — own MLX allocator state, no cross-condition
 buffer retention):
@@ -26,14 +26,13 @@ delta the release threshold cares about shows up) and `marginal_peak_gb` is the
 incremental cost of running the forward passes themselves, not of holding the weights.
 
 Release thresholds this bench feeds (evaluated by the CONTROLLER against the written
-artifacts — out of this script's scope, see docs/backlog/mlx-train-perf/
-mlx-train-perf-0009.md and the task-10 report):
+artifacts — out of this script's scope):
   - quant_kernel g_mac_per_s >= dense_kernel g_mac_per_s / 1.5
   - (dequant_once_then_dense active_before_gb) - (quant_kernel active_before_gb)
     ~= head size (~1.24 GB at this shape)
 
 Heavy GPU run at production shape — main session only, subprocess-per-condition,
-ETA ~5 min total for all three conditions (per the task brief's step 8 budget).
+ETA ~5 min total for all three conditions.
 Pre-flight `memory_pressure` before running; never invoke from a subagent.
 """
 import argparse

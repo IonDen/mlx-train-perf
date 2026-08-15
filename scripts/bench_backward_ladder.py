@@ -1,4 +1,4 @@
-"""Per-rung bench for the backward ladder (Task 16b, step 4/5 — the STOP-table bench).
+"""Per-rung bench for the backward ladder (the STOP-table bench).
 
 Conditions (subprocess-per-condition -- own MLX allocator state, no cross-condition
 buffer retention):

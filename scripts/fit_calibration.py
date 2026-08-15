@@ -147,7 +147,7 @@ def build_updated_calibration_data(
 
     `provenance` keeps the four keys `load_calibration`'s own tests require truthy
     (`machine`, `macos`, `mlx_version`, `measured_date`), plus `flash_fit`
-    (`"ols"|"envelope"`, Task 8 0.5.0) naming which flash-coefficient fit `main()`
+    (`"ols"|"envelope"`, added in 0.5.0) naming which flash-coefficient fit `main()`
     selected -- `"ols"` unless the one-sidedness check (`_flash_fit_is_one_sided`)
     found a violation and refit with the envelope fallback. Its `fit_source` PRESERVES
     the existing note (so a flash-only refit -- which keeps the stock coefficients

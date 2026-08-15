@@ -4,13 +4,180 @@
 [![Python versions](https://img.shields.io/pypi/pyversions/mlx-train-perf.svg)](https://pypi.org/project/mlx-train-perf/)
 [![License: MIT](https://img.shields.io/pypi/l/mlx-train-perf.svg)](https://github.com/IonDen/mlx-train-perf/blob/main/LICENSE)
 
-A fused, logit-free linear-cross-entropy loss for training on Apple Silicon with [MLX](https://github.com/ml-explore/mlx), plus a RAM-fit planner and an honest benchmark harness. It drops into an `mlx-lm` LoRA/QLoRA fine-tune as the loss function.
+Train on longer sequences, and get through short ones faster, on the Mac you already have.
+
+`mlx-train-perf` is a set of drop-in parts for [MLX](https://github.com/ml-explore/mlx) LoRA and QLoRA fine-tuning: Metal kernels that cut what a single training step allocates, sequence packing for datasets made of short examples, and a planner that answers "will this fit in my RAM?" before you download the weights. It is not a trainer and does not want to be one. You keep `mlx_lm`'s training loop and swap in the pieces you need.
+
+Measured on one M1 Max (32 GB), Qwen3-8B-4bit QLoRA: the longest sequence you can train goes from 7,936 tokens to 23,040, and an Alpaca-shaped instruction dataset trains 3.0× faster per real token (2 to 3× depending on how short your examples are).
+
+### The problem, in mlx-lm's own words
+
+If a fine-tune does not fit in memory, mlx-lm's [LoRA guide](https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/LORA.md) offers five remedies. The fourth is:
+
+> Longer examples require more memory. If it makes sense for your data, one thing you can do is break your examples into smaller sequences when making the `{train, valid, test}.jsonl` files.
+
+And if you leave `max_seq_length` at its default of 2048 while your data is longer than that, the trainer does it for you:
+
+```
+[WARNING] Some sequences are longer than 2048 tokens. The longest sentence 6144 will be
+truncated to 2048. Consider pre-splitting your data to save memory.
+```
+
+That advice is correct, and it means training on the first 2048 tokens of every contract, transcript, or source file and discarding the rest. The advice exists because MLX's attention has a memory-light forward pass and a backward pass that rebuilds the full `(N, N)` score matrix. An MLX maintainer put it plainly while [closing an out-of-memory report](https://github.com/ml-explore/mlx/issues/3539#issuecomment-4445752643):
+
+> The RAM needed for training grows quadratically as sequence length increases, so I'm afraid the OOM is not something we can simply solve.
+
+It is solvable one layer up. This library replaces that backward pass with one that keeps O(N) state, for the architectures it supports, so context costs what it should. You raise `max_seq_length` instead of cutting up your data.
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/IonDen/mlx-train-perf/main/docs/images/training-step-memory.svg" alt="Training step peak memory at 8192 tokens on Qwen3-8B-4bit: stock attention 25.68 GiB, above what a 32 GB Mac can use; flash attention 12.75 GiB, comfortably under it." width="720">
+</p>
+
+## Does this help me?
+
+Including the cases where it does not.
+
+| What you are hitting | Does this help? |
+|---|---|
+| The truncation warning above, on examples you would rather keep whole | Yes. Raise `max_seq_length` and use the [flash-attention path](https://github.com/IonDen/mlx-train-perf#flash-attention-training-path). |
+| You raised `max_seq_length` and the run died or the machine locked up | Yes, if one step was the problem. At 8192 tokens the step's peak drops from 25.68 to 12.75 GiB. |
+| An instruction dataset of short examples, and training crawls while the GPU looks idle | Yes. [Packing](https://github.com/IonDen/mlx-train-perf#sequence-packing) moves 2 to 3× more real tokens per second. |
+| You want to know whether a config fits before spending an hour finding out | Yes. [`mlx-train-perf plan`](https://github.com/IonDen/mlx-train-perf#ram-fit-planner) answers without loading the model. |
+| Everything already fits at the 2048 default | Not for the memory work — below roughly 2,100 tokens stock attention is the faster of the two. Packing can still help if your examples are short. |
+| Memory that climbs across iterations at a fixed shape | No. That is a leak somewhere else; these kernels change what one step allocates, not what accumulates between steps. |
+| Gemma, Mistral, Phi, or a hybrid model with sliding-window attention | Not yet. Llama, Qwen2 and Qwen3 with full attention, and it refuses the rest up front rather than failing halfway through a run. |
+| Inference or serving speed | No. This is training only. |
+
+Every number here has a committed script under `scripts/` that reproduces it, all measured on one M1 Max (32 GB, macOS 26.5). The loss-layer figures were taken on mlx 0.31.2 and reproduce on the pinned 0.32.0; the flash-attention memory figures were taken on 0.32.0 in 0.2.0, and the 0.3.0 context-ceiling figures on 0.32.0.
+
+## Install
+
+```bash
+pip install mlx-train-perf            # the loss kernel + planner
+pip install "mlx-train-perf[mlx-lm]"  # plus the mlx-lm training adapter
+```
+
+Apple Silicon only. Requires mlx >=0.32.0,<0.33, the version the kernels' JIT contract is verified against. The mlx-lm adapter and the flash-attention wrapper need the optional `mlx-lm` extra.
+
+There is no flag to bolt onto `mlx_lm.lora`. These parts attach to a loaded model object, so you drive `mlx_lm`'s `train()` from a short Python script instead of the CLI. That script is the whole difference, and it runs about six lines longer than the one you would have written anyway.
+
+## Three situations, start to finish
+
+### Long examples that keep getting truncated
+
+What you run today:
+
+```bash
+mlx_lm.lora --model mlx-community/Qwen3-8B-4bit --train --data ./data \
+    --batch-size 1 --grad-checkpoint
+```
+
+```
+[WARNING] Some sequences are longer than 2048 tokens. The longest sentence 6144 will be
+truncated to 2048. Consider pre-splitting your data to save memory.
+```
+
+Passing `--max-seq-length 8192` trades the truncation for a crash: the step peaks at 25.68 GiB, and a 32 GB Mac has roughly 24.5 GiB to give it. With the flash path that same step peaks at 12.75 GiB, and the longest sequence you can train moves from 7,936 tokens to 23,040 (`scripts/northstar_context_sweep.py`).
+
+```python
+import mlx.core as mx
+from mlx_lm import load
+from mlx_lm.tuner.trainer import TrainingArgs, train
+from mlx_train_perf.adapters.mlx_lm import make_loss_fn
+from mlx_train_perf.attention import enable_flash_attention
+
+model, tokenizer = load("mlx-community/Qwen3-8B-4bit")
+model.set_dtype(mx.bfloat16)  # 4-bit checkpoints compute in fp16; the kernels need bf16/fp32
+# ... freeze the base model and apply linear_to_lora_layers as in a normal mlx-lm LoRA run ...
+
+args = TrainingArgs(batch_size=1, max_seq_length=8192, grad_checkpoint=True, iters=600)
+enable_flash_attention(model, seq_len=8192, batch_size=1)
+
+train(model=model, optimizer=opt, train_dataset=ds, args=args,
+      loss=make_loss_fn(model, impl="auto"))
+```
+
+Two independent levers sit in those last three lines. `enable_flash_attention` swaps each layer's attention for the O(N) path, which is what moves the ceiling. `make_loss_fn` routes the loss through the fused kernel and frees the logit buffer on top of that. Either one works without the other.
+
+The elisions above are the parts of a stock mlx-lm LoRA run that do not change. [`examples/finetune_long_context.py`](https://github.com/IonDen/mlx-train-perf/blob/main/examples/finetune_long_context.py) is the same thing with nothing left out: argument parsing, dataset loading, the freeze and adapter setup, and adapter saving. Run it as is.
+
+One trap worth knowing: `enable_flash_attention` replaces each layer's attention in place and there is no undo. Load a fresh copy of the model for inference, because the training-configured object raises `AttentionInputError` as soon as a KV cache appears.
+
+On a 16 GB machine this shape does not fit. Ask the planner what does, rather than finding out three minutes into a run.
+
+### Thousands of short examples, and a run that crawls
+
+Alpaca averages 84 tokens per example under Qwen3's chat template, and mlx-lm's trainer runs one step per batch of them. On an 8B model at batch 1 that step takes 2.5 s to carry 84 real tokens. Packing fills the row to 4,096 tokens with whole examples instead, and the step then takes 40.4 s to carry about 4,000 — roughly 48 times the tokens for 16 times the wall clock. The difference is fixed per-step cost that a short batch pays in full, and a packed row pays once.
+
+```python
+import functools
+from mlx_train_perf.adapters.mlx_lm import make_packed_loss_fn
+from mlx_train_perf.data.packing import packed_iterate_batches
+
+enable_flash_attention(model, seq_len=4096, batch_size=1, packed=True)
+args = TrainingArgs(batch_size=1, max_seq_length=4096, grad_checkpoint=True, iters=600)
+
+train(model=model, optimizer=opt, train_dataset=ds, args=args,
+      loss=make_packed_loss_fn(model),
+      iterate_batches=functools.partial(
+          packed_iterate_batches,
+          max_position_embeddings=model.args.max_position_embeddings,
+      ))
+```
+
+Measured on Qwen3-8B-4bit: 33.1 real tokens per second unpacked against 99.2 packed, a factor of 3.00 (`scripts/bench_packed_training.py`). Dataset items are `(tokens, offset)` pairs, where the offset is the prompt length. The gain comes from amortizing the fixed step cost, so it shrinks as your examples get longer and disappears once they already fill a row. [Sequence packing](#sequence-packing) has the conservative steady-state range and the full recipe.
+
+### You do not know whether any of it will fit
+
+```bash
+mlx-train-perf plan --config ./Qwen3-8B-4bit/config.json --batch 1 --lora-rank 8 \
+    --attention flash --max-seq
+```
+
+The alternative is a 16 GB download and an out-of-memory crash three minutes into training. This loads no weights and spends no GPU time. It reads the config, prices the run against your machine's memory, and hands back the longest sequence that fits. Ask about one specific config with `--seq-len` instead and it answers fits or does not fit, with the peak it predicted. The estimate leans toward over-predicting, which is the safe direction for a tool whose job is keeping you off the cliff.
+
+## If you maintain a trainer
+
+The two kernels are usable without `mlx_lm` and without this project's adapter. `mlx` is the
+only runtime dependency; `mlx-lm` is an optional extra that exists solely for the adapter and
+the `enable_flash_attention` wrapper.
+
+```python
+from mlx_train_perf import linear_cross_entropy, DenseHead, QuantizedHead
+from mlx_train_perf.attention import flash_attention
+
+# Loss: hidden states in, scalar out, no (N, V) tensor in between.
+loss = linear_cross_entropy(hidden, head, targets, impl="auto", reduction="mean")
+
+# Attention: a drop-in for mx.fast.scaled_dot_product_attention on the training path.
+out = flash_attention(q, k, v, scale=scale, causal=True)
+```
+
+`head` is a `DenseHead`, a `QuantizedHead`, or a tied embedding via `tied_head(...)`. `q`/`k`/`v`
+are `(B, H, N, D)` with `head_dim` in {64, 96, 128} and grouped-query heads mapped contiguously,
+matching `mx.fast.scaled_dot_product_attention`'s own convention. Pass `segments=PackedMask(...)`
+for block-diagonal packing.
+
+What you are signing up for, stated plainly:
+
+- **In-place mutation.** `enable_flash_attention(model)` swaps attention on a live model object
+  and has no undo. `flash_attention` itself is a pure function and mutates nothing, so if you
+  own your model code, call it directly and skip the wrapper.
+- **Training only.** Both refuse a KV cache. Reload the model for inference.
+- **Typed refusals, never silent fallbacks.** An unsupported architecture, head dim, dtype or
+  mask raises at enable time or on the first call, naming the reason.
+- **The mlx pin is a policy, not neglect.** `mlx>=0.32.0,<0.33` is narrow because the kernels'
+  JIT contract is re-verified against each mlx release before the range widens, rather than
+  assumed forward-compatible.
+- **Calibration is one-time and host-synced.** Warm it at your training shape before a compiled
+  step traces, or accept a single in-trace stall on the first call.
+
+If your model family is not in the support list, open an issue and name it. The refusal list is
+a statement about what has been verified, not about what the kernels could cover.
+
+## The fused cross-entropy loss
 
 The idea is the same one behind [Cut Cross-Entropy](https://arxiv.org/abs/2411.09009) and [Liger-Kernel](https://github.com/linkedin/Liger-Kernel) on the CUDA side, ported to a Metal kernel: compute the cross-entropy loss and its gradient without ever building the full `(N, V)` logits tensor. For a large vocabulary that tensor is the single biggest allocation in the training step, and it is pure waste. You only need the per-token loss and a gradient back into the hidden states.
-
-Released on PyPI as `mlx-train-perf`. Every number below has a committed script under `scripts/` that reproduces it, all measured on one M1 Max (32 GB, macOS 26.5). The loss-layer figures were taken on mlx 0.31.2 and reproduce on the pinned 0.32.0; the flash-attention memory figures were taken on 0.32.0 in 0.2.0, and the 0.3.0 context-ceiling figures on 0.32.0.
-
-## The problem it solves
 
 Standard cross-entropy in a trainer materializes logits of shape `(batch·seq, vocab)`. At Qwen3-8B's vocabulary (151,936) and a 2048-token sequence, that is a 0.6 GB tensor in bf16, plus another for the softmax gradient in the backward pass. The fused kernel never allocates it: the forward regenerates logits in registers tile-by-tile over the vocabulary and returns three `N`-length arrays (the per-token NLL, the log-sum-exp, and the target logit); the backward recomputes the needed tiles instead of reading a stored matrix.
 
@@ -40,17 +207,17 @@ On Qwen3-8B-4bit (LoRA rank 8, batch 1, gradient checkpointing on, bf16) the two
 
 (`scripts/bench_train_step.py`; M1 Max 32 GB, macOS 26.5, mlx 0.32.0. These memory and throughput figures are the 0.2.0 measurements, carried into 0.3.0 unchanged: 0.3.0 changed how the backward splits its kernel launches, not what it allocates, and the 0.3.0 context sweep below — measured fresh — confirms the flash path's memory still scales linearly in sequence length.)
 
-The 32 GB machine that peaked near its ceiling with stock attention now runs the same step at half the memory. That is real headroom: a longer sequence, or a second job on the GPU.
+The 32 GB machine that peaked near its ceiling with stock attention now runs the same step at half the memory. That headroom buys a longer sequence.
 
-The attention op itself, timed alone at the flagship shape (batch 1, 32 query / 8 KV heads, 8192 tokens, head_dim 128), is 0.186 s on the forward and 0.576 s on the full backward, 3.1× the forward (`scripts/bench_attention_op.py`). As the sequence doubles, the flash op's peak grows about 2.00× (2048→4096) and about 3.06× (4096→8192). The second step is above 2× because the chained backward split adds a small, budget-bounded constant of at most ~0.3 GB, not because the O(N) growth law changed. Stock attention over the same doublings grows 3.76× then 3.05×, and that last figure is flattered by paging: at 8192 the stock op allocates about 32.4 GB on a 32 GB machine and its wall time degrades roughly 41× as it pages, which puts the single flash op about 45× below stock there. Those stock figures are a pre-net measurement of the exact hazard the safety net now prevents. They were taken before the memory watchdog shipped, and on a 32 GB machine `scripts/bench_attention_op.py` now aborts that condition by design (`aborted_memory_ceiling`) rather than paging into it. The flash-side numbers all reproduce. Flash is not universally cheaper, though — below about 2100 tokens the stock op's simpler bookkeeping wins, and the two curves cross there. The win is at real training context, not tiny shapes. (At 16384 the flash op now runs rather than refusing, since the launch guard no longer caps the chain; stock attention still cannot reach that context on 32 GB.)
+The attention op timed alone at the flagship shape (batch 1, 32 query / 8 KV heads, 8192 tokens, head_dim 128) is 0.186 s forward and 0.576 s backward (`scripts/bench_attention_op.py`). Its peak grows 2.00× from 2,048 to 4,096 tokens and 3.06× from 4,096 to 8,192; the second step is above 2× because the chained backward split adds a bounded constant of at most ~0.3 GB, not because the O(N) growth law changed. Stock attention grows 3.76× then 3.05× over the same doublings, from a far higher base. Flash is not universally cheaper: below about 2,100 tokens the stock op's simpler bookkeeping wins, and the two curves cross there. [When the bottleneck moved](https://ineshin.space/papers/when-the-bottleneck-moved/) has the full measurement, including what stock attention does on a 32 GB machine once it starts paging.
 
 ### What it costs in throughput
 
-Turning flash attention on is not free. On the stock-loss path at 8192 it costs 5.3% of tokens/sec (74.0 vs 78.1); at 2048 the cost is 5.5% on the fused-loss path (86.4 vs 91.5) and 5.9% on the stock-loss path (92.1 vs 97.8). The fused-loss comparison at 8192 has no stock-attention number to pair with: on this 32 GB machine that baseline condition crosses the memory safety net's ceiling and records an abort instead of a number. That baseline running out of room is the problem flash attention exists to remove. Under flash attention the fused cross-entropy and mlx-lm's stock cross-entropy stay close: 0.94× at 2048 (86.4 vs 92.1 tok/s) and 0.99× at 8192 on Qwen3-8B, 0.92× and 0.97× on Llama-3.2-3B. The loss values match to bf16 tolerance throughout — the worst per-step difference across every measured pair is 2.4e-3. The worst attention-arm throughput ratio measured is 0.94× stock; 0.85× is the maintainer's release acceptance bar for that path, provisional and pinned at the PR.
+Turning flash attention on is not free. On the stock-loss path at 8192 it costs 5.3% of tokens/sec (74.0 vs 78.1); at 2048 the cost is 5.5% on the fused-loss path (86.4 vs 91.5) and 5.9% on the stock-loss path (92.1 vs 97.8). The fused-loss comparison at 8192 has no stock-attention number to pair with: on this 32 GB machine that baseline condition crosses the memory safety net's ceiling and records an abort instead of a number. That baseline running out of room is the problem flash attention exists to remove. Under flash attention the fused cross-entropy and mlx-lm's stock cross-entropy stay close: 0.94× at 2048 (86.4 vs 92.1 tok/s) and 0.99× at 8192 on Qwen3-8B, 0.92× and 0.97× on Llama-3.2-3B. The loss values match to bf16 tolerance throughout — the worst per-step difference across every measured pair is 2.4e-3. The worst attention-arm throughput ratio measured is 0.94× stock.
 
 ### What it changes: the context ceiling on 32 GB
 
-0.2.0 shipped this path with a caveat — it halved the memory but did not extend the longest sequence you could train, because a launch-safety budget capped it before memory did. That cap turned out to be guarding the wrong thing. Re-reading how mlx schedules Metal work, and re-running the crash that motivated the budget, showed the GPU watchdog acts on a single command buffer, not on a chain of them, and at training shapes each backward dispatch already runs in its own buffer. 0.3.0 replaces the per-chain budget with a per-buffer one that models what the scheduler actually commits. No safety margin moved; what changed is what the margin is measured against. (`scripts/probe_command_buffer_packing.py` reproduces the evidence.)
+0.2.0 shipped this path with a launch-safety budget that capped context before memory did. That budget turned out to be guarding the wrong unit: the GPU watchdog acts on a single Metal command buffer, not a chain of them, and 0.3.0 measures the margin against the right thing (`scripts/probe_command_buffer_packing.py`; the reasoning is in [How MLX packs Metal command buffers](https://ineshin.space/papers/how-mlx-packs-metal-command-buffers/)).
 
 With that cap gone, the flash path is bound by memory, the same thing that bounds stock attention — and it needs far less of it. Measured the same day with the same search (`scripts/northstar_context_sweep.py`, Qwen3-8B-4bit QLoRA, gradient checkpointing, bf16):
 
@@ -86,7 +253,7 @@ Call it in place on a loaded model, after you set the compute dtype and before y
 
 ## Sequence packing
 
-New in 0.4.0 and opt-in. Instruction-tuning datasets are short and ragged: Alpaca under Qwen3's chat template averages 84 tokens per example, and mlx-lm's trainer runs one step per batch of them. At batch size 1 on an 8B model, a compiled training step costs about 2 to 2.5 seconds whether it carries 84 tokens or 4,096 — the fixed per-step cost dominates and the GPU idles. Packing concatenates many sequences into fixed 4,096-token rows so every step runs at full-context efficiency. A block-diagonal attention mask keeps the sequences independent: a token attends another only when both belong to the same original sequence, enforced inside the flash Metal kernels by a per-token segment id rather than a materialized mask (the mask tensor an `(N, N)` approach would need is exactly the quadratic allocation this library exists to avoid).
+New in 0.4.0 and opt-in. Packing concatenates many short sequences into fixed 4,096-token rows so every step runs at full-context efficiency, as the worked example above describes. A block-diagonal attention mask keeps the sequences independent: a token attends another only when both belong to the same original sequence, enforced inside the flash Metal kernels by a per-token segment id rather than a materialized mask (the mask tensor an `(N, N)` approach would need is exactly the quadratic allocation this library exists to avoid).
 
 Loss masking reproduces mlx-lm's unpacked semantics segment by segment, so the supervised token set is identical to an unpacked run. Three sequences packed into one row produce the same token count and a loss within measured bf16 tolerance of the same three run unpacked: worst difference 5.0e-4 against a 2e-2 pin sized from measured RoPE offset drift (`tests/test_adapter_packed.py`). Cross-sequence contamination is tested by construction: deliberately dropping the segment mask in the test suite moves the loss by 0.11, well past the pin.
 
@@ -134,37 +301,6 @@ train(
 ```
 
 `packed_iterate_batches` re-packs each epoch with a fresh shuffle and hands the trainer fixed-shape batches; `make_packed_loss_fn` walks the model's layers itself to thread the segment mask (the stock model call hardcodes a causal mask) and refuses at construction if `enable_flash_attention` has not run. Pass `packed=True` with `seq_len` equal to your pack length and `batch_size` equal to your training batch: the calibration caches key on the exact batch size and sequence bucket, so matching hints keep the one-time kernel timing probes in the controlled window before `mx.compile` traces the step. The pack length must not exceed the model's trained context — packed sequences keep their relative positions, and the row as a whole runs at absolute positions up to the pack length.
-
-## Install
-
-```bash
-pip install mlx-train-perf            # the loss kernel + planner
-pip install "mlx-train-perf[mlx-lm]"  # plus the mlx-lm training adapter
-```
-
-Apple Silicon only. Requires mlx >=0.32.0,<0.33 — the version the kernels' JIT contract is verified against. The mlx-lm adapter and the flash-attention wrapper need the optional `mlx-lm` extra.
-
-## Use it in an mlx-lm fine-tune
-
-The adapter builds a loss callable with the same signature `mlx_lm`'s trainer expects, so you pass it straight to `train(...)`. `enable_flash_attention` is the second, independent lever — turn on either, both, or neither:
-
-```python
-import mlx.core as mx
-from mlx_lm import load
-from mlx_lm.tuner.trainer import train
-from mlx_train_perf.adapters.mlx_lm import make_loss_fn
-from mlx_train_perf.attention import enable_flash_attention
-
-model, tokenizer = load("mlx-community/Qwen3-8B-4bit")
-model.set_dtype(mx.bfloat16)  # 4-bit checkpoints compute in fp16; the kernels need bf16/fp32
-# ... freeze the base model and apply linear_to_lora_layers as in a normal mlx-lm LoRA run ...
-
-enable_flash_attention(model, seq_len=8192, batch_size=1)  # O(N) attention backward
-loss_fn = make_loss_fn(model, impl="auto")                 # logit-free cross-entropy
-train(model=model, optimizer=opt, train_dataset=ds, args=args, loss=loss_fn)
-```
-
-`make_loss_fn` splits the model into its trunk and its output head and routes the loss through the fused kernel; `enable_flash_attention` swaps each layer's attention for the flash path in place.
 
 ## Implementations
 
@@ -249,22 +385,26 @@ The guard sets an active-memory ceiling from the machine's own RAM. It is anchor
 
 The guard is rank-local: every input it reads is this node's own RAM, availability, and process memory. On a multi-node `mx.distributed` job each rank sizes its own ceiling and flags its own crowding, and a breach hard-exits that rank — so run distributed training under a launcher (`mpirun` or `mlx.launch`) that propagates a rank failure to the whole job.
 
-The incident that motivated this guard, and what the watchdog does and does not cover, is documented in [When an MLX memory cap is not a safety boundary](https://github.com/IonDen/mlx-train-perf/blob/main/docs/papers/when-an-mlx-memory-cap-is-not-a-safety-boundary.md).
+The incident that motivated this guard, and what the watchdog does and does not cover, is documented in [When an MLX memory cap is not a safety boundary](https://ineshin.space/papers/when-an-mlx-memory-cap-is-not-a-safety-boundary/).
 
 ## Research
 
-- [Fused linear cross-entropy on Apple GPUs](https://github.com/IonDen/mlx-train-perf/blob/main/docs/papers/fused-linear-cross-entropy-apple-gpus.md)
+Four write-ups cover the work behind this library in more depth than a README can, including the
+measurements that went the wrong way. They are published at [ineshin.space](https://ineshin.space)
+alongside the rest of my Apple Silicon work, and the source Markdown lives under `docs/papers/`.
+
+- [Fused linear cross-entropy on Apple GPUs](https://ineshin.space/papers/fused-linear-cross-entropy-apple-gpus/)
   explains how vocabulary chunking and a fused Metal kernel avoid materializing logits. It covers
   memory costs, the optimization ladder, failed performance models, and the limits of the evidence.
-- [When the bottleneck moved: from fused cross-entropy to FlashAttention on MLX](https://github.com/IonDen/mlx-train-perf/blob/main/docs/papers/when-the-bottleneck-moved.md)
+- [When the bottleneck moved: from fused cross-entropy to FlashAttention on MLX](https://ineshin.space/papers/when-the-bottleneck-moved/)
   explains why removing the logits matrix did not extend context once attention backward set the
   peak. It also covers the command-buffer correction that removed a false launch limit, while
   separating source-reported measurements from claims the available controls cannot support.
-- [How MLX packs Metal command buffers](https://github.com/IonDen/mlx-train-perf/blob/main/docs/papers/how-mlx-packs-metal-command-buffers.md)
+- [How MLX packs Metal command buffers](https://ineshin.space/papers/how-mlx-packs-metal-command-buffers/)
   explains the operation and element thresholds that MLX 0.32.0 uses to commit Metal work. It applies
   them to tiled attention, then explains why a whole-chain launch budget rejected valid work. The
   macOS watchdog mechanism remains an inference.
-- [When an MLX memory cap is not a safety boundary](https://github.com/IonDen/mlx-train-perf/blob/main/docs/papers/when-an-mlx-memory-cap-is-not-a-safety-boundary.md)
+- [When an MLX memory cap is not a safety boundary](https://ineshin.space/papers/when-an-mlx-memory-cap-is-not-a-safety-boundary/)
   reports the kernel-panic incident behind the memory guard: a wired limit that caps residency
   without rejecting allocation, an advisory soft limit, and the active-memory watchdog added as a
   third layer. It separates the observed record from reconstruction and keeps the panic-trigger

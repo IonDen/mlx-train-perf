@@ -1,4 +1,4 @@
-"""Ground-truth experiment (mlx-train-perf-0008, Task 16b Step 1): does
+"""Ground-truth experiment: does
 `mx.fast.metal_kernel`'s `atomic_outputs=True` float add work correctly under the JIT, and
 what does it cost against a split-K-style partials buffer + reduction (steel's pattern),
 at a shape representative of the fused backward kernel's `d_w = P^T @ H` cross-row-block
@@ -104,7 +104,7 @@ _PARTIALS_SOURCE = """
 def script_sha() -> str:
     """Fingerprint of THIS script's own bytes. `run_identity`'s `CODE_SHA_DEPS` is the
     bench harness's own dependency list and deliberately excludes ad hoc experiment
-    scripts (per the task brief) -- this is a separate identity field so an edit to this
+    scripts -- this is a separate identity field so an edit to this
     script still invalidates its own prior artifacts, without touching that list."""
     return hashlib.sha256(_SCRIPT_PATH.read_bytes()).hexdigest()[:16]
 
@@ -138,7 +138,7 @@ def resolve_shape(
 ) -> tuple[int, int, int]:
     """Pure CLI-defaulting logic: `--correctness` defaults to a tiny shape (well under a
     second of GPU time even with full cross-row-block contention on every element);
-    `--cost` defaults to the representative d_w accumulation shape from the task brief
+    `--cost` defaults to the representative d_w accumulation shape
     (tile=2048, d=4096, 16 partials/splits). An explicitly passed value always wins over
     the mode's default."""
     defaults = _CORRECTNESS_DEFAULTS if mode == "correctness" else _COST_DEFAULTS
@@ -224,7 +224,7 @@ def check_correctness(
     reference. The partials-buffer path (no atomics -- the known-correct oracle) is
     expected to pass unconditionally; `atomic_outputs` is wrapped in a broad `except`
     because a JIT compile failure or a wrong numeric result IS a valid verdict for THIS
-    experiment (the task brief: "don't fight it"), not a bug to propagate as a crash."""
+    experiment ("don't fight it"), not a bug to propagate as a crash."""
     n_elem = tile * d
     if not fits_float32_exact(n_elem=n_elem, row_blocks=row_blocks):
         raise ValueError(

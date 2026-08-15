@@ -203,7 +203,7 @@ def _flash_attention_packed(
     """The PACKED (`segments`) branch of `flash_attention`: a 5-primal custom_function
     `_core(q, k, v, seg_id, seg_start)` so the two int32 segment buffers are custom_function
     PRIMALS -- threaded and re-read every step, never closure captures. A captured layout would
-    freeze into a compiled trace (spec 8.3 / review F2, the residual-`L` footgun this module's
+    freeze into a compiled trace (the residual-`L` footgun this module's
     docstring documents), so the forward AND backward read the seg PRIMALS (`seg_id_`/
     `seg_start_`), never this function's closure args -- a re-fed layout masks fresh.
 

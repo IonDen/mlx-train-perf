@@ -230,7 +230,7 @@ def _attention_bytes(cfg: TrainConfig, shape: ModelShape, calib: Calibration) ->
 
     FLASH (0.2.0 opt-in): the analytic O(N.D) saved state (`_flash_saved_state_bytes`) plus
     a fitted LINEAR live-transient term `a_flash * batch * heads * seq`. Driver form settled
-    from the T13 single-op scaling (linear growth; the split-regime steepening folded into
+    from the single-op scaling measurements (linear growth; the split-regime steepening folded into
     the coefficient, over-predict-safe). bf16-calibrated (dtype folded into a_flash).
     Validated against measured Qwen3-8B-4bit anchors up to seq 12288 (0.5.0 refit, both
     loss impls, envelope fit -- one coefficient covers the worst measured arm, so the

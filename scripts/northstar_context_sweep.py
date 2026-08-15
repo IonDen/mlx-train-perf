@@ -117,7 +117,7 @@ def build_probe(
     # dominate and both arms OOM together long before the loss layer matters. The sweep
     # MEASURES both arms' ceilings; it does not presume ours is higher (measured
     # 2026-07-08: the O(N^2) attention backward binds both arms, ceilings tied ~8.5k).
-    # `attention_impl` is FORCED per arm, not a free flag (architect ruling): `ours`
+    # `attention_impl` is FORCED per arm, not a free flag: `ours`
     # measures the whole product story (flash attention + kernel loss) against `stock`
     # (stock attention + stock loss) -- a free global flag would permit the nonsensical
     # ours-with-stock-attention combination. This edit changes `script_sha()`, which

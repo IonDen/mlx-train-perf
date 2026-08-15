@@ -5,11 +5,15 @@ build-backend = "hatchling.build"
 [project]
 name = "mlx-train-perf"
 dynamic = ["version"]
-description = "Fused, logit-free linear-cross-entropy loss, RAM-fit planner, and benchmark harness for MLX fine-tuning on Apple Silicon"
+description = "Train longer sequences on your Mac: O(N)-memory attention, logit-free cross-entropy, and sequence packing for MLX LoRA fine-tuning"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
 authors = [{ name = "Denis Ineshin", email = "denis.ineshin@gmail.com" }]
+keywords = [
+    "mlx", "apple-silicon", "lora", "qlora", "fine-tuning", "flash-attention",
+    "metal", "cross-entropy", "long-context", "sequence-packing", "llm-training",
+]
 dependencies = ["mlx>=0.32.0,<0.33"]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -19,6 +23,12 @@ classifiers = [
     "Operating System :: MacOS",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
+
+[project.urls]
+Homepage = "https://github.com/IonDen/mlx-train-perf"
+Repository = "https://github.com/IonDen/mlx-train-perf"
+Changelog = "https://github.com/IonDen/mlx-train-perf/blob/main/CHANGELOG.md"
+Issues = "https://github.com/IonDen/mlx-train-perf/issues"
 
 [project.optional-dependencies]
 # transformers>=5.13 breaks `import mlx_lm` outright: mlx_lm/tokenizer_utils.py:505 calls
@@ -44,6 +54,7 @@ include = [
     "/src",
     "/tests",
     "/scripts",
+    "/examples",
     "/.github",
     "/README.md",
     "/CHANGELOG.md",

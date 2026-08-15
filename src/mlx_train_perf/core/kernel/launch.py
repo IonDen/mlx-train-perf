@@ -125,7 +125,7 @@ def backward_dhidden(
     tile: int,
     rate_macs_per_s: float | None,
 ) -> mx.array:
-    """d_hidden-only backward (Task 16b step 2, v0-correct — frozen/QLoRA head path).
+    """d_hidden-only backward (v0-correct — frozen/QLoRA head path).
 
     d_hidden = cotangent * sum_j (P_ij - onehot(j == targets_i)) * w_j, with P_ij
     regenerated tile-wise from the SAVED lse residual (never recomputed) — see
@@ -192,7 +192,7 @@ def backward_dhidden_mma(
     tile: int,
     rate_macs_per_s: float | None,
 ) -> mx.array:
-    """d_hidden-only backward via the fused two-GEMM MMA kernel (Task 16b step 4 — the
+    """d_hidden-only backward via the fused two-GEMM MMA kernel (the
     frozen/QLoRA-head PERF rung).
 
     Drop-in replacement for `backward_dhidden`: same math, same
@@ -261,7 +261,7 @@ def backward_dw(
     tile: int,
     rate_macs_per_s: float | None,
 ) -> mx.array:
-    """d_w (trainable-head) backward (Task 16b step 3, v0-correct).
+    """d_w (trainable-head) backward (v0-correct).
 
     d_w[j,:] = sum_i (P_ij - onehot(j == targets_i)) * cotangent_i * hidden_i,:, with
     P_ij regenerated tile-wise from the SAVED lse residual (never recomputed) — see
@@ -270,7 +270,7 @@ def backward_dw(
 
     Cross-ROW-BLOCK accumulation (many context-row chunks contending on the same d_w
     column slice) is the ONE mechanism d_w needs that d_hidden doesn't — ground-truthed
-    correct in Task 16b step 1 (scripts/ground_truth_atomic_outputs.py) via
+    correct by the ground-truth experiment (scripts/ground_truth_atomic_outputs.py) via
     `atomic_outputs=True` + `atomic_fetch_add_explicit` on a native Metal
     `device atomic<float>*` output. This makes the result BIT-LEVEL NON-DETERMINISTIC
     run to run (atomics reorder float additions) — see

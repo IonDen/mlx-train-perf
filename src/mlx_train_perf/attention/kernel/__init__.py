@@ -1,4 +1,4 @@
-"""Flash-attention FORWARD Metal kernel v0 (O + L), correctness-only (0.2.0 T5).
+"""Flash-attention FORWARD Metal kernel v0 (O + L), correctness-only.
 
 `source.build_fwd_source` is the sentinel-templated MSL builder; `launch.launch_flash_fwd`
 is the query-range multi-dispatch driver (splits over disjoint query-row ranges, full

@@ -4,6 +4,47 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.1] - 2026-08-16
+
+Documentation. No functional change: `src/` is touched only in docstrings, the test suite is
+unchanged, and every number in the README is the one 0.5.0 measured, from the same committed
+script.
+
+The README used to open with the mechanism, so a reader had to already know what Cut
+Cross-Entropy was to work out whether any of this applied to them. It now opens with the problem
+in mlx-lm's own words. Its LoRA guide tells you to break your examples into smaller sequences
+when a run does not fit, and its trainer truncates anything past `max_seq_length` with a warning
+suggesting you pre-split your data. Making that unnecessary is what this library is for.
+
+### Added
+- A "Does this help me?" table mapping symptoms to answers, including the cases where the answer
+  is no: runs that already fit at the 2048 default, memory that grows across iterations rather
+  than within a step, unsupported architectures, and inference.
+- Three worked situations, and `examples/finetune_long_context.py` — a complete, runnable LoRA
+  fine-tune with nothing elided, for the reader who wants to copy a file rather than assemble
+  one from fragments.
+- A section for maintainers of other trainers: the two framework-agnostic entry points
+  (`linear_cross_entropy`, `flash_attention`), what integrating them commits you to, and the
+  fact that `mlx` is the only runtime dependency.
+- A diagram of where a training step's memory goes at 8,192 tokens, against what a 32 GB machine
+  can actually use.
+- PyPI metadata that was missing: keywords, and project URLs for the repository, issues and
+  changelog.
+
+### Changed
+- The package description no longer leads with the kernel. It leads with what the kernel buys.
+- Install moved near the top, and says plainly that there is no flag to add to `mlx_lm.lora`.
+- The four write-ups now link to their published home on <https://ineshin.space>.
+- Docstrings across `src/` and `scripts/` no longer cite internal task or item numbers, which
+  meant nothing to anyone reading them through `help()`.
+
+### Fixed
+- The sequence-packing section claimed a training step "costs about 2 to 2.5 seconds whether it
+  carries 84 tokens or 4,096". It does not: at batch 1 on Qwen3-8B-4bit, 84 real tokens take
+  2.5 s and about 4,000 take 40.4 s. The point the sentence was reaching for survives — a large
+  fixed per-step cost is paid either way, which is why packing wins — but the number was wrong
+  and is now the measured pair.
+
 ## [0.5.0] - 2026-07-23
 
 Bounds the packed dK/dV backward kernel's query walk at each key block's segment end,

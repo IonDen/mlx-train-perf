@@ -1,4 +1,4 @@
-"""Gate A for the 0.4.0 sequence-packing cycle (spec §9 a/b/d): kernel feasibility
+"""Gate A for the 0.4.0 sequence-packing cycle: kernel feasibility
 measurements for the PACKED flash-attention variants.
 
 Phases (each writes `_artifacts/gate_packed/<phase>.json` the moment it finishes and is

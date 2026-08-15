@@ -172,9 +172,9 @@ def _prewarm_rate_caches(
 ) -> None:
     """Warm `flash_attention`'s three kernel rate caches (forward + backward dQ + backward
     dK/dV) at the shape a training forward will hit, so a subsequently compiled `train()`
-    traces with warm caches (no host-sync inside the compiled region -- the T5-review
-    contract). ONE untraced forward call is sufficient: all three `calibrated_*_rate` probes
-    run in `flash_attention`'s Python body at construction time, keyed by
+    traces with warm caches (no host-sync inside the compiled region). ONE untraced forward
+    call is sufficient: all three `calibrated_*_rate` probes run in `flash_attention`'s
+    Python body at construction time, keyed by
     `(head_dim, dtype, causal, batch, n_heads, n-bucket, variant, d_slab, packed)`, before the
     kernel even dispatches. Inputs are zeros (values are irrelevant to a timing probe and touch
     no global RNG); the dtype is the model's compute dtype, read off a floating trunk norm
