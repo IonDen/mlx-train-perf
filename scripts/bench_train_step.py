@@ -31,7 +31,7 @@ way `tests/test_adapter.py`'s own `@pytest.mark.smoke` test is: see
 skipped by default, never executed without `--run-smoke` and a pre-downloaded model).
 
 Heavy GPU run at production shape -- main session only, ETA ~30-60 min total for the
-brief's own matrix (20 steps/condition, per the task brief's step-2 budget), serialized
+the release matrix (20 steps/condition), serialized
 across conditions (subprocess-per-condition already enforces this). Pre-flight
 `memory_pressure` before running; never invoke a production-shape or `--smoke`
 condition from an agent session -- `--smoke` still loads a real (if small) model.

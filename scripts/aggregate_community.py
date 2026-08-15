@@ -1,5 +1,5 @@
 """Fold submitted `community-benchmarks/*.json` artifacts into the README's community
-table (backlog 0015, spec §7). Pure extraction + exact-markdown rendering -- the
+table. Pure extraction + exact-markdown rendering -- the
 maintainer runs this after merging a contributor's artifact PR and pastes the table into
 the README's community section.
 

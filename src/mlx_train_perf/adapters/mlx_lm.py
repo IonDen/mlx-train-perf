@@ -240,7 +240,7 @@ def make_packed_loss_fn(
     (`Qwen3Model.__call__`) are all exactly that shape, with no extra scaling; the three
     families share `embed_tokens`/`layers`/`norm` (same gate as `make_loss_fn`). The walk
     stays grad-checkpointed: `grad_checkpoint` patches `type(layer).__call__` at class level,
-    so direct block calls dispatch through the patched method (spec §3.2).
+    so direct block calls dispatch through the patched method.
 
     Fails fast at CONSTRUCTION (`AdapterError`): an unsupported architecture or missing
     `mlx-lm` (via `split_model`), and -- because only the `FlashAttentionWrapper` can

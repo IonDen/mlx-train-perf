@@ -167,7 +167,7 @@ _DIVERGENCE_WARN_FRACTION = 0.75
 
 def memory_ceiling_bytes(memory_size: int, *, headroom_gb: int = 4) -> int:
     """Pure STATIC device-relative active-memory ceiling the watchdog fails against,
-    anchored at the 32 GB machine class (T15-style anchored-proportional; see the module
+    anchored at the 32 GB machine class (anchored-proportional; see the module
     docstring's two-term model). Off PHYSICAL `memory_size`
     (`mx.device_info()["memory_size"]`), not the recommended working set, because the
     storm class allocates PAST physical RAM.

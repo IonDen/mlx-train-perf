@@ -2,6 +2,12 @@
 
 ## Released
 
+### 0.5.1 - 2026-08-16
+- Documentation. The README now opens with the problem this solves rather than the kernel
+  that solves it, answers "does this help me?" in a table that includes the cases where it
+  does not, and works through three real situations from the command you run today to a
+  measured result. No functional change.
+
 ### 0.5.0 - 2026-07-23
 - Packed dK/dV block skipping. The packed backward kernel now bounds its query walk at
   each key block's segment end instead of masking cross-segment work per element.

@@ -6,7 +6,7 @@ need doubled): `HEAD_DIM` is substituted with the compile-time head dimension (f
 per-thread `qreg`/`acc` array sizes and the D-loop bounds), and `KEEP_CMP` is the per-key
 causal keep predicate.
 
-v0 design (deliberately slow, speed is T6's job):
+v0 design (deliberately slow; the KV-block kernels are where speed comes from):
 - ONE thread per query row -- no simdgroup cooperation, no `simdgroup_matrix`. Each thread
   runs the full online-softmax recurrence over the keys for its row, holding `m`/`l`/`acc`
   in fp32 registers (`alpha = exp(m_old - m_new)` rescale; `L = m + log(l)` at the end) --
@@ -14,8 +14,8 @@ v0 design (deliberately slow, speed is T6's job):
   simplest form to verify.
 - Causal is a per-key keep predicate applied BEFORE the key touches the running max
   (`KEEP_CMP`, normally `kk <= row`), so the diagonal is masked before rowmax and every
-  key above the diagonal contributes nothing -- the spec's "diagonal masked before rowmax"
-  specialized to Bk=1. (T6 turns this into KV-block loop bounds + in-tile masking.)
+  key above the diagonal contributes nothing: "diagonal masked before rowmax"
+  specialized to Bk=1. (The KV-block kernels turn this into loop bounds + in-tile masking.)
 - GQA `kv_head = q_head // group_size` is computed in-kernel from the q/k head counts;
   K/V are never expanded.
 - fp32 accumulators throughout; inputs read through the `T` template (bf16 or fp32) and

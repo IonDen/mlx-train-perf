@@ -12,7 +12,7 @@ produce the same jsonl. Heavy dependencies (`huggingface_hub`/`hf`, `pyarrow`,
 `transformers`) are imported lazily inside the functions that need them, so `--help` and
 the pure parsing/stats helpers stay importable (and unit-testable) without them.
 
-Run on the main session (T14), not an agent: the download touches the network and the
+Run on the main session, not an agent: the download touches the network and the
 tokenize pass loads a real tokenizer.
 """
 import argparse
@@ -130,7 +130,7 @@ def dataset_stats(
 def parse_download_path(stdout: str) -> Path:
     """The snapshot directory from `hf download`'s stdout. huggingface_hub 1.x prints the
     final line as `path=<dir>`; older CLIs printed the bare directory -- accept both.
-    (Found live in the T14 run: the raw `path=`-prefixed line used as a literal path made
+    (Found live in a real run: the raw `path=`-prefixed line used as a literal path made
     the parquet glob match nothing and the prep emit an empty jsonl.)"""
     lines = [line.strip() for line in stdout.strip().splitlines() if line.strip()]
     if not lines:

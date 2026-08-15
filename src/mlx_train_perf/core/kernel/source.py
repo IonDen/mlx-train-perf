@@ -600,8 +600,8 @@ _BACKWARD_DHIDDEN_MMA_TEMPLATE = (
 
 
 def build_backward_dhidden_mma_source(row_tiles: int) -> str:
-    """MSL function body for the fused two-GEMM d_hidden-only backward kernel (Task 16b
-    step 4). RT in {2, 4}, same row-block-sizing convention as `build_dense_source`; the
+    """MSL function body for the fused two-GEMM d_hidden-only backward kernel.
+    RT in {2, 4}, same row-block-sizing convention as `build_dense_source`; the
     logit-regeneration GEMM is reused verbatim from the forward (see the block comment above
     for the full derivation, the fragment layout, and the GEMM-B output-structure choice)."""
     if row_tiles not in (2, 4):

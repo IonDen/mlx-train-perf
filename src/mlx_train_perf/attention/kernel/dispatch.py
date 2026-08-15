@@ -1,10 +1,10 @@
-"""Forward-kernel tile/variant dispatch by (n, head_dim) -- encodes the persisted T6 ladder
+"""Forward-kernel tile/variant dispatch by (n, head_dim) -- encodes the persisted tile ladder
 artifacts under `_artifacts/attention_fwd_rungs/`, not prose memory (the `core/kernel/
 dispatch.py` convention: pick the table's winner from a committed artifact, never re-derive
 it from recollection).
 
 MEASURED is a SINGLE saturation-bucket data point: the flagship shape (b=1, Hq=32, Hkv=8,
-N=8192, D=128, bf16) is the only shape the T6 ladder ran the register-resident P@V MMA body
+N=8192, D=128, bf16) is the only shape the tile ladder ran the register-resident P@V MMA body
 (`source.build_fwd_mma_source`) at occupancy-saturated N. Four D-slab widths were compared at
 THAT one shape:
 

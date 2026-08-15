@@ -159,9 +159,9 @@ def condition_identity(
     `TypeError: got multiple values for keyword argument`; this raises a clean, named
     error instead.
 
-    `attention_impl`/`dkv_split_policy`/`attention_variant` (T10, 0.2.0, spec §8
-    amendment) are the same kind of dedicated, reserved identity input as `kind`/
-    `session_id` -- an attention-measuring condition (T11/T13) passes them explicitly so
+    `attention_impl`/`dkv_split_policy`/`attention_variant` (added in 0.2.0) are the same
+    kind of dedicated, reserved identity input as `kind`/`session_id` -- an
+    attention-measuring condition passes them explicitly so
     two conditions differing only in one of them get different identities; `params` may
     not also set them (rejected below, same collision-avoidance reasoning as `kind`/
     `session_id`). Each is OMITTED from the returned identity (not defaulted to `None`)

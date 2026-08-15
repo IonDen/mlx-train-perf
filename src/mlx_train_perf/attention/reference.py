@@ -1,7 +1,6 @@
 """Pure-MLX attention oracles: no Metal, no models.
 
-Two oracles that every later Metal-kernel attention parity test (T4-T13) compares
-against:
+Two oracles that every Metal-kernel attention parity test compares against:
 
 - `math_attention` -- the materialized reference: builds the full `(N, N)` score
   matrix, softmaxes it in fp32, and matmuls into V. MLX autodiff differentiates
@@ -13,17 +12,17 @@ against:
   saves to reconstruct the backward pass without re-materializing the full `(N, N)`
   matrix.
 
-GQA convention (T2-pinned, `tests/test_attention_composition.py
+GQA convention (pinned by `tests/test_attention_composition.py
 ::test_gqa_grouping_convention_matches_mlx`): query heads are grouped CONTIGUOUSLY, so
 kv head index = `q_head // group_size` -- matching
 `mx.fast.scaled_dot_product_attention`. K/V are never repeated or tiled; they are
 gathered per q-head through this mapping.
 
-Layouts (spec Section 4.1): q `(B, Hq, N, D)`, k/v `(B, Hkv, N, D)`, O `(B, Hq, N, D)`,
+Layouts: q `(B, Hq, N, D)`, k/v `(B, Hkv, N, D)`, O `(B, Hq, N, D)`,
 L `(B, Hq, N)` fp32. Softmax/logsumexp math runs in fp32 regardless of input dtype
 (upcast internally); O is cast back to the input dtype at the end. L always stays fp32.
 
-Packed sequences (0.4.0, spec 2026-07-17 §3.2/§3.3): `segments=None` on every public
+Packed sequences (added in 0.4.0): `segments=None` on every public
 function below is BYTE-IDENTICAL to pre-0.4.0 pure-causal behavior -- no regression for
 callers written before packing existed. `segments=PackedMask(...)` replaces the causal
 triangle with block-diagonal-causal isolation (`segment_allowed`): key j visible to
@@ -35,7 +34,7 @@ from mlx_train_perf.attention.segments import PackedMask, segment_allowed
 
 
 def kv_head_for(q_head: int, group_size: int) -> int:
-    """T2-pinned GQA convention: contiguous grouping, matching mx.fast.sdpa."""
+    """Pinned GQA convention: contiguous grouping, matching mx.fast.sdpa."""
     return q_head // group_size
 
 

@@ -1,4 +1,4 @@
-"""Single-op attention memory-scaling bench (spec §8/§10.6) -- the O(N) proof.
+"""Single-op attention memory-scaling bench -- the O(N) proof.
 
 Model-free: synthetic `(B=1, Hq, Hkv, N, D)` tensors, no `mlx_lm`/model load. Two `impl`
 arms, both measured at the SAME shape so the comparison is apples to apples:
@@ -8,7 +8,7 @@ arms, both measured at the SAME shape so the comparison is apples to apples:
            split rates). Expected O(N)-class memory growth: the `(N, N)` score/probability
            matrix is never materialized on either pass.
   stock -- `attention.reference.math_attention` under plain MLX autodiff -- the pure-MLX
-           O(N^2) oracle this release replaces (same measurement SHAPE as T2's moat check,
+           O(N^2) oracle this release replaces (same measurement SHAPE as the parity oracle's,
            `tests/test_attention_composition.py::
            test_sdpa_backward_is_still_quadratic_on_installed_mlx`, through OUR math
            reference rather than `mx.fast.scaled_dot_product_attention` since that upstream
@@ -31,10 +31,10 @@ median fwd+bwd wall minus median forward wall, and `bwd_over_fwd`) -- see
 fields, reproducible from this one script.
 
 The O(N) PROOF is `fwdbwd_peak_gb`'s doubling ratio across `--seq-lens`: flash should show
-~2x per doubling (O(N)-class), stock ~3.8x (the measured O(N^2) baseline, spec §8). That
+~2x per doubling (O(N)-class), stock ~3.8x (the measured O(N^2) baseline). That
 assertion is never made here against a real GPU number -- it lives in
 `compute_doubling_ratios`'s own unit test against SYNTHETIC artifacts
-(`tests/test_bench_attention_op.py`); the real numbers are T13's measurement campaign.
+(`tests/test_bench_attention_op.py`); the real numbers come from a full measurement campaign.
 
 subprocess-per-condition (workspace convention -- MLX's lazy allocator otherwise holds
 buffers across runs within one process): the top-level invocation
@@ -49,11 +49,11 @@ marker pinned to exactly that one `(impl, n)` pair -- resume-by-skip identical t
 already fresh is never spawned; a crashed/silently-exited subprocess gets its failure
 recorded as an `"error"` result on the ORCHESTRATOR's side, so one bad condition never
 aborts the rest of the grid). `--impl` defaults to both arms; each artifact carries the
-T10-extended identity (`attention_impl` -- see `bench.artifacts.condition_identity`), plus
+The extended identity (`attention_impl` -- see `bench.artifacts.condition_identity`), plus
 `impl`/`n`/`fwd_peak_gb`/`fwdbwd_peak_gb`/`wall_s` as top-level result fields.
 
 Every RUN this script performs in THIS task is a tiny synthetic shape (the `--run-benchmark`
-gated smoke, N=256) -- never a flagship dispatch. T13's campaign owns the real measurement
+gated smoke, N=256) -- never a flagship dispatch. A full campaign owns the real measurement
 run (main session, ETA-stated, AC power, serialized against other heavy runs).
 """
 import argparse

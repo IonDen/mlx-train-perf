@@ -7,8 +7,8 @@ any rate. Forward O/L rows are DISJOINT across query blocks, so the launcher loo
 query-row-range dispatches, each writing its own tile-local (b, hq, rows, d) chunk (the CE
 forward's disjoint-output pattern -- no accumulator chaining), and reassembles with
 `mx.concatenate`. It SPLITS rather than refuses; `LaunchBudgetError` is raised only when
-the shape cannot be planned within the per-command-buffer budget (the 0.3.0 buffer model,
-backlog 0025 -- see `plan_budgeted_ranges` and the constants block below).
+the shape cannot be planned within the per-command-buffer budget (the 0.3.0 buffer
+model -- see `plan_budgeted_ranges` and the constants block below).
 
 Full buffers + an in-kernel query-row offset (`qoffs`), never a Python-side `q[r0:r1]`
 slice into a chained launch (the CE kernel's measured 1.22 GB retained-copy lesson --
@@ -35,7 +35,7 @@ never risks the watchdog. Probe QKV are drawn from a LOCAL `mx.random.key` (neve
 `mx.random.seed`), so calibration never mutates the caller's global RNG stream -- the first
 kernel call can fire inside a user's grad/training run and desync downstream consumers.
 
-T6's MMA body changes the kernel's cache-residency and reuse pattern entirely
+The MMA body changes the kernel's cache-residency and reuse pattern entirely
 (register/simdgroup-level K/V reuse within each 32-row query block -- NO threadgroup
 staging; rung 2 removed all threadgroup memory -- versus v0's zero-reuse per-row
 re-stream) -- do not assume v0's RATES transfer to the mma body (rung 3's dispatch table
@@ -96,8 +96,8 @@ _CANARY_BUDGET_S = 0.1   # projected cost of the calibration's final full-workin
 # summed projected time at MAX_DISPATCH_SECONDS -- which therefore stays the ONE pinned
 # worst-day budget (projected ~0.5 s = ~0.25 s real behind the 2x SAFETY margin; never
 # killed on any observed day, while ~0.5-1.0 s-real buffers died on the kill-active day).
-# Full evidence: docs/superpowers/research/2026-07-14-mlx-train-perf-launch-budget-evidence.md
-# (workspace root) + scripts/probe_command_buffer_packing.py.
+# Full evidence: scripts/probe_command_buffer_packing.py, and the published write-up
+# https://ineshin.space/papers/how-mlx-packs-metal-command-buffers/
 _PACK_COMMIT_ELEMS = 51 << 20   # buffer_sizes_ >> 20 > 50  <=>  elements >= 51 * 2^20
 _PACK_COMMIT_OPS = 51           # buffer_ops_ > 50          <=>  ops >= 51
 SAFETY_FACTOR = 0.5      # halve the measured rate (session drift + probe noise, 2x margin)
@@ -132,7 +132,7 @@ class TileShape:
     `d_slab` overrides the mma body's register-resident D-slab width (see `source.py`'s
     `build_fwd_mma_source` / `_FWD_MMA_D_SLAB`) -- `None` means "use the source builder's own
     default" (32, ignored by the scalar body entirely). `provisional` is selection metadata
-    only: it marks a `TileShape` picked by `dispatch.select_fwd_tile` for a shape the T6
+    only: it marks a `TileShape` picked by `dispatch.select_fwd_tile` for a shape the tile
     ladder did not directly measure (same kernel body, unmeasured rate) -- it is never
     consumed by `_fwd_kernel`/`_dispatch_range`, only carried through for callers/logging. A
     `TileShape` built directly (every existing parity/determinism test does this) defaults
@@ -160,7 +160,7 @@ def _fwd_macs_per_row(*, n: int, d: int, b: int, hq: int) -> int:
 def causal_pairs(r0: int, r1: int) -> int:
     """Exact (query, key) pair count for causal query rows [r0, r1): row i attends to the
     i+1 keys j <= i, so this is `sum_{i=r0}^{r1-1} (i+1) = (r1-r0)(r0+r1+1)/2`. The 0.3.0
-    projection basis (backlog 0025): the old full-rectangle per-row cost over-charged causal
+    projection basis: the old full-rectangle per-row cost over-charged causal
     work ~2x -- an upper bound the budget model no longer needs, since the exact count is
     itself an upper bound of nothing (it IS the work) and the 2x SAFETY_FACTOR on the rate
     carries the margin."""
@@ -216,7 +216,7 @@ def plan_budgeted_ranges(
 ) -> list[tuple[int, int]]:
     """Ascending contiguous query ranges tiling [0, n) exactly, sized so that every MODELED
     COMMAND BUFFER's summed projected time stays within `MAX_DISPATCH_SECONDS` -- the 0.3.0
-    launch guard (backlog 0025: the macOS interactivity kill applies to an individual command
+    launch guard (the macOS interactivity kill applies to an individual command
     buffer, never a chain or eval total, so there is NO chain-total cap).
 
     Buffer composition follows mlx 0.32.0's verified commit rule (module constants above): a
@@ -573,7 +573,7 @@ def _calibrate_fwd(
     n-key working set. The ramp's self-shaped probes under-populate the production
     working set (few rows x ALL keys x every head is DRAM-bound where a self-probe still
     partly fits cache), and the measured consequence of trusting them was a
-    macOS-interactivity-killed command buffer at flagship shape (T6 rung 0) -- so the
+    macOS-interactivity-killed command buffer at flagship shape -- so the
     returned rate comes from the canary, the only probe that sees production conditions.
     Skipped only when the ramp already measured the full n x n shape (harsher than any
     range dispatch). Returns the raw (un-halved) rate -- the caller applies SAFETY_FACTOR.
@@ -581,10 +581,10 @@ def _calibrate_fwd(
     `macs_per_row` (default the forward's `2*D`) is the per-query-row MAC cost model; the two
     per-kernel backward rates (`calibrated_bwd_dq_rate` at `3*D`, `calibrated_bwd_dkv_rate` at
     `4*D`) reuse this exact ramp/canary machinery by passing their own cost (design point 4) -- so
-    the ONLY kernel-specific input is this one additive parameter. T6's KV-block tiling changes
-    the cost model: re-validate both budgets then.
+    the ONLY kernel-specific input is this one additive parameter. KV-block tiling changes
+    the cost model: re-validate both budgets when it does.
 
-    0.3.0 (backlog 0025): rates are CREDITED with the probe's exact-causal work when
+    0.3.0: rates are CREDITED with the probe's exact-causal work when
     `causal=True` (a self-shaped [0, np) probe does np(np+1)/2 pairs, not np^2; the tail
     canary [n-rows, n) does its own exact triangle slice), so the returned MAC/s means
     "causal-true MACs per second" -- consistent with `plan_budgeted_ranges`' projection
@@ -660,7 +660,7 @@ def calibrated_fwd_rate(
     sub-keys), never `mx.random.seed`, so calibration never mutates the caller's global RNG
     stream.
 
-    PROBE WHAT YOU RATE (T6 rung 3): `measure()` builds and dispatches the SAME
+    PROBE WHAT YOU RATE: `measure()` builds and dispatches the SAME
     (`tile.variant`, `tile.d_slab`, `packed`) kernel the launcher will actually run -- rating one
     variant while dispatching another sizes the query-row split from the wrong rate. The
     cache is keyed on (head_dim, dtype, causal, b, hq, n-bucket, variant, d_slab, packed), so an
@@ -992,8 +992,9 @@ def launch_bwd_dq(
     _force_ranges: list[tuple[int, int]] | None = None,
 ) -> mx.array:
     """dQ backward -> the query gradient, with q's shape/dtype. Consumes the forward's saved
-    L (`lse`, fp32 (B, Hq, N)) and T7's D (`d_arr`, fp32 (B, Hq, N)); recomputes S/P from
-    q/k and accumulates `dQ_i += scale*P*(dP - D)*k` in fp32 per causally-allowed key.
+    L (`lse`, fp32 (B, Hq, N)) and the D-preprocess output (`d_arr`, fp32 (B, Hq, N));
+    recomputes S/P from q/k and accumulates `dQ_i += scale*P*(dP - D)*k` in fp32 per
+    causally-allowed key.
 
     `variant` picks the kernel body: `"scalar"` (default -- the v1 one-thread-per-query-row
     body, unchanged behaviour for every existing caller) or `"mma"` (the T9b rung-B1 4x4
@@ -1170,7 +1171,7 @@ def _bwd_dkv_kernel(
     order is untouched (mlx binds positionally). `packed` is the LAST cache-key component and
     defaults False, so every pre-0.4.0 caller keeps its existing call and cache entry unchanged.
 
-    `segment_bound`/`break_early` (0.5.0, spec D1/D5) add the packed MMA query-block segment-end
+    `segment_bound`/`break_early` (added in 0.5.0) add the packed MMA query-block segment-end
     bound; both are passed to `build_bwd_dkv_mma_source` in the mma arm ONLY -- the scalar builder
     does not accept them and stays the assumption-free oracle (D3). Both flags are threaded into
     BOTH the `functools.cache` key (this signature) AND the `mx.fast.metal_kernel` name below,
@@ -1267,9 +1268,10 @@ def launch_bwd_dkv(
     _force_ranges: list[tuple[int, int]] | None = None,
 ) -> tuple[mx.array, mx.array]:
     """dK/dV backward -> (dK, dV), with k/v's shape/dtype. Consumes the forward's saved L
-    (`lse`, fp32 (B, Hq, N)) and T7's D (`d_arr`, fp32 (B, Hq, N)); recomputes S/P from q/k and
-    accumulates `dV_j += P*dO`, `dK_j += scale*P*(dP - D)*q` in CHAINED fp32 partials over the
-    causally-allowed queries, grouped over each kv head's contiguous q-head group.
+    (`lse`, fp32 (B, Hq, N)) and the D-preprocess output (`d_arr`, fp32 (B, Hq, N));
+    recomputes S/P from q/k and accumulates `dV_j += P*dO`,
+    `dK_j += scale*P*(dP - D)*q` in CHAINED fp32 partials over the causally-allowed
+    queries, grouped over each kv head's contiguous q-head group.
 
     `variant` picks the kernel body: `"scalar"` (default -- the v1 one-thread-per-key body,
     unchanged behaviour for every existing caller) or `"mma"` (the T9b rung-B2 key-major 4x4
@@ -1297,7 +1299,7 @@ def launch_bwd_dkv(
     identically regardless of the range split, so a chained split stays bit-identical to a single
     dispatch under packing too.
 
-    `segment_bound`/`break_early` (0.5.0, spec D1/D5, mma variant only): thread straight through
+    `segment_bound`/`break_early` (added in 0.5.0, mma variant only): thread straight through
     to `_bwd_dkv_kernel`, which passes them to `build_bwd_dkv_mma_source` and folds both into the
     kernel's cache key AND its `mx.fast.metal_kernel` name -- mlx caches compiled kernels BY NAME
     (verified: same name + different source returns the FIRST compiled binary), so a

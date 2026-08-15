@@ -1,4 +1,4 @@
-"""Sequence packing: pure first-fit over a seeded per-epoch shuffle (spec §2.3, §4)."""
+"""Sequence packing: pure first-fit over a seeded per-epoch shuffle."""
 import random
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
@@ -16,7 +16,7 @@ def pack_indices(
     lengths: Sequence[int], pack_len: int, *, seed: int, epoch: int
 ) -> list[list[int]]:
     """Group dataset indices into packs. A sequence costs `min(len, pack_len) + 1`
-    slots (its trailing separator/pad slot, spec §4) against a capacity of
+    slots (its trailing separator/pad slot) against a capacity of
     `pack_len + 1`. Deterministic per (seed, epoch); the shuffle varies across epochs."""
     if pack_len < 1:
         raise PackingError(f"pack_len must be >= 1; got {pack_len}")
@@ -103,7 +103,7 @@ def build_row(
     entries: list[tuple[list[int], int]], pack_len: int
 ) -> tuple[list[int], list[int], list[int], list[bool]]:
     """Lay out one packed row from `entries` (as drawn from one `pack_indices` pack):
-    `(tokens, offset)` pairs in pack order (spec §4, the boundary algebra).
+    `(tokens, offset)` pairs in pack order (the boundary algebra).
 
     Row axis (`pack_len + 1` wide, mirroring stock's `1 + ...` sizing -- the final
     column is target-only): each segment places its tokens, then a single `0` pad
@@ -113,7 +113,7 @@ def build_row(
     spans its tokens plus its own pad slot (`seg_len + 1` positions); any remaining
     capacity forms one trailing tail segment, so every position in `[0, pack_len)`
     is covered by exactly one segment id -- gapless by construction, a NaN-safety
-    invariant for the attention kernel's softmax (spec §4), not cosmetics.
+    invariant for the attention kernel's softmax, not cosmetics.
 
     Supervised window per segment: `[t0 + max(offset, 1) - 1, t0 + seg_len - 1]`
     on the inputs axis (`t0` = the segment's `seg_start`) -- stock's window shifted
@@ -157,7 +157,7 @@ def build_row(
 
 
 def _assert_pack_time_monotone(sid_arr: Any, sst_arr: Any) -> None:
-    """Vectorized numpy check (spec D2): `seg_id` and `seg_start` must be
+    """Vectorized numpy check: `seg_id` and `seg_start` must be
     non-decreasing along each row of a packed batch -- the packed kernels' block-skip
     bounds (forward/dQ `kv_lo`, the 0.5.0 dK/dV segment-end break) assume contiguous
     ascending segments, with no in-kernel guard. Called on the numpy host arrays
@@ -185,8 +185,8 @@ def packed_iterate_batches(
     *,
     max_position_embeddings: int | None = None,
 ) -> Iterator[tuple[mx.array, mx.array, mx.array, mx.array]]:
-    """Drop-in for `mlx_lm.tuner.trainer.iterate_batches` (host-side packed variant,
-    spec §3.1). Parameter names/order mirror the installed stock signature exactly
+    """Drop-in for `mlx_lm.tuner.trainer.iterate_batches` (host-side packed variant).
+    Parameter names/order mirror the installed stock signature exactly
     (`iterate_batches`, trainer.py:102-109) so `train(iterate_batches=partial(...))`
     and `evaluate(...)` need zero call-site changes.
 
@@ -205,9 +205,9 @@ def packed_iterate_batches(
     batch is dropped (matching stock's full-batch construction).
 
     Refuses (`PackingError`, no silent fallback): a `comm_group` with `size() > 1`
-    (distributed packing is out of scope, spec §10 -- size 1 or `None` is accepted);
+    (distributed packing is out of scope -- size 1 or `None` is accepted);
     `max_position_embeddings` given and `max_seq_length` exceeds it (positions run
-    up to `pack_len` with no reset, spec §4 -- the real correctness fence).
+    up to `pack_len` with no reset -- the real correctness fence).
     """
     if comm_group is not None and comm_group.size() > 1:
         raise PackingError(
