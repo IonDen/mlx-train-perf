@@ -124,7 +124,7 @@ def _candidate_calibration(*, calib: Calibration, coeffs: dict[str, float]) -> C
 
 def _flash_fit_is_one_sided(points: list[FitPoint], *, candidate: Calibration) -> bool:
     """True iff, for EVERY flash `FitPoint`, the CANDIDATE calibration's predicted
-    cushioned TOTAL peak (the public `estimate_peak` call a real planner caller makes)
+    UNCUSHIONED total peak (`estimate_peak` evaluated with `overhead_frac=0`)
     is >= the point's own measured total. `candidate` must be the FULL post-fit
     `Calibration` `main()` is about to write (see `_candidate_calibration`) -- checking
     a stale `calib` with only the flash coefficients swapped in validates a
@@ -146,14 +146,26 @@ def _flash_fit_is_one_sided(points: list[FitPoint], *, candidate: Calibration) -
     the real prediction a chunked/naive flash caller would receive against the measured
     stock-CE peak. Evaluating a stock-arm anchor with the KERNEL coefficient would
     demand the fused arm cover the stock arm -- the pooled-envelope conservatism the
-    per-arm split exists to remove."""
+    per-arm split exists to remove.
+
+    The check runs UNCUSHIONED (`overhead_frac=0`, 0.6.0 review finding): the cushion
+    exists for allocator fragmentation and run-to-run variance, and a coefficient that
+    under-fits an anchor by up to the cushion's width would otherwise pass -- spending
+    the safety margin on fit error. Because the per-point residual ratios rise with
+    seq, a through-origin OLS necessarily lands below the top anchor whenever the
+    ratios differ, so this uncushioned check is what actually routes the real
+    calibration to the envelope fit. A 1e-6 relative tolerance absorbs
+    `estimate_peak`'s integer flooring on synthetic exact-construction points; real
+    under-fit is orders of magnitude larger (measured 1.3e-2 at the seq-12288 fused
+    anchor under OLS)."""
+    uncushioned = replace(candidate, overhead_frac=0.0)
     for p in points:
         if p.cfg.attention != "flash":
             continue
         cfg_eval = p.cfg if p.loss_arm == "kernel" else replace(p.cfg, impl="chunked")
-        predicted_total, components = estimate_peak(p.shape, cfg_eval, candidate)
+        predicted_total, components = estimate_peak(p.shape, cfg_eval, uncushioned)
         measured_total = components["weights"] + p.marginal_peak_bytes
-        if predicted_total < measured_total:
+        if predicted_total < measured_total * (1.0 - 1e-6):
             return False
     return True
 

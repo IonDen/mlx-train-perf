@@ -6,7 +6,7 @@
 - Per-loss-implementation flash memory coefficients in the planner. `plan --attention
   flash` with the fused loss no longer carries the stock-loss arm's worst-case margin:
   its predictions dropped from up to about 1.4× the recorded peak (1.6× cross-model) to
-  1.08–1.19× (1.20–1.23× cross-model), so fewer configs that fit are refused and
+  1.09–1.19× (1.22–1.24× cross-model), so fewer configs that fit are refused and
   `--max-seq` / `--max-batch` answers grow accordingly. Refit from the same committed
   anchors, no new measurement; every prediction still covers every measured anchor.
 - `bench` exits 3 when the only unfinished conditions were refused by a safety guard,

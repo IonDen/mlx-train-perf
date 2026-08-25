@@ -251,11 +251,15 @@ def _read_status(path: Path) -> str:
 def _bench_exit_code(statuses: list[str]) -> int:
     """0 all ok · 1 any error · 3 refusals-only (0.6.0). A refusal yields no usable
     timing data, so it stays LOUD (nonzero) -- but an envelope-testing sweep where some
-    grid points are EXPECTED to hit the launch-budget or memory guard is the guard
-    doing its job, not a misbehaving sweep, and scripting callers need to tell the two
-    apart without parsing the JSON conditions list. Anything that is neither 'ok' nor
-    'refused' (including a corrupt artifact, which `_read_status` reads as 'error', and
-    any future unknown status) takes the error path -- the conservative direction."""
+    grid points are EXPECTED to hit the launch-budget guard (`status == "refused"`, the
+    worker's `LaunchBudgetError` outcome) is the guard doing its job, not a misbehaving
+    sweep, and scripting callers need to tell the two apart without parsing the JSON
+    conditions list. ONLY that literal status maps to 3: a too-crowded-machine refusal
+    (`refused_environment`, retried on a quieter machine) and a memory-ceiling abort
+    (`aborted_memory_ceiling`, the watchdog firing) both stay on the exit-1 path, as
+    does anything else that is not 'ok' (including a corrupt artifact, which
+    `_read_status` reads as 'error', and any future unknown status) -- the conservative
+    direction."""
     if all(status == "ok" for status in statuses):
         return 0
     if all(status in ("ok", "refused") for status in statuses):
@@ -386,10 +390,12 @@ def _add_bench_parser(subparsers: "argparse._SubParsersAction[argparse.ArgumentP
     bench = subparsers.add_parser(
         "bench", help="run the benchmark harness",
         description="Run the benchmark harness. Exit 0 only when every condition is "
-                     "'ok'. Exit 1 on any 'error' condition. Exit 3 when the only "
-                     "non-ok conditions are 'refused' (a safety guard declined to run "
-                     "them -- expected in envelope-testing sweeps; still nonzero "
-                     "because a refusal yields no timing data).",
+                     "'ok'. Exit 3 when the only non-ok conditions carry the literal "
+                     "status 'refused' (the launch-budget guard declined to run them "
+                     "-- expected in envelope-testing sweeps; still nonzero because a "
+                     "refusal yields no timing data). Exit 1 on anything else, "
+                     "including errors, too-crowded-machine refusals and "
+                     "memory-ceiling aborts.",
     )
     bench.add_argument("--suite", required=True, choices=_BENCH_SUITES, help="bench suite")
     bench.add_argument("--out", required=True, help="output directory for result artifacts")

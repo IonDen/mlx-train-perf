@@ -249,6 +249,13 @@ def _attention_bytes(cfg: TrainConfig, shape: ModelShape, calib: Calibration) ->
     against measured Qwen3-8B-4bit anchors up to seq 12288 per arm (0.5.0 anchors, 0.6.0
     per-arm fit); beyond 12288 the fit extrapolates.
 
+    Measurement boundary: the anchors are ACTIVE-memory peaks
+    (`mx.get_peak_memory` marginals from the bench worker) -- MLX's retained cache pool
+    is not modeled, so a caller who wants the plan to reflect full resident footprint
+    should bound that pool with `mx.set_cache_limit(...)` in the training process. This
+    is one reason the shipped per-arm coefficients are envelopes (largest per-anchor
+    ratio), not least-squares averages.
+
     An unknown `impl` raises here as well as in `_loss_bytes` -- the flash branch cannot
     silently pick an arm for a loss impl it does not know."""
     if cfg.attention == "stock":
