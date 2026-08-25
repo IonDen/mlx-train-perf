@@ -2,7 +2,7 @@
 
 ## Released
 
-### 0.6.0 - 2026-08-25
+### 0.6.0 - 2026-08-26
 - Per-loss-implementation flash memory coefficients in the planner. `plan --attention
   flash` with the fused loss no longer carries the stock-loss arm's worst-case margin:
   its predictions dropped from up to about 1.4× the recorded peak (1.6× cross-model) to

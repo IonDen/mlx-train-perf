@@ -4,7 +4,7 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.6.0] - 2026-08-25
+## [0.6.0] - 2026-08-26
 
 The planner stops over-charging the fused loss on the flash-attention path. Since 0.5.0, one
 flash memory coefficient covered both measured loss arms, sized to the worst of them, so
