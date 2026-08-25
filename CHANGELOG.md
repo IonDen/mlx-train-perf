@@ -15,12 +15,15 @@ same committed anchors, and no measurement was rerun for this release: the refit
 `_artifacts/calib_050/refit_manifest.json` through `scripts/fit_calibration.py`.
 
 ### Changed
-- `plan --attention flash` with the fused loss now reads at 1.08–1.20× the measured peak on
-  the fitted model (Qwen3-8B-4bit, 2,048–12,288 tokens) and about 1.2× cross-model
-  (Llama-3.2-3B-4bit), from 1.4× and 1.6×. Predictions for the chunked and naive loss
-  implementations keep the stock-loss arm's coefficient (the worst measured arm; those
-  combinations have no anchors of their own) and read at 1.12–1.26×. Every prediction stays
-  at or above every measured anchor, both arms, both model families.
+- `plan --attention flash` with the fused loss now reads at 1.08–1.19× each anchor's
+  recorded total peak on the fitted model (Qwen3-8B-4bit, 2,048–12,288 tokens) and
+  1.20–1.23× cross-model (Llama-3.2-3B-4bit), from about 1.4× and 1.6×. Predictions for the
+  chunked loss keep the stock-loss arm's coefficient (the worst measured arm; that
+  combination has no anchors of its own) and read at 1.11–1.25× against the stock-CE
+  anchors. Naive-loss flash plans read far higher, about 1.7–2.2×, because the naive loss
+  term itself deliberately over-predicts away from its own calibration shape; that term is
+  unchanged in this release. Every prediction stays at or above every measured anchor, both
+  arms, both model families.
 - `mlx-train-perf bench` exits 3 when the only conditions that did not finish were refused by
   a safety guard, instead of folding them into exit 1 with real errors. A refusal still yields
   no timing data, so the code stays nonzero; a script sweeping past the guard on purpose can

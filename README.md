@@ -328,7 +328,7 @@ Pass `--attention flash` to price the flash-attention path instead of the stock 
 mlx-train-perf plan --config path/to/config.json --batch 1 --seq-len 8192 --lora-rank 8 --attention flash
 ```
 
-The flash model is an analytic saved-state term plus a measured linear coefficient per loss implementation, each fit on its own arm's anchors so neither under-predicts at any of them. Plans for the fused loss read at 1.08–1.20× the measured peak on the fitted model and about 1.2× cross-model; before 0.6.0 a single worst-case coefficient pushed these to 1.4× and 1.6×. The other loss implementations use the stock-loss arm's coefficient and read at 1.12–1.26×. The validated range is 2,048 to 12,288 tokens; past that the fit extrapolates.
+The flash model is an analytic saved-state term plus a measured linear coefficient per loss implementation, each fit on its own arm's anchors so neither under-predicts at any of them. Plans for the fused loss read at 1.08–1.19× the recorded peak on the fitted model and 1.20–1.23× cross-model; before 0.6.0 a single worst-case coefficient pushed these to about 1.4× and 1.6×. The chunked loss uses the stock-loss arm's coefficient and reads at 1.11–1.25×; the naive loss reads higher still because its own loss term over-predicts away from its calibration shape. The validated range is 2,048 to 12,288 tokens; past that the fit extrapolates.
 
 Instead of checking one config at a time, ask the planner for the largest sequence length or batch size that fits your budget:
 
