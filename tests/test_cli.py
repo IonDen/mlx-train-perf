@@ -487,9 +487,32 @@ def test_bench_exit_code_zero_when_all_ok() -> None:
     assert _bench_exit_code(["ok", "ok"]) == 0
 
 
-def test_bench_exit_code_one_on_any_error_or_refusal() -> None:
+def test_bench_exit_code_one_on_any_error() -> None:
+    """Any 'error' status dominates: exit 1, even when refusals are also present (a
+    sweep that both misbehaved AND was refused is a misbehaving sweep). Would go red if
+    the refusals-only code (3) ever swallowed a real error."""
     assert _bench_exit_code(["ok", "error"]) == 1
-    assert _bench_exit_code(["ok", "refused"]) == 1
+    assert _bench_exit_code(["error", "refused"]) == 1
+    assert _bench_exit_code(["refused", "error", "ok"]) == 1
+
+
+def test_bench_exit_code_three_on_refusals_only() -> None:
+    """0.6.0 policy: a sweep whose only non-ok conditions are REFUSALS exits 3 --
+    still loud (nonzero, `set -e` and `if ! mlx-train-perf bench` behave as before),
+    but scripting an envelope-testing sweep (where grid points are EXPECTED to hit the
+    launch-budget or memory guard) can now tell "the guard did its job" (3) from "the
+    sweep misbehaved" (1) without parsing the JSON conditions list. Would go red if
+    refusals fell back into the errors code or started reading as success."""
+    assert _bench_exit_code(["ok", "refused"]) == 3
+    assert _bench_exit_code(["refused", "refused"]) == 3
+
+
+def test_bench_exit_code_unknown_status_is_an_error_not_a_refusal() -> None:
+    """A status string outside the known set (a corrupt artifact reads as 'error' via
+    `_read_status`, but a future worker could emit something new) must take the LOUD
+    error path (1), never the refusals-only path (3) -- the conservative direction."""
+    assert _bench_exit_code(["ok", "bogus"]) == 1
+    assert _bench_exit_code(["bogus", "refused"]) == 1
 
 
 def test_bench_exit_code_zero_on_empty() -> None:
@@ -575,14 +598,16 @@ def test_bench_unsupported_suite_tool_error_exit_two(tmp_path: Path) -> None:
 
 
 def test_bench_help_documents_exit_code_policy(capsys: pytest.CaptureFixture[str]) -> None:
-    """The exit-1 policy (both 'error' and 'refused' count as non-ok) must be visible in
-    `bench -h`, not only in the module docstring. `main` catches argparse's own
-    `SystemExit(0)` for `-h`, so this asserts on the return code, not a raised exception."""
+    """The exit-code policy (1 on any 'error', 3 on refusals-only -- both non-ok, both
+    loud) must be visible in `bench -h`, not only in the module docstring. `main`
+    catches argparse's own `SystemExit(0)` for `-h`, so this asserts on the return
+    code, not a raised exception."""
     rc = main(["bench", "-h"])
     out = capsys.readouterr().out
     assert rc == 0
     assert "error" in out
     assert "refused" in out
+    assert "exit 3" in out.lower()
 
 
 # --- contribute subcommand ----------------------------------------------------------

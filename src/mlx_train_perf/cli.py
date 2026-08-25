@@ -3,7 +3,8 @@
 
 `plan` renders a `FitReport` for a given model config + training shape (exit 0 fits, 1
 does not fit, 2 tool error). `bench` drives the subprocess-per-condition bench runner over
-the `loss_layer` suite (exit 0 all conditions ok, 1 any condition not ok, 2 tool error).
+the `loss_layer` suite (exit 0 all conditions ok, 1 any condition errored, 3 refusals
+only, 2 tool error).
 `contribute` runs the committed benches on the current machine and writes one
 provenance-complete community artifact (exit 0 written, 1 refused -- red memory /
 too-crowded / not confirmed, 2 tool error). Argument parsing and rendering are kept in
@@ -248,7 +249,18 @@ def _read_status(path: Path) -> str:
 
 
 def _bench_exit_code(statuses: list[str]) -> int:
-    return 0 if all(status == "ok" for status in statuses) else 1
+    """0 all ok · 1 any error · 3 refusals-only (0.6.0). A refusal yields no usable
+    timing data, so it stays LOUD (nonzero) -- but an envelope-testing sweep where some
+    grid points are EXPECTED to hit the launch-budget or memory guard is the guard
+    doing its job, not a misbehaving sweep, and scripting callers need to tell the two
+    apart without parsing the JSON conditions list. Anything that is neither 'ok' nor
+    'refused' (including a corrupt artifact, which `_read_status` reads as 'error', and
+    any future unknown status) takes the error path -- the conservative direction."""
+    if all(status == "ok" for status in statuses):
+        return 0
+    if all(status in ("ok", "refused") for status in statuses):
+        return 3
+    return 1
 
 
 def _render_bench_summary(paths: list[Path], statuses: list[str]) -> str:
@@ -373,8 +385,11 @@ def _add_plan_parser(subparsers: "argparse._SubParsersAction[argparse.ArgumentPa
 def _add_bench_parser(subparsers: "argparse._SubParsersAction[argparse.ArgumentParser]") -> None:
     bench = subparsers.add_parser(
         "bench", help="run the benchmark harness",
-        description="Run the benchmark harness. Exit 1 covers both an 'error' and a "
-                     "'refused' condition status -- neither is a clean 'ok' result.",
+        description="Run the benchmark harness. Exit 0 only when every condition is "
+                     "'ok'. Exit 1 on any 'error' condition. Exit 3 when the only "
+                     "non-ok conditions are 'refused' (a safety guard declined to run "
+                     "them -- expected in envelope-testing sweeps; still nonzero "
+                     "because a refusal yields no timing data).",
     )
     bench.add_argument("--suite", required=True, choices=_BENCH_SUITES, help="bench suite")
     bench.add_argument("--out", required=True, help="output directory for result artifacts")
