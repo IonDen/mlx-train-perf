@@ -309,7 +309,13 @@ def estimate_peak(
     shape: ModelShape, cfg: TrainConfig, calib: Calibration
 ) -> tuple[int, dict[str, int]]:
     """Pure: predicted peak bytes plus a component breakdown. No I/O, no device query --
-    `calib` is passed in rather than loaded here so this function has no hidden state."""
+    `calib` is passed in rather than loaded here so this function has no hidden state.
+
+    Measurement boundary: the calibration anchors are ACTIVE-memory peaks
+    (`mx.get_peak_memory` marginals), so the estimate models MLX active memory -- the
+    allocator's retained cache pool is not included. A caller budgeting full resident
+    footprint should bound that pool with `mx.set_cache_limit(...)` in the training
+    process."""
     dtype_size = _dtype_bytes(cfg.dtype)
     components = {
         "weights": _weights_bytes(shape, dtype_size),

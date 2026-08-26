@@ -22,8 +22,10 @@ same committed anchors, and no measurement was rerun for this release: the refit
   combination has no anchors of its own) and read at 1.13–1.26× against the stock-CE
   anchors. Naive-loss flash plans read far higher, about 1.7–2.2×, because the naive loss
   term itself deliberately over-predicts away from its own calibration shape; that term is
-  unchanged in this release. Every prediction stays at or above every measured anchor, both
-  arms, both model families — before the 10% safety cushion is applied, not thanks to it.
+  unchanged in this release; ranges are rounded outward. Every prediction stays at or above
+  every measured anchor's training-loop footprint — the weights term plus the measured
+  marginal, the quantity the fit models — before the 10% safety cushion is applied, not
+  thanks to it.
 - The refit's never-under-predict check now runs without the 10% cushion, so the shipped
   coefficients themselves must cover every anchor and the cushion stays what it is meant to
   be: margin for allocator fragmentation and run-to-run variance, never cover for fit error.
@@ -327,6 +329,8 @@ Silicon, with an mlx-lm adapter, a RAM-fit planner, and a benchmark harness.
   `ROADMAP.md`).
 - Architectures: Llama and Qwen3 only. Training: LoRA / QLoRA. Apple Silicon only.
 
+[0.6.0]: https://github.com/IonDen/mlx-train-perf/releases/tag/v0.6.0
+[0.5.1]: https://github.com/IonDen/mlx-train-perf/releases/tag/v0.5.1
 [0.5.0]: https://github.com/IonDen/mlx-train-perf/releases/tag/v0.5.0
 [0.4.0]: https://github.com/IonDen/mlx-train-perf/releases/tag/v0.4.0
 [0.3.1]: https://github.com/IonDen/mlx-train-perf/releases/tag/v0.3.1

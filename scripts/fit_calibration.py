@@ -20,7 +20,7 @@ The flash coefficients (`attn_bytes_per_head_token_flash_kernel` / `_stock`, one
 loss arm since 0.6.0 -- the arm reads from each artifact's `identity.stock` flag) are
 fit twice if needed: first by `fit_memory_coeffs(..., flash_fit="ols")` (the
 least-squares default, per arm), then checked for one-sidedness
-(`_flash_fit_is_one_sided` -- the candidate's predicted cushioned TOTAL peak, via the
+(`_flash_fit_is_one_sided` -- the candidate's predicted UNCUSHIONED total peak, via the
 public `estimate_peak` with each anchor routed to its own arm's shipped combination,
 must be >= every flash anchor's own measured total). A violation triggers a refit with
 `flash_fit="envelope"` (the largest per-point residual/x_flash ratio within each arm,
@@ -154,10 +154,11 @@ def _flash_fit_is_one_sided(points: list[FitPoint], *, candidate: Calibration) -
     the safety margin on fit error. Because the per-point residual ratios rise with
     seq, a through-origin OLS necessarily lands below the top anchor whenever the
     ratios differ, so this uncushioned check is what actually routes the real
-    calibration to the envelope fit. A 1e-6 relative tolerance absorbs
-    `estimate_peak`'s integer flooring on synthetic exact-construction points; real
-    under-fit is orders of magnitude larger (measured 1.3e-2 at the seq-12288 fused
-    anchor under OLS)."""
+    calibration to the envelope fit. A 1e-6 relative tolerance keeps
+    `estimate_peak`'s integer flooring from ever flipping a genuinely-exact synthetic
+    point; real under-fit is orders of magnitude larger (measured 1.3e-2 at the
+    seq-12288 fused anchor under OLS, and the gate's own boundary test constructs
+    ~3.7e-2)."""
     uncushioned = replace(candidate, overhead_frac=0.0)
     for p in points:
         if p.cfg.attention != "flash":
@@ -265,7 +266,7 @@ def main(argv: list[str] | None = None) -> int:
     candidate = _candidate_calibration(calib=calib, coeffs=coeffs)
     if not _flash_fit_is_one_sided(points, candidate=candidate):
         # OLS's least-squares average under-predicted at least one flash anchor's own
-        # cushioned TOTAL, checked against the FULL candidate (not a stale calib with
+        # UNCUSHIONED total, checked against the FULL candidate (not a stale calib with
         # only a_flash swapped) -- refit with the conservative (over-predict-safe)
         # envelope.
         coeffs = fit_memory_coeffs(points, calib=calib, flash_fit="envelope")

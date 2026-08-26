@@ -488,6 +488,47 @@ def test_main_fits_each_flash_arm_separately_and_routes_the_one_sided_check(
     assert updated["provenance"]["flash_fit"] == "ols"
 
 
+def test_main_one_sided_check_runs_uncushioned(tmp_path: Path) -> None:
+    """The one-sidedness gate must evaluate WITHOUT the 10% `overhead_frac` cushion
+    (0.6.0 review finding): a coefficient that under-fits an anchor by less than the
+    cushion's width would pass a cushioned check, silently spending the fragmentation
+    margin on fit error -- the exact defect class the uncushioned gate fixed, and the
+    regime the REAL refit lives in (its OLS under-fit was ~1.3%, far inside the 10%
+    cushion). The other envelope-selection tests here all use order-of-magnitude
+    spreads, so cushioned-vs-uncushioned makes no difference to them (verified by
+    mutation: reverting the gate to the cushioned candidate passed every prior test).
+
+    Construction: two kernel-arm flash points whose true coefficients differ modestly
+    (seq 512 at 530, seq 8192 at 500). Through-origin OLS is dominated by the
+    big-seq point's x_flash^2 weight and lands at ~500.1, under-fitting the seq-512
+    anchor by ~3.7% of its measured total -- inside the 10% cushion, far above the
+    1e-6 flooring tolerance. A cushioned gate reports one-sided and ships OLS
+    (flash_fit "ols", coefficient ~500.1); the uncushioned gate must detect the
+    violation and ship the per-arm envelope: flash_fit "envelope", kernel coefficient
+    exactly the seq-512 anchor's own 530 (noiseless forward construction)."""
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(_CONFIG))
+    calib = _stand_in_calibration()
+    shape = ModelShape.from_config(_CONFIG)
+    small = _write_flash_point(tmp_path, "small_mild", config_path=config_path,
+                               calib=calib, shape=shape, seq_len=512, a_flash=530.0)
+    big = _write_flash_point(tmp_path, "big_mild", config_path=config_path,
+                             calib=calib, shape=shape, seq_len=8192, a_flash=500.0)
+    manifest_path = tmp_path / "manifest.json"
+    _write_manifest(manifest_path, [small, big])
+    calibration_path = tmp_path / "calibration_data.json"
+    calibration_path.write_text(json.dumps(_EXISTING_CALIBRATION))
+
+    rc = fit_calibration.main([
+        "--manifest", str(manifest_path), "--calibration-data", str(calibration_path),
+    ])
+    assert rc == 0
+    updated = json.loads(calibration_path.read_text())
+    assert updated["provenance"]["flash_fit"] == "envelope"
+    assert updated["attn_bytes_per_head_token_flash_kernel"] == pytest.approx(
+        530.0, rel=1e-6)
+
+
 def test_main_detects_under_prediction_from_a_mixed_stock_flash_manifest(
     tmp_path: Path,
 ) -> None:
