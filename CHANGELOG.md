@@ -4,6 +4,47 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-08-26
+
+The planner stops over-charging the fused loss on the flash-attention path. Since 0.5.0, one
+flash memory coefficient covered both measured loss arms, sized to the worst of them, so
+`plan --attention flash` with the fused loss (the default) predicted up to 1.4× the peak it
+had itself measured, and 1.6× on a different model family. Refusals came several GiB early,
+and `--max-seq` answers ran short. The coefficient is now fit per loss implementation, on the
+same committed anchors, and no measurement was rerun for this release: the refit replays
+`_artifacts/calib_050/refit_manifest.json` through `scripts/fit_calibration.py`.
+
+### Changed
+- `plan --attention flash` with the fused loss now reads at 1.09–1.19× each anchor's
+  recorded total peak on the fitted model (Qwen3-8B-4bit, 2,048–12,288 tokens) and
+  1.22–1.24× cross-model (Llama-3.2-3B-4bit), from about 1.4× and 1.6×. Predictions for the
+  chunked loss keep the stock-loss arm's coefficient (the worst measured arm; that
+  combination has no anchors of its own) and read at 1.13–1.26× against the stock-CE
+  anchors. Naive-loss flash plans read far higher, about 1.7–2.2×, because the naive loss
+  term itself deliberately over-predicts away from its own calibration shape; that term is
+  unchanged in this release; ranges are rounded outward. Every prediction stays at or above
+  every measured anchor's training-loop footprint — the weights term plus the measured
+  marginal, the quantity the fit models — before the 10% safety cushion is applied, not
+  thanks to it.
+- The refit's never-under-predict check now runs without the 10% cushion, so the shipped
+  coefficients themselves must cover every anchor and the cushion stays what it is meant to
+  be: margin for allocator fragmentation and run-to-run variance, never cover for fit error.
+  Each arm therefore ships its own envelope (largest per-anchor ratio) rather than a
+  least-squares average that dips under its longest anchor.
+- `mlx-train-perf bench` exits 3 when the only conditions that did not finish were refused by
+  a safety guard, instead of folding them into exit 1 with real errors. A refusal still yields
+  no timing data, so the code stays nonzero; a script sweeping past the guard on purpose can
+  now tell "the guard held" from "the sweep broke" without parsing the JSON. Exit 1 keeps
+  meaning at least one condition errored.
+- The calibration file's flash coefficient is now two fields
+  (`attn_bytes_per_head_token_flash_kernel` / `_stock`), and `fit_memory_coeffs` accepts the
+  loss arm on each fit point, fitting each arm's coefficient only from its own anchors.
+
+### Added
+- The four Llama-3.2-3B-4bit flash train-step anchors (both loss arms, 2,048 and 8,192
+  tokens) are now committed under `_artifacts/bench_train_step_flash_llama3b/`, so the
+  cross-model contract tests cite artifacts in the repository rather than local files.
+
 ## [0.5.1] - 2026-08-16
 
 Documentation. No functional change: `src/` is touched only in docstrings, the test suite is
@@ -288,6 +329,8 @@ Silicon, with an mlx-lm adapter, a RAM-fit planner, and a benchmark harness.
   `ROADMAP.md`).
 - Architectures: Llama and Qwen3 only. Training: LoRA / QLoRA. Apple Silicon only.
 
+[0.6.0]: https://github.com/IonDen/mlx-train-perf/releases/tag/v0.6.0
+[0.5.1]: https://github.com/IonDen/mlx-train-perf/releases/tag/v0.5.1
 [0.5.0]: https://github.com/IonDen/mlx-train-perf/releases/tag/v0.5.0
 [0.4.0]: https://github.com/IonDen/mlx-train-perf/releases/tag/v0.4.0
 [0.3.1]: https://github.com/IonDen/mlx-train-perf/releases/tag/v0.3.1

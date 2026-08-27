@@ -2,6 +2,17 @@
 
 ## Released
 
+### 0.6.0 - 2026-08-26
+- Per-loss-implementation flash memory coefficients in the planner. `plan --attention
+  flash` with the fused loss no longer carries the stock-loss arm's worst-case margin:
+  its predictions dropped from up to about 1.4× the recorded peak (1.6× cross-model) to
+  1.09–1.19× (1.22–1.24× cross-model), so fewer configs that fit are refused and
+  `--max-seq` / `--max-batch` answers grow accordingly. Refit from the same committed
+  anchors, no new measurement; every prediction still covers every measured anchor.
+- `bench` exits 3 when the only unfinished conditions were refused by a safety guard,
+  keeping exit 1 for real errors, so envelope-testing sweeps can be scripted without
+  parsing the result JSON.
+
 ### 0.5.1 - 2026-08-16
 - Documentation. The README now opens with the problem this solves rather than the kernel
   that solves it, answers "does this help me?" in a table that includes the cases where it

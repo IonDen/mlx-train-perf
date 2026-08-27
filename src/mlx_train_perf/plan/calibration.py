@@ -33,20 +33,30 @@ class Calibration:
     # walks the stack). bf16-calibrated (dtype folded into the coefficient). Used by the
     # STOCK attention branch (`TrainConfig.attention == "stock"`).
     attn_bytes_per_head_token2: float
-    # Linear flash-attention-backward memory, bytes per (head * seq). Used by the FLASH
-    # branch (`attention == "flash"`), which replaces the O(N^2) quadratic term with the
-    # analytic O(N.D) saved state (O + logsumexp) PLUS this fitted linear live-transient
-    # coefficient. bf16-calibrated (dtype folded in). Fit by 1-variable residual OLS from
-    # 0.2.0 flash train-step marginal peaks, holding base/a_lin fixed from the stock
-    # calibration (the x_flash = batch.heads.seq driver is an exact scalar multiple of the
+    # Linear flash-attention-backward memory, bytes per (head * seq), SPLIT BY LOSS ARM
+    # (0.6.0). Used by the FLASH branch (`attention == "flash"`), which replaces the
+    # O(N^2) quadratic term with the analytic O(N.D) saved state (O + logsumexp) PLUS one
+    # of these fitted linear live-transient coefficients. bf16-calibrated (dtype folded
+    # in). Each is fit by 1-variable residual OLS over ITS OWN loss arm's flash
+    # train-step marginal peaks, holding base/a_lin fixed from the stock calibration (the
+    # x_flash = batch.heads.seq driver is an exact scalar multiple of the
     # linear-activation driver at fixed model shape, so a joint fit is rank-deficient --
     # see estimate.fit_memory_coeffs). Driver form settled from the T13 single-op scaling:
     # backward saved state grows O(N) (single-op 2048->4096 == exactly 2.0x); the
-    # 4096->8192 super-linearity is a confirmed budget-bounded dispatch-split additive, not
-    # a growth-law change, so the planner models a pure linear term (over-predict-safe: the
-    # split steepening is folded into the slope, and the overhead_frac cushion covers the
-    # anchor).
-    attn_bytes_per_head_token_flash: float
+    # 4096->8192 super-linearity is a confirmed budget-bounded dispatch-split additive,
+    # not a growth-law change, so the planner models a pure linear term.
+    #
+    # `_kernel` is the fused-loss (impl="kernel") arm. `_stock` is the stock-CE arm: the
+    # bench's stock arm runs mlx-lm's own materialized-logits cross-entropy with the
+    # KERNEL loss's tiny analytic term subtracted at fit time, so the stock coefficient
+    # ABSORBS the stock loss's live transients on top of the flash transient -- it is the
+    # worst measured arm and serves the planner's chunked/naive flash routes
+    # conservatively (see estimate._attention_bytes). The 0.5.0 schema's single
+    # `attn_bytes_per_head_token_flash` was the envelope over BOTH arms pooled, which
+    # over-predicted the fused arm by 1.41-1.57x; the split removes that conservatism
+    # from the fused arm without touching the stock arm.
+    attn_bytes_per_head_token_flash_kernel: float
+    attn_bytes_per_head_token_flash_stock: float
     # AdamW analytic: two fp32 moments per trainable param == 8 bytes/param (not fitted).
     optimizer_bytes_per_param: float
     overhead_frac: float
@@ -77,7 +87,10 @@ def load_calibration() -> Calibration:
         act_bytes_per_token_hidden_layer_ckpt=float(raw["act_bytes_per_token_hidden_layer_ckpt"]),
         act_bytes_per_token_hidden_layer_full=float(raw["act_bytes_per_token_hidden_layer_full"]),
         attn_bytes_per_head_token2=float(raw["attn_bytes_per_head_token2"]),
-        attn_bytes_per_head_token_flash=float(raw["attn_bytes_per_head_token_flash"]),
+        attn_bytes_per_head_token_flash_kernel=float(
+            raw["attn_bytes_per_head_token_flash_kernel"]),
+        attn_bytes_per_head_token_flash_stock=float(
+            raw["attn_bytes_per_head_token_flash_stock"]),
         optimizer_bytes_per_param=float(raw["optimizer_bytes_per_param"]),
         overhead_frac=float(raw["overhead_frac"]),
         naive_loss_bytes_per_nv=float(raw["naive_loss_bytes_per_nv"]),

@@ -328,7 +328,7 @@ Pass `--attention flash` to price the flash-attention path instead of the stock 
 mlx-train-perf plan --config path/to/config.json --batch 1 --seq-len 8192 --lora-rank 8 --attention flash
 ```
 
-The flash model is an analytic saved-state term plus one measured linear coefficient, fit as an envelope over the worst-case measured loss arm so it never under-predicts at a measured anchor. That makes it read more conservatively for the fused loss in particular: up to about 1.4× the measured peak on the fitted model, about 1.6× cross-model. The validated range is 2,048 to 12,288 tokens; past that the fit extrapolates.
+The flash model is an analytic saved-state term plus a measured linear coefficient per loss implementation, each fit on its own arm's anchors so neither under-predicts the quantity the fit models (the weights term plus the measured training-loop marginal) at any of them, even before the safety cushion. Plans for the fused loss read at 1.09–1.19× the recorded peak on the fitted model and 1.22–1.24× cross-model (ranges rounded outward); before 0.6.0 a single worst-case coefficient pushed these to about 1.4× and 1.6×. The chunked loss uses the stock-loss arm's coefficient and reads at 1.13–1.26×; the naive loss reads higher still because its own loss term over-predicts away from its calibration shape. The validated range is 2,048 to 12,288 tokens; past that the fit extrapolates. The estimate models MLX active memory — if you are budgeting full resident footprint, bound the allocator's retained cache with `mx.set_cache_limit(...)` in your training process.
 
 Instead of checking one config at a time, ask the planner for the largest sequence length or batch size that fits your budget:
 
@@ -362,7 +362,7 @@ python scripts/northstar_context_sweep.py # the max-context sweep (1-2 h; heavy)
 # the packed dK/dV block-skip ratios (6.2x / 8.3x): one invocation per layout and length
 python scripts/bench_packed_dkv.py --n 4096 --layout alpaca --out _artifacts/packed_dkv
 python scripts/bench_packed_dkv.py --n 8192 --layout alpaca --out _artifacts/packed_dkv
-# the planner's flash-fit anchors and refit (envelope over the committed manifest)
+# the planner's flash-fit anchors and refit (per-loss-arm fit over the committed manifest)
 python scripts/fit_calibration.py --manifest _artifacts/calib_050/refit_manifest.json --dry-run
 # the packing table (3.00x / 2.95x): prep the dataset once per model, then run each arm
 # into its own --out dir (30 timed steps per arm, the script default, matching the

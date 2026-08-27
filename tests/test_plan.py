@@ -1,3 +1,5 @@
+import dataclasses
+
 import mlx.core as mx
 import pytest
 
@@ -529,9 +531,10 @@ def test_flash_attention_changes_only_the_attention_component() -> None:
 def test_flash_attention_component_hand_computed() -> None:
     """Exact-value pin (0.1.0 pin style): the flash attention component is the analytic
     O/L saved state (O = batch*seq*hidden*dtype_bytes, bf16=2; L = batch*heads*seq*4 fp32)
-    plus a_flash*batch*heads*seq. Drivers are powers of two from `_shape()` (batch=1,
-    seq=512, hidden=64, heads=4) so the products are float-exact; a_flash comes from the
-    committed calibration."""
+    plus a_flash*batch*heads*seq, where a_flash is the PER-LOSS-IMPL coefficient (0.6.0):
+    `impl="kernel"` selects the kernel-arm fit. Drivers are powers of two from `_shape()`
+    (batch=1, seq=512, hidden=64, heads=4) so the products are float-exact; the
+    coefficient comes from the committed calibration."""
     s = _shape()
     calib = load_calibration()
     cfg = TrainConfig(batch=1, seq_len=512, dtype="bfloat16", lora_rank=8, lora_layers=2,
@@ -540,8 +543,48 @@ def test_flash_attention_component_hand_computed() -> None:
     o_saved = 1 * 512 * 64 * 2       # attention output O in compute dtype (bf16)
     l_saved = 1 * 4 * 512 * 4        # logsumexp L in fp32
     expected = int(o_saved + l_saved
-                   + calib.attn_bytes_per_head_token_flash * (1 * 4 * 512))
+                   + calib.attn_bytes_per_head_token_flash_kernel * (1 * 4 * 512))
     assert comp["attention"] == expected
+
+
+def test_calibration_carries_per_loss_impl_flash_coefficients() -> None:
+    """The 0.6.0 calibration schema splits the flash live-transient coefficient by loss
+    arm. Both are positive, and the kernel (fused-loss) arm's is STRICTLY below the
+    stock-loss arm's -- the measured relationship the 0.5.0 refit exposed (the stock-CE
+    arm's materialized-logits transients land in its residual). Would go red if the
+    loader dropped a field or the committed fit inverted the arms."""
+    calib = load_calibration()
+    assert calib.attn_bytes_per_head_token_flash_kernel > 0
+    assert calib.attn_bytes_per_head_token_flash_stock > 0
+    assert (calib.attn_bytes_per_head_token_flash_kernel
+            < calib.attn_bytes_per_head_token_flash_stock)
+
+
+def test_flash_attention_routes_coefficient_by_loss_impl() -> None:
+    """`_attention_bytes`'s flash branch routes by `cfg.impl` (0.6.0): the kernel loss
+    gets the kernel-arm coefficient; chunked and naive get the stock-arm coefficient
+    (the worst measured arm -- those combinations are unmeasured, so they read
+    conservative). Exact-value pins per impl (power-of-two drivers, float-exact), plus
+    the user-visible consequence: the kernel impl's attention component is strictly
+    smaller. Would go red if the routing collapsed back to one shared coefficient or
+    routed an impl to the wrong arm."""
+    s = _shape()
+    calib = load_calibration()
+    saved = 1 * 512 * 64 * 2 + 1 * 4 * 512 * 4   # O (bf16) + L (fp32) analytic state
+    x_flash = 1 * 4 * 512                        # batch * heads * seq
+    by_impl = {}
+    for impl in ("kernel", "chunked", "naive"):
+        cfg = TrainConfig(batch=1, seq_len=512, dtype="bfloat16", lora_rank=8,
+                          lora_layers=2, grad_checkpoint=True, impl=impl,
+                          attention="flash")
+        _, comp = estimate_peak(s, cfg, calib)
+        by_impl[impl] = comp["attention"]
+    a_k = calib.attn_bytes_per_head_token_flash_kernel
+    a_s = calib.attn_bytes_per_head_token_flash_stock
+    assert by_impl["kernel"] == int(saved + a_k * x_flash)
+    assert by_impl["chunked"] == int(saved + a_s * x_flash)
+    assert by_impl["naive"] == int(saved + a_s * x_flash)
+    assert by_impl["kernel"] < by_impl["chunked"]
 
 
 def test_flash_attention_scales_linearly_with_seq() -> None:
@@ -570,11 +613,14 @@ def test_unknown_attention_raises_plan_input_error() -> None:
 
 def _synthesize_flash_fit_point(
     *, shape: ModelShape, calib, batch: int, seq_len: int, lora_rank: int,
-    lora_layers: int, grad_checkpoint: bool, a_flash: float,
+    lora_layers: int, grad_checkpoint: bool, a_flash: float, loss_arm: str = "kernel",
 ) -> FitPoint:
     """Synthesize a flash FitPoint FORWARD from a known a_flash, holding base/a_lin at
     the calibration's own values (which the flash fit holds fixed). marginal = base +
-    a_lin*x_lin + a_flash*x_flash + analytic_small + analytic_O/L."""
+    a_lin*x_lin + a_flash*x_flash + analytic_small + analytic_O/L. `loss_arm` tags the
+    point's loss arm (0.6.0); the synthesis math is arm-independent because the fit
+    subtracts the KERNEL loss's analytic term for BOTH arms (the stock arm's extra loss
+    transients live inside its own a_flash by construction)."""
     cfg = TrainConfig(batch=batch, seq_len=seq_len, dtype="bfloat16", lora_rank=lora_rank,
                       lora_layers=lora_layers, grad_checkpoint=grad_checkpoint, impl="kernel",
                       attention="flash")
@@ -586,7 +632,7 @@ def _synthesize_flash_fit_point(
     x_flash = batch * shape.heads * seq_len
     o_l = batch * seq_len * shape.hidden * 2 + batch * shape.heads * seq_len * 4
     marginal = calib.base_transient_bytes + a_lin * x_lin + a_flash * x_flash + analytic + o_l
-    return FitPoint(shape=shape, cfg=cfg, marginal_peak_bytes=marginal)
+    return FitPoint(shape=shape, cfg=cfg, marginal_peak_bytes=marginal, loss_arm=loss_arm)
 
 
 def test_fit_memory_coeffs_recovers_a_flash_from_flash_points() -> None:
@@ -602,7 +648,10 @@ def test_fit_memory_coeffs_recovers_a_flash_from_flash_points() -> None:
                                        a_flash=a_flash)
            for s in (512, 1024, 2048)]
     c = fit_memory_coeffs(pts, calib=calib)
-    assert c["attn_bytes_per_head_token_flash"] == pytest.approx(a_flash, rel=1e-6)
+    assert c["attn_bytes_per_head_token_flash_kernel"] == pytest.approx(a_flash, rel=1e-6)
+    # Kernel-arm-only points must never move the stock arm's coefficient.
+    assert (c["attn_bytes_per_head_token_flash_stock"]
+            == calib.attn_bytes_per_head_token_flash_stock)
 
 
 def test_fit_memory_coeffs_recovers_a_flash_from_a_single_flash_point() -> None:
@@ -615,7 +664,72 @@ def test_fit_memory_coeffs_recovers_a_flash_from_a_single_flash_point() -> None:
                                        lora_rank=8, lora_layers=2, grad_checkpoint=True,
                                        a_flash=a_flash)]
     c = fit_memory_coeffs(pts, calib=calib)
-    assert c["attn_bytes_per_head_token_flash"] == pytest.approx(a_flash, rel=1e-6)
+    assert c["attn_bytes_per_head_token_flash_kernel"] == pytest.approx(a_flash, rel=1e-6)
+
+
+def test_fit_memory_coeffs_recovers_stock_arm_a_flash_and_keeps_kernel_arm() -> None:
+    """Stock-loss-arm flash points (loss_arm="stock", the bench's `identity.stock: true`
+    arm) fit ONLY `attn_bytes_per_head_token_flash_stock`; the kernel arm's coefficient
+    is preserved from `calib`. Would go red if the arm partition collapsed (both keys
+    moving) or the arms were swapped."""
+    shape = _shape()
+    calib = load_calibration()
+    a_flash = 44444.0
+    pts = [_synthesize_flash_fit_point(shape=shape, calib=calib, batch=1, seq_len=s,
+                                       lora_rank=8, lora_layers=2, grad_checkpoint=True,
+                                       a_flash=a_flash, loss_arm="stock")
+           for s in (512, 1024, 2048)]
+    c = fit_memory_coeffs(pts, calib=calib)
+    assert c["attn_bytes_per_head_token_flash_stock"] == pytest.approx(a_flash, rel=1e-6)
+    assert (c["attn_bytes_per_head_token_flash_kernel"]
+            == calib.attn_bytes_per_head_token_flash_kernel)
+
+
+def test_fit_memory_coeffs_mixed_arms_recover_independently() -> None:
+    """A mixed manifest (the real 0.5.0 campaign shape: both arms at every seq) recovers
+    each arm's own coefficient exactly -- the fused arm's fit must not be dragged toward
+    the stock arm's larger residuals (the 0.5.0 pooled-envelope failure mode this split
+    removes)."""
+    shape = _shape()
+    calib = load_calibration()
+    a_kernel, a_stock = 12000.0, 34000.0
+    pts = []
+    for s in (512, 1024, 2048):
+        pts.append(_synthesize_flash_fit_point(
+            shape=shape, calib=calib, batch=1, seq_len=s, lora_rank=8, lora_layers=2,
+            grad_checkpoint=True, a_flash=a_kernel, loss_arm="kernel"))
+        pts.append(_synthesize_flash_fit_point(
+            shape=shape, calib=calib, batch=1, seq_len=s, lora_rank=8, lora_layers=2,
+            grad_checkpoint=True, a_flash=a_stock, loss_arm="stock"))
+    c = fit_memory_coeffs(pts, calib=calib)
+    assert c["attn_bytes_per_head_token_flash_kernel"] == pytest.approx(a_kernel, rel=1e-6)
+    assert c["attn_bytes_per_head_token_flash_stock"] == pytest.approx(a_stock, rel=1e-6)
+
+
+def test_fit_memory_coeffs_refuses_stock_arm_on_stock_attention_point() -> None:
+    """`loss_arm="stock"` is only meaningful for FLASH points -- the stock-ATTENTION
+    calibration campaign never had a stock-loss arm, so a stock-attention point tagged
+    stock-arm is a manifest error, refused with a typed PlanInputError rather than
+    silently folded into the stock-attention fit."""
+    shape = _shape()
+    calib = load_calibration()
+    cfg = TrainConfig(batch=1, seq_len=512, dtype="bfloat16", lora_rank=8, lora_layers=2,
+                      grad_checkpoint=True, impl="kernel", attention="stock")
+    pt = FitPoint(shape=shape, cfg=cfg, marginal_peak_bytes=1e9, loss_arm="stock")
+    with pytest.raises(PlanInputError, match="loss_arm"):
+        fit_memory_coeffs([pt], calib=calib)
+
+
+def test_fit_memory_coeffs_refuses_unknown_loss_arm() -> None:
+    """An out-of-vocabulary `loss_arm` is refused (typed), never silently treated as
+    either arm."""
+    shape = _shape()
+    calib = load_calibration()
+    pt = _synthesize_flash_fit_point(shape=shape, calib=calib, batch=1, seq_len=512,
+                                     lora_rank=8, lora_layers=2, grad_checkpoint=True,
+                                     a_flash=1000.0, loss_arm="bogus")
+    with pytest.raises(PlanInputError, match="loss_arm"):
+        fit_memory_coeffs([pt], calib=calib)
 
 
 def test_fit_memory_coeffs_flash_only_keeps_stock_coefficients() -> None:
@@ -647,8 +761,10 @@ def test_fit_memory_coeffs_without_flash_points_keeps_calib_flash() -> None:
             grad_checkpoint=True, base=1e9, a_lin_ckpt=3.0, a_lin_full=999.0, a_quad=5.0)
 
     c = fit_memory_coeffs([synth(512), synth(1024), synth(2048)], calib=calib)
-    assert (c["attn_bytes_per_head_token_flash"]
-            == calib.attn_bytes_per_head_token_flash)
+    assert (c["attn_bytes_per_head_token_flash_kernel"]
+            == calib.attn_bytes_per_head_token_flash_kernel)
+    assert (c["attn_bytes_per_head_token_flash_stock"]
+            == calib.attn_bytes_per_head_token_flash_stock)
 
 
 def test_fit_memory_coeffs_flash_fit_ols_default_is_byte_identical() -> None:
@@ -694,21 +810,40 @@ def test_fit_memory_coeffs_flash_fit_envelope_matches_max_ratio() -> None:
 
     c_ols = fit_memory_coeffs(pts, calib=calib, flash_fit="ols")
     c_env = fit_memory_coeffs(pts, calib=calib, flash_fit="envelope")
-    assert c_ols["attn_bytes_per_head_token_flash"] == pytest.approx(expected_ols, rel=1e-6)
-    assert (c_env["attn_bytes_per_head_token_flash"]
+    assert (c_ols["attn_bytes_per_head_token_flash_kernel"]
+            == pytest.approx(expected_ols, rel=1e-6))
+    assert (c_env["attn_bytes_per_head_token_flash_kernel"]
             == pytest.approx(expected_envelope, rel=1e-6))
 
 
+def test_fit_memory_coeffs_envelope_is_per_arm_not_pooled() -> None:
+    """The envelope is taken WITHIN each arm, never across the pooled set: a stock-arm
+    point with a much larger true ratio must not inflate the kernel arm's envelope (the
+    exact conservatism the 0.5.0 pooled envelope suffered and 0.6.0 removes)."""
+    shape = _shape()
+    calib = load_calibration()
+    pts = [
+        _synthesize_flash_fit_point(shape=shape, calib=calib, batch=1, seq_len=512,
+                                    lora_rank=8, lora_layers=2, grad_checkpoint=True,
+                                    a_flash=2_000.0, loss_arm="kernel"),
+        _synthesize_flash_fit_point(shape=shape, calib=calib, batch=1, seq_len=1024,
+                                    lora_rank=8, lora_layers=2, grad_checkpoint=True,
+                                    a_flash=90_000.0, loss_arm="stock"),
+    ]
+    c = fit_memory_coeffs(pts, calib=calib, flash_fit="envelope")
+    assert c["attn_bytes_per_head_token_flash_kernel"] == pytest.approx(2_000.0, rel=1e-6)
+    assert c["attn_bytes_per_head_token_flash_stock"] == pytest.approx(90_000.0, rel=1e-6)
+
+
 def test_predicted_peak_one_sided_and_bounded_qwen3_8b_flash() -> None:
-    """Measured-vs-predicted acceptance for the flash branch under the 0.5.0 ENVELOPE
-    contract. The 0.5.0 refit (anchors to seq 12288, BOTH loss impls) showed the old
-    OLS coefficient UNDER-predicted the stock-loss flash arm from 8192 up (-2.1 GiB at
-    8192, -4.1 at 12288); the envelope fit covers the worst measured arm instead, so
-    the FUSED-loss anchor here reads deliberately conservative rather than accurate.
-    Contract pinned: predicted >= measured (never under), AND predicted <= 1.5x
-    measured (measured ratio ~1.41 at this anchor under the envelope calibration --
-    ~6% margin, own measurement, never inherited). Anchor: Qwen3-8B-4bit, seq 8192,
-    gc=True, kernel, attention=flash, MEASURED total 12.7462 GB
+    """Measured-vs-predicted acceptance for the flash branch under the 0.6.0 PER-ARM
+    contract. The 0.5.0 envelope covered BOTH loss arms with one coefficient, so this
+    fused-loss anchor read at ratio ~1.41; the per-arm split fits the fused arm on its
+    own anchors and the same anchor now reads ~1.14 (own measurement, 2026-08-26
+    refit). Contract pinned: predicted >= measured (never under), AND predicted <=
+    1.2x measured (~5.7% margin over the measured 1.1350, own measurement, never
+    inherited). Anchor: Qwen3-8B-4bit, seq 8192, gc=True, kernel, attention=flash,
+    MEASURED total 12.7462 GB
     (`_artifacts/bench_train_step_flash/..._seq8192_ours.json`)."""
     qwen = ModelShape(vocab=151936, hidden=4096, layers=36, intermediate=12288, heads=32,
                       kv_heads=8, tied=False, quant_bits=4, quant_group=64)
@@ -718,21 +853,21 @@ def test_predicted_peak_one_sided_and_bounded_qwen3_8b_flash() -> None:
     peak, _ = estimate_peak(qwen, cfg, calib)
     measured_bytes = 12.7462 * 1024**3
     assert peak >= measured_bytes          # never under -- the planner's core promise
-    assert peak <= measured_bytes * 1.5    # bounded conservatism (measured 1.405)
+    assert peak <= measured_bytes * 1.2    # bounded conservatism (measured 1.1350)
 
 
 def test_flash_cross_model_validation_on_llama3b() -> None:
-    """Cross-model validation of the Qwen-fitted a_flash on Llama-3.2-3B-Instruct-4bit --
-    a DIFFERENT heads/(hidden*layers) ratio than the identification model, so this checks
-    generality, not fit. The Qwen-fitted coefficient bounds the measured Llama-3B flash
-    train-step TOTAL peak (seq 8192, gc=True, kernel;
-    `_artifacts/bench_train_step_flash_llama3b/..._seq8192_ours.json`, total 7.5133 GB)
-    under the 0.5.0 ENVELOPE contract: one-sided (never under) with bounded
-    conservatism. The 0.5.0 refit covers the worst measured loss arm, so the fused-loss
-    anchor here reads conservative; the cross-model ratio is WIDER than the
-    identification model's (measured 1.566 here vs 1.405 on Qwen under the envelope
-    calibration -- Llama's heads/(hidden*layers) ratio amplifies the shared
-    coefficient), so this test pins its OWN bound (own measurement, never inherited)."""
+    """Cross-model validation of the Qwen-fitted fused-arm a_flash on
+    Llama-3.2-3B-Instruct-4bit -- a DIFFERENT heads/(hidden*layers) ratio than the
+    identification model, so this checks generality, not fit. The Qwen-fitted kernel-arm
+    coefficient bounds the measured Llama-3B flash train-step TOTAL peak (seq 8192,
+    gc=True, kernel; `_artifacts/bench_train_step_flash_llama3b/..._seq8192_ours.json`,
+    total 7.5133 GB) under the 0.6.0 PER-ARM contract: one-sided (never under) with
+    bounded conservatism. The cross-model ratio is WIDER than the identification
+    model's (measured 1.2217 here vs 1.1350 on Qwen -- Llama's heads/(hidden*layers)
+    ratio amplifies the coefficient; both are far below the 0.5.0 shared-envelope
+    1.566/1.405), so this test pins its OWN bound (own measurement, never
+    inherited)."""
     llama = ModelShape(vocab=128256, hidden=3072, layers=28, intermediate=8192, heads=24,
                        kv_heads=8, tied=True, quant_bits=4, quant_group=64)
     calib = load_calibration()
@@ -741,7 +876,74 @@ def test_flash_cross_model_validation_on_llama3b() -> None:
     peak, _ = estimate_peak(llama, cfg, calib)
     measured_bytes = 7.5133 * 1024**3
     assert peak >= measured_bytes          # never under, cross-model too
-    assert peak <= measured_bytes * 1.7    # bounded conservatism (measured 1.566)
+    assert peak <= measured_bytes * 1.3    # bounded conservatism (measured 1.2217)
+
+
+def test_flash_predictions_cover_anchors_before_the_cushion() -> None:
+    """Coefficient-level one-sidedness (0.6.0 review finding): the fitted flash
+    coefficients themselves -- not the 10% `overhead_frac` cushion -- must cover every
+    committed anchor. The cushion exists for allocator fragmentation and run-to-run
+    variance; a fit that under-predicts an anchor and hides behind the cushion spends
+    that margin on fit error (the per-point residual ratios RISE with seq, so a
+    through-origin OLS necessarily lands below the top anchor -- measured: OLS
+    20415.73 gave an uncushioned ratio 0.9868 at the seq-12288 fused anchor, ~0.22 GiB
+    under). Evaluates every committed Qwen3-8B anchor, both arms, with
+    `overhead_frac=0`: fused anchors through the kernel route, stock-CE anchors
+    through the shipped chunked route. Would go red if the calibration regressed to a
+    fit that is only cushion-covered (the exact state this test was written RED
+    against)."""
+    qwen = ModelShape(vocab=151936, hidden=4096, layers=36, intermediate=12288, heads=32,
+                      kv_heads=8, tied=False, quant_bits=4, quant_group=64)
+    calib = dataclasses.replace(load_calibration(), overhead_frac=0.0)
+    fused_anchors = (
+        (2048, 2.7106), (8192, 8.3736), (10240, 10.4289), (12288, 12.4794),
+    )   # _artifacts/bench_train_step_flash + _artifacts/calib_050, *_ours.json marginals
+    stock_anchors = (
+        (2048, 3.4304), (8192, 11.5427), (10240, 14.3876), (12288, 17.2327),
+    )   # same locations, *_stock.json marginals
+    for impl, anchors in (("kernel", fused_anchors), ("chunked", stock_anchors)):
+        for seq_len, marginal_peak_gb in anchors:
+            cfg = TrainConfig(batch=1, seq_len=seq_len, dtype="bfloat16", lora_rank=8,
+                              lora_layers=36, grad_checkpoint=True, impl=impl,
+                              attention="flash")
+            predicted_total, components = estimate_peak(qwen, cfg, calib)
+            measured_total = components["weights"] + marginal_peak_gb * 1024**3
+            assert predicted_total >= measured_total, (
+                f"the {impl}-routed fit under-covers the anchor at seq_len={seq_len} "
+                f"before the cushion: predicted={predicted_total} "
+                f"measured_total={measured_total}"
+            )
+
+
+def test_flash_cross_model_stock_arm_validation_on_llama3b() -> None:
+    """Cross-model validation for the STOCK-loss arm's coefficient (the 0.6.0
+    counterpart of the fused-arm test above): the Qwen-fitted stock-arm coefficient,
+    reached through the shipped non-kernel routing (`impl="chunked"`), bounds the
+    measured Llama-3B stock-CE flash anchors --
+    `_artifacts/bench_train_step_flash_llama3b/..._seq2048_stock.json` (marginal
+    2.8988 GB) and `..._seq8192_stock.json` (marginal 9.4254 GB). Measured ratios
+    1.2646 / 1.1359 (own measurement, 2026-08-26 per-arm envelope refit,
+    reconstructed-total style matching
+    `scripts/fit_calibration.py::_flash_fit_is_one_sided`); bound pinned 1.35 (~7%
+    margin over the wider 2048 anchor). Would go red if a stock-arm regression let a
+    chunked/naive flash caller be under-planned on a different model family."""
+    llama = ModelShape(vocab=128256, hidden=3072, layers=28, intermediate=8192, heads=24,
+                       kv_heads=8, tied=True, quant_bits=4, quant_group=64)
+    calib = load_calibration()
+    anchors = (
+        (2048, 2.8988),   # ..._seq2048_stock.json
+        (8192, 9.4254),   # ..._seq8192_stock.json
+    )
+    for seq_len, marginal_peak_gb in anchors:
+        cfg = TrainConfig(batch=1, seq_len=seq_len, dtype="bfloat16", lora_rank=8,
+                          lora_layers=28, grad_checkpoint=True, impl="chunked",
+                          attention="flash")
+        predicted_total, components = estimate_peak(llama, cfg, calib)
+        measured_total = components["weights"] + marginal_peak_gb * 1024**3
+        assert predicted_total >= measured_total, (
+            f"under-predicted the Llama stock-arm anchor at seq_len={seq_len}"
+        )
+        assert predicted_total <= measured_total * 1.35   # measured 1.2646 / 1.1359
 
 
 def test_envelope_flash_fit_guards_a_degenerate_point_instead_of_raw_zerodivisionerror() -> None:
@@ -774,33 +976,30 @@ def test_envelope_flash_fit_guards_a_degenerate_point_instead_of_raw_zerodivisio
 
 
 def test_flash_never_under_predicts_stock_loss_anchors() -> None:
-    """Checkpoint C review fix (item 1, High): the two never-under-predict contract
-    tests above (`test_predicted_peak_one_sided_and_bounded_qwen3_8b_flash`,
-    `test_flash_cross_model_validation_on_llama3b`) only exercise FUSED-loss ("ours")
-    anchors -- both are satisfied by the OLD (pre-0.5.0-refit)
-    `attn_bytes_per_head_token_flash` coefficient (18633.411713264017) too (verified:
-    that coefficient gives ratios 1.0785/1.1508 at those two anchors, both inside
-    their pinned bands), so neither test would have caught a regression back to it.
-    This test closes that gap with the three real STOCK-loss (mlx_lm's own default
-    cross-entropy, NOT this project's fused kernel) flash artifacts instead --
-    `_artifacts/bench_train_step_flash/..._seq8192_stock.json`,
+    """Never-under-predict contract for the STOCK-loss flash arm (mlx_lm's own default
+    cross-entropy, NOT this project's fused kernel), against the three real stock-arm
+    anchors -- `_artifacts/bench_train_step_flash/..._seq8192_stock.json`,
     `_artifacts/calib_050/flash_n10240/..._stock.json`,
-    `_artifacts/calib_050/flash_n12288/..._stock.json` -- and mirrors the SAME
-    TrainConfig shape the two contract tests above use (Qwen3-8B-4bit, batch=1,
-    lora_rank=8, lora_layers=36, grad_checkpoint=True, impl="kernel",
-    attention="flash"; only seq_len varies per anchor).
+    `_artifacts/calib_050/flash_n12288/..._stock.json`.
 
-    RED verification (arithmetic, done against the OLD coefficient directly -- it
-    predates this test and is no longer installed, so there is no commit to run
-    against): reconstructing `measured_total = estimate_peak(...)[1]["weights"] +
-    marginal_peak_gb * 1024**3` exactly the way `scripts/fit_calibration.py`'s
-    `_flash_fit_is_one_sided` does, the OLD coefficient (18633.411713264017)
-    UNDER-predicts at all three anchors: seq=8192 (marginal_peak_gb=11.5427) by 2.041
-    GiB, seq=10240 (marginal_peak_gb=14.3876) by 3.040 GiB, seq=12288
-    (marginal_peak_gb=17.2327) by 4.039 GiB -- confirming this is a real regression
-    this test would have caught. The CURRENT (committed, envelope-refit) coefficient
-    clears all three with margin (own measurement: ~2.12/2.16/2.20 GiB headroom
-    respectively)."""
+    0.6.0 semantics: the per-arm split means the KERNEL-impl prediction no longer
+    covers the stock-CE arm (that was the pooled envelope's deliberate conservatism,
+    now removed from the fused arm). The stock arm is instead covered by the
+    NON-KERNEL routing (`impl in ("chunked", "naive")` -> the stock-arm coefficient),
+    so this test evaluates the BINDING shipped non-kernel combination --
+    `impl="chunked"` (naive's own loss term is far larger, so chunked is the smallest
+    non-kernel prediction) -- exactly the way `scripts/fit_calibration.py`'s
+    `_flash_fit_is_one_sided` routes stock-arm points. Measured ratios under the
+    committed 0.6.0 calibration: 1.1860 / 1.1709 / 1.1598 (own measurement,
+    2026-08-26 per-arm envelope refit). Would go red if the stock-arm coefficient
+    regressed low enough that a real chunked/naive flash caller could be under-planned
+    at a measured anchor.
+
+    RED verification (arithmetic): routing these anchors through the KERNEL
+    coefficient (the shipped 0.6.0 fused-arm envelope value, 21145.74) under-predicts all three
+    (by 1.366 GiB at seq=8192, ratio 0.914) -- the exact failure class this test
+    caught live when the
+    routing landed before the test was re-anchored, confirming it discriminates."""
     qwen = ModelShape(vocab=151936, hidden=4096, layers=36, intermediate=12288, heads=32,
                       kv_heads=8, tied=False, quant_bits=4, quant_group=64)
     calib = load_calibration()
@@ -811,7 +1010,7 @@ def test_flash_never_under_predicts_stock_loss_anchors() -> None:
     )
     for seq_len, marginal_peak_gb in anchors:
         cfg = TrainConfig(batch=1, seq_len=seq_len, dtype="bfloat16", lora_rank=8,
-                          lora_layers=36, grad_checkpoint=True, impl="kernel",
+                          lora_layers=36, grad_checkpoint=True, impl="chunked",
                           attention="flash")
         predicted_total, components = estimate_peak(qwen, cfg, calib)
         measured_total = components["weights"] + marginal_peak_gb * 1024**3
@@ -831,8 +1030,9 @@ def test_flash_never_under_predicts_fused_loss_anchors_past_8192() -> None:
     Anchors: `_artifacts/calib_050/flash_n10240/..._ours.json`
     (marginal_peak_gb=10.4289) and `_artifacts/calib_050/flash_n12288/..._ours.json`
     (marginal_peak_gb=12.4794); same TrainConfig shape as the sibling stock-anchor
-    test. The committed envelope coefficient clears both at ratio ~1.416 (own
-    measurement, final-gate review)."""
+    test. The committed 0.6.0 per-arm envelope coefficient clears both at ratios
+    1.1197 / 1.1030 (own measurement, 2026-08-26 refit; the 0.5.0 shared envelope
+    read ~1.416 here)."""
     qwen = ModelShape(vocab=151936, hidden=4096, layers=36, intermediate=12288, heads=32,
                       kv_heads=8, tied=False, quant_bits=4, quant_group=64)
     calib = load_calibration()

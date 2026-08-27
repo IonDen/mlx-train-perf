@@ -141,10 +141,20 @@ class FitPoint:
     `train_step` bench condition measured (`bench/worker.py::run_train_step`'s own
     `marginal_peak_gb` field, converted to bytes -- the training LOOP's own
     incremental memory above whatever was already resident before it started, NOT
-    `total_peak_gb`, which also counts the already-resident weights)."""
+    `total_peak_gb`, which also counts the already-resident weights).
+
+    `loss_arm` (0.6.0) names which LOSS the measured condition actually ran:
+    `"kernel"` (this project's fused loss -- the bench's "ours" arm) or `"stock"`
+    (mlx-lm's own materialized-logits cross-entropy -- the bench's `identity.stock:
+    true` arm). Both arms record `identity.impl == "kernel"` in their artifacts (the
+    worker's identity describes the kernel under test, the `stock` flag selects the
+    baseline arm), so the arm cannot be read from `cfg.impl` -- it routes flash points
+    into their own per-arm coefficient fit. Typed as `str` for consistency with
+    `TrainConfig.impl`/`dtype`; `fit_memory_coeffs` refuses out-of-set values."""
     shape: ModelShape
     cfg: TrainConfig
     marginal_peak_bytes: float
+    loss_arm: str = "kernel"
 
 
 def _dtype_bytes(dtype: str) -> int:
@@ -229,17 +239,38 @@ def _attention_bytes(cfg: TrainConfig, shape: ModelShape, calib: Calibration) ->
     the trainable context length regardless of the loss layer.
 
     FLASH (0.2.0 opt-in): the analytic O(N.D) saved state (`_flash_saved_state_bytes`) plus
-    a fitted LINEAR live-transient term `a_flash * batch * heads * seq`. Driver form settled
-    from the single-op scaling measurements (linear growth; the split-regime steepening folded into
-    the coefficient, over-predict-safe). bf16-calibrated (dtype folded into a_flash).
-    Validated against measured Qwen3-8B-4bit anchors up to seq 12288 (0.5.0 refit, both
-    loss impls, envelope fit -- one coefficient covers the worst measured arm, so the
-    fused-loss arm reads deliberately conservative); beyond 12288 the fit extrapolates."""
+    a fitted LINEAR live-transient term `a_flash * batch * heads * seq`, where `a_flash` is
+    PER-LOSS-IMPL since 0.6.0: `impl="kernel"` selects the fused-loss arm's coefficient;
+    `"chunked"`/`"naive"` select the stock-CE arm's -- the worst measured arm (its fit
+    absorbed the stock loss's live transients), serving the unmeasured chunked/naive flash
+    combinations conservatively. Driver form settled from the single-op scaling
+    measurements (linear growth; the split-regime steepening folded into the coefficient,
+    over-predict-safe). bf16-calibrated (dtype folded into each coefficient). Validated
+    against measured Qwen3-8B-4bit anchors up to seq 12288 per arm (0.5.0 anchors, 0.6.0
+    per-arm fit); beyond 12288 the fit extrapolates.
+
+    Measurement boundary: the anchors are ACTIVE-memory peaks
+    (`mx.get_peak_memory` marginals from the bench worker) -- MLX's retained cache pool
+    is not modeled, so a caller who wants the plan to reflect full resident footprint
+    should bound that pool with `mx.set_cache_limit(...)` in the training process. This
+    is one reason the shipped per-arm coefficients are envelopes (largest per-anchor
+    ratio), not least-squares averages.
+
+    An unknown `impl` raises here as well as in `_loss_bytes` -- the flash branch cannot
+    silently pick an arm for a loss impl it does not know."""
     if cfg.attention == "stock":
         return int(calib.attn_bytes_per_head_token2 * cfg.batch * shape.heads * cfg.seq_len**2)
     if cfg.attention == "flash":
+        if cfg.impl == "kernel":
+            a_flash = calib.attn_bytes_per_head_token_flash_kernel
+        elif cfg.impl in ("chunked", "naive"):
+            a_flash = calib.attn_bytes_per_head_token_flash_stock
+        else:
+            raise PlanInputError(
+                f"unknown impl {cfg.impl!r}; expected 'naive', 'chunked', or 'kernel'"
+            )
         return int(_flash_saved_state_bytes(cfg, shape)
-                   + calib.attn_bytes_per_head_token_flash * cfg.batch * shape.heads * cfg.seq_len)
+                   + a_flash * cfg.batch * shape.heads * cfg.seq_len)
     raise PlanInputError(
         f"unknown attention {cfg.attention!r}; expected 'stock' or 'flash'"
     )
@@ -278,7 +309,13 @@ def estimate_peak(
     shape: ModelShape, cfg: TrainConfig, calib: Calibration
 ) -> tuple[int, dict[str, int]]:
     """Pure: predicted peak bytes plus a component breakdown. No I/O, no device query --
-    `calib` is passed in rather than loaded here so this function has no hidden state."""
+    `calib` is passed in rather than loaded here so this function has no hidden state.
+
+    Measurement boundary: the calibration anchors are ACTIVE-memory peaks
+    (`mx.get_peak_memory` marginals), so the estimate models MLX active memory -- the
+    allocator's retained cache pool is not included. A caller budgeting full resident
+    footprint should bound that pool with `mx.set_cache_limit(...)` in the training
+    process."""
     dtype_size = _dtype_bytes(cfg.dtype)
     components = {
         "weights": _weights_bytes(shape, dtype_size),
@@ -376,7 +413,8 @@ def fit_memory_coeffs(
 
     Returns a dict with keys `base_transient_bytes`,
     `act_bytes_per_token_hidden_layer_ckpt`, `act_bytes_per_token_hidden_layer_full`,
-    `attn_bytes_per_head_token2`.
+    `attn_bytes_per_head_token2`, `attn_bytes_per_head_token_flash_kernel`,
+    `attn_bytes_per_head_token_flash_stock`.
 
     Each point's MARGINAL peak (kernel impl) is modeled as:
 
@@ -405,16 +443,18 @@ def fit_memory_coeffs(
     every stock coefficient is kept unchanged from `calib` -- a flash refit never disturbs
     the stock model.
 
-    FLASH points fit `a_flash` (`attn_bytes_per_head_token_flash`) by a 1-variable
-    through-origin residual OLS: `x_flash = batch*heads*seq` is an EXACT scalar multiple of
-    `x_lin` at fixed model shape (ratio heads/(hidden*layers)), so a joint (base, a_lin,
-    a_flash) fit is rank-deficient at ANY number of same-model points -- instead base and
-    a_lin are held FIXED from the passed-in stock `calib`, the analytic small terms and the
-    O(N.D) saved state (`_flash_saved_state_bytes`) are subtracted, and a_flash absorbs the
-    residual live transient (`num/den`, den = sum x_flash^2 > 0 needs >= 1 flash point).
-    With no flash points the existing `calib` value is kept. The Llama-3.2-3B flash point
-    (a different heads/(hidden*layers) ratio) is used for cross-model VALIDATION, not
-    identification.
+    FLASH points fit the PER-LOSS-ARM coefficients
+    (`attn_bytes_per_head_token_flash_kernel` / `_stock`, partitioned by
+    `FitPoint.loss_arm` -- 0.6.0) by a 1-variable through-origin residual OLS per arm:
+    `x_flash = batch*heads*seq` is an EXACT scalar multiple of `x_lin` at fixed model
+    shape (ratio heads/(hidden*layers)), so a joint (base, a_lin, a_flash) fit is
+    rank-deficient at ANY number of same-model points -- instead base and a_lin are held
+    FIXED from the passed-in stock `calib`, the analytic small terms and the O(N.D)
+    saved state (`_flash_saved_state_bytes`) are subtracted, and each arm's a_flash
+    absorbs its own residual live transient (`num/den`, den = sum x_flash^2 > 0 needs
+    >= 1 point in the arm). An arm with no points keeps its existing `calib` value. The
+    Llama-3.2-3B flash points (a different heads/(hidden*layers) ratio) are used for
+    cross-model VALIDATION, not identification.
 
     `flash_fit` selects HOW the flash coefficient above is computed from the same
     `flash_residual`/`x_flash` closures: `"ols"` (default) is the shipped 1-variable
@@ -442,6 +482,18 @@ def fit_memory_coeffs(
                 f"fit_memory_coeffs only accepts impl='kernel' FitPoints (got "
                 f"impl={p.cfg.impl!r}) -- 'chunked'/'naive' measure a different loss-layer "
                 "memory shape that would contaminate the fit"
+            )
+        if p.loss_arm not in ("kernel", "stock"):
+            raise PlanInputError(
+                f"unknown loss_arm {p.loss_arm!r} on FitPoint (seq_len={p.cfg.seq_len}, "
+                f"batch={p.cfg.batch}); expected 'kernel' or 'stock'"
+            )
+        if p.loss_arm == "stock" and p.cfg.attention != "flash":
+            raise PlanInputError(
+                "loss_arm='stock' is only meaningful for attention='flash' FitPoints -- "
+                "the stock-attention calibration has no stock-loss arm (offending point: "
+                f"seq_len={p.cfg.seq_len}, batch={p.cfg.batch}, "
+                f"attention={p.cfg.attention!r})"
             )
 
     def residual(p: FitPoint) -> float:
@@ -499,18 +551,25 @@ def fit_memory_coeffs(
         a_lin_full = calib.act_bytes_per_token_hidden_layer_full
         a_quad = calib.attn_bytes_per_head_token2
 
-    if flash_points:
-        # a_flash by 1-variable through-origin residual OLS, holding base/a_lin FIXED from
-        # the stock `calib` (the x_flash driver is collinear with x_lin at fixed shape, so
-        # they cannot be jointly identified). The analytic small terms and the O(N.D) saved
-        # state are subtracted; a_flash captures the residual live backward transient.
-        def flash_residual(p: FitPoint) -> float:
-            a_lin = (calib.act_bytes_per_token_hidden_layer_ckpt if p.cfg.grad_checkpoint
-                     else calib.act_bytes_per_token_hidden_layer_full)
-            return (residual(p) - calib.base_transient_bytes - a_lin * x_lin(p)
-                    - _flash_saved_state_bytes(p.cfg, p.shape))
+    # a_flash by 1-variable through-origin residual OLS, holding base/a_lin FIXED from
+    # the stock `calib` (the x_flash driver is collinear with x_lin at fixed shape, so
+    # they cannot be jointly identified). The analytic small terms and the O(N.D) saved
+    # state are subtracted; a_flash captures the residual live backward transient. Since
+    # 0.6.0 the flash points partition BY LOSS ARM (`FitPoint.loss_arm`) and each arm
+    # fits its own coefficient independently -- both arms subtract the same analytic
+    # KERNEL loss term (both arms' artifacts record impl="kernel"; the stock arm's extra
+    # loss transients are deliberately absorbed into ITS coefficient, which is what makes
+    # it the conservative arm). An arm with no points keeps its `calib` value.
+    def flash_residual(p: FitPoint) -> float:
+        a_lin = (calib.act_bytes_per_token_hidden_layer_ckpt if p.cfg.grad_checkpoint
+                 else calib.act_bytes_per_token_hidden_layer_full)
+        return (residual(p) - calib.base_transient_bytes - a_lin * x_lin(p)
+                - _flash_saved_state_bytes(p.cfg, p.shape))
 
-        den = sum(x_flash(p) ** 2 for p in flash_points)
+    def fit_flash_arm(arm_points: list[FitPoint], prior: float) -> float:
+        if not arm_points:
+            return prior
+        den = sum(x_flash(p) ** 2 for p in arm_points)
         if den <= 0:
             raise PlanInputError(
                 "fit_memory_coeffs cannot identify a_flash: the flash design has "
@@ -523,18 +582,24 @@ def fit_memory_coeffs(
             # one degenerate point (batch=0) mixed with other, well-formed points still
             # passes that check but would raise a raw ZeroDivisionError here --
             # `_guard_envelope_x_flash_positive` names the offending point instead.
-            _guard_envelope_x_flash_positive(flash_points, x_flash)
-            a_flash = max(flash_residual(p) / x_flash(p) for p in flash_points)
-        else:
-            num = sum(flash_residual(p) * x_flash(p) for p in flash_points)
-            a_flash = num / den
-    else:
-        a_flash = calib.attn_bytes_per_head_token_flash
+            _guard_envelope_x_flash_positive(arm_points, x_flash)
+            return max(flash_residual(p) / x_flash(p) for p in arm_points)
+        return sum(flash_residual(p) * x_flash(p) for p in arm_points) / den
+
+    a_flash_kernel = fit_flash_arm(
+        [p for p in flash_points if p.loss_arm == "kernel"],
+        calib.attn_bytes_per_head_token_flash_kernel,
+    )
+    a_flash_stock = fit_flash_arm(
+        [p for p in flash_points if p.loss_arm == "stock"],
+        calib.attn_bytes_per_head_token_flash_stock,
+    )
 
     return {
         "base_transient_bytes": base,
         "act_bytes_per_token_hidden_layer_ckpt": a_lin_ckpt,
         "act_bytes_per_token_hidden_layer_full": float(a_lin_full),
         "attn_bytes_per_head_token2": a_quad,
-        "attn_bytes_per_head_token_flash": float(a_flash),
+        "attn_bytes_per_head_token_flash_kernel": float(a_flash_kernel),
+        "attn_bytes_per_head_token_flash_stock": float(a_flash_stock),
     }
