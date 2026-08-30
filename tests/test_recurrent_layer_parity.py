@@ -17,8 +17,8 @@ composition gates: they prove the post-norm + output-projection wiring in
 `__call__` doesn't introduce a NEW divergence on top of whatever `_pre_norm`
 already has.
 
-0045 constraint: gradient comparisons use `mx.grad`/`nn.value_and_grad`, but
-never assert on the loss VALUE the latter also returns.
+Gradient comparisons use `mx.grad`/`nn.value_and_grad`; no assertion reads a
+loss value returned by `value_and_grad`.
 """
 
 import mlx.core as mx
@@ -97,6 +97,10 @@ def _capture_stock_pre_op(
 
     monkeypatch.setattr(qwen3_5_mod, "gated_delta_update", spy)
     stock(inputs, None, None)
+    assert captured, (
+        "stock's forward never called gated_delta_update -- the spy never fired, "
+        "so this capture is not a real oracle"
+    )
     return captured["out"], captured["state"]
 
 

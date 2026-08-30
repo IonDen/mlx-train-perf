@@ -14,10 +14,10 @@ identical to the plain (uncomposed) gradient computation:
    vacuous while still reporting bitwise-identical grads for the wrong
    reason -- it never actually exercised the compiled path).
 
-0045 constraint: every comparison below is on GRADIENTS. A ``value_and_grad``
-loss VALUE is never asserted on -- there is an open, unexplained anomaly in
-this project where that value is insensitive to which implementation ran, so
-no gate may rest on it.
+Every comparison below is on GRADIENTS. A ``value_and_grad`` loss VALUE is
+never asserted on -- there is an open, unexplained anomaly in this project
+where that value is insensitive to which implementation ran, so no gate may
+rest on it.
 """
 
 import mlx.core as mx
