@@ -215,6 +215,39 @@ def test_editing_packed_path_source_changes_code_sha(
     assert ident_after["code_sha"] != ident_before["code_sha"]
 
 
+_RECURRENT_CODE_SHA_DEPS: tuple[str, ...] = (
+    "recurrent/ops.py",
+    "recurrent/reference.py",
+)
+
+
+@pytest.mark.parametrize("rel_path", _RECURRENT_CODE_SHA_DEPS, ids=_RECURRENT_CODE_SHA_DEPS)
+def test_editing_recurrent_source_changes_code_sha(
+    rel_path: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each file a measured GatedDelta recurrent condition depends on must be declared in
+    `CODE_SHA_DEPS` (0.7.0 Phase A, task A6) -- without it, editing the chunked op would NOT
+    invalidate a prior bench artifact, the exact staleness class this harness exists to
+    prevent. `recurrent/wrapper.py` and `families.py` are added by a later task once they
+    exist (adding them now would make `_code_sha` raise `FileNotFoundError` on every
+    `condition_identity()` call and break the existing bench tests immediately). Proven the
+    same two ways as `test_editing_attention_source_changes_code_sha`: (1) the real,
+    on-disk file is actually a member of the production `CODE_SHA_DEPS` tuple; (2) editing
+    its bytes flips `code_sha`, isolated to a tmp copy so this test never mutates the real
+    source tree."""
+    real_path = artifacts._PACKAGE_ROOT / rel_path
+    assert real_path in artifacts.CODE_SHA_DEPS, f"{rel_path} must be declared in CODE_SHA_DEPS"
+
+    dep = tmp_path / real_path.name
+    dep.write_bytes(real_path.read_bytes())
+    monkeypatch.setattr(artifacts, "CODE_SHA_DEPS", (dep,))
+
+    ident_before = run_identity(model="m", session_id="s1")
+    dep.write_bytes(dep.read_bytes() + b"\n# perturb\n")
+    ident_after = run_identity(model="m", session_id="s1")
+    assert ident_after["code_sha"] != ident_before["code_sha"]
+
+
 def test_condition_identity_rejects_reserved_param_key_kind() -> None:
     with pytest.raises(BenchInputError, match="kind"):
         condition_identity(kind="loss_layer", session_id="s1", params={"kind": "oops"})

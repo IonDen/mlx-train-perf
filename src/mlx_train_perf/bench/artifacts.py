@@ -74,6 +74,12 @@ CODE_SHA_DEPS: tuple[Path, ...] = tuple(
         # invalidate a prior packed_train artifact.
         "data/packing.py",
         "attention/segments.py",
+        # Task A6 (0.7.0 Phase A): the chunked GatedDelta recurrent path's measured-path
+        # files. `recurrent/wrapper.py` and `families.py` join once a later task creates
+        # them -- listing a not-yet-existing file here would make `_code_sha`'s
+        # `p.read_bytes()` raise `FileNotFoundError` on every `condition_identity()` call.
+        "recurrent/ops.py",
+        "recurrent/reference.py",
     )
 )
 
