@@ -226,10 +226,10 @@ def test_editing_recurrent_source_changes_code_sha(
     rel_path: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Each file a measured GatedDelta recurrent condition depends on must be declared in
-    `CODE_SHA_DEPS` (0.7.0 Phase A, task A6) -- without it, editing the chunked op would NOT
-    invalidate a prior bench artifact, the exact staleness class this harness exists to
-    prevent. `recurrent/wrapper.py` and `families.py` are added by a later task once they
-    exist (adding them now would make `_code_sha` raise `FileNotFoundError` on every
+    `CODE_SHA_DEPS` -- without it, editing the chunked op would NOT invalidate a prior
+    bench artifact, the exact staleness class this harness exists to prevent.
+    `recurrent/wrapper.py` and `families.py` join this list once those files exist
+    (adding them now would make `_code_sha` raise `FileNotFoundError` on every
     `condition_identity()` call and break the existing bench tests immediately). Proven the
     same two ways as `test_editing_attention_source_changes_code_sha`: (1) the real,
     on-disk file is actually a member of the production `CODE_SHA_DEPS` tuple; (2) editing
