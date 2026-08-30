@@ -16,10 +16,17 @@ from mlx_train_perf.recurrent.ops import chunked_gated_delta
 # component in every regime (~3-5x its siblings) -- backward through the
 # log-domain g_cumlog/exp chain is more fp32-sensitive than the linear q/k/v/
 # beta paths, matching the "KNOWN divergence" the op's own docstring already
-# flags for the g clamp; this was investigated (forward parity for the same
-# cases stays at the ~1e-6 floor, and the backward/forward amplification
-# ratio is consistent -- ~30-60x -- across every case, not just the g-heavy
-# ones), so it is pinned, not treated as a surprise.
+# flags for the g clamp. Investigated further: taking each case's backward
+# diff over its own forward y diff (same case, same metric type) as an
+# amplification ratio, the effect is substantially dg-specific, not a flat
+# ratio across every component. dg's ratio runs 30-58x on max_abs and 4-41x
+# on rel_fro, in every case -- both far above every other component. The
+# rel_fro ratio for dq/dk/dv/dbeta stays near 1x (0.8-1.6x); only dv's
+# max_abs ratio is similarly small (2-5x) -- dq/dk/dbeta's max_abs ratios
+# actually run 8-51x, so max_abs alone doesn't isolate the effect, but
+# rel_fro cleanly does. The mechanism is the 1/g chain-rule term through
+# log(g): the minimum g across these cases is ~0.04-0.08, giving 1/g
+# ~13-24x -- the right order of magnitude for the measured dg amplification.
 BWD_PINS: dict[str, dict[str, tuple[float, float]]] = {
     # T=96 cases (multi_chunk, carried_state) alone: worst max_abs=3.649294e-05
     # (dg, multi_chunk), rel_fro=1.005649e-06 (dg, multi_chunk) -- matches the
