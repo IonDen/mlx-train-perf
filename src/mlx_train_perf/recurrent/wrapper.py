@@ -146,12 +146,17 @@ def _select_linear_layer(i: int, layer: Any, gated_delta_net_cls: type[Any]) -> 
 
 
 class GatedDeltaTrainingProxy(nn.Module):
-    """Drop-in replacement for an mlx-lm `GatedDeltaNet` that will route the recurrence
+    """Drop-in replacement for an mlx-lm `GatedDeltaNet` that routes the recurrence
     through this project's chunk-parallel op or the sequential oracle. Holds the
     original's submodules/array leaves under their original names and never retains the
-    original module itself (see the module docstring for why). The forward pass lands in
-    a later change; today `__call__` refuses a cache (a training-only path never serves
-    one) and otherwise raises `NotImplementedError`."""
+    original module itself (see the module docstring for why).
+
+    `__call__` refuses a cache (a training-only path never serves one), then delegates
+    the numerical forward to `_pre_norm` -- a line-for-line mirror of the installed
+    `GatedDeltaNet.__call__` up to (but not including) the post-op gated RMSNorm and
+    output projection, which `__call__` applies itself. `_pre_norm` is the op-boundary
+    surface: it is what parity tests call directly, since the gated RMSNorm downstream
+    is scale-blind and would hide a scale error in the op's own output."""
 
     def __init__(self, original: nn.Module, *, impl: str) -> None:
         super().__init__()  # type: ignore[no-untyped-call]
@@ -198,10 +203,66 @@ class GatedDeltaTrainingProxy(nn.Module):
             )
         self._impl = impl
 
+    def _pre_norm(
+        self, inputs: mx.array, mask: mx.array | None
+    ) -> tuple[mx.array, mx.array]:
+        """The op-boundary surface: everything the installed `GatedDeltaNet.__call__`
+        computes up to (but not including) the post-op gated RMSNorm + output
+        projection. Called directly by `__call__` (never duplicated) and by the
+        op-boundary parity gate, which needs the pre-norm `(out, state)` pair the
+        downstream gated RMSNorm would otherwise mask a scale error in.
+
+        `z` (the gate the post-norm step needs) is intentionally not computed here --
+        it depends only on `inputs`, not on anything this method produces, so
+        `__call__` computes it itself rather than threading it through an
+        `(out, state)`-shaped return."""
+        if self.A_log.dtype != mx.float32:
+            raise RecurrentInputError(
+                f"A_log was cast to {self.A_log.dtype}: call model.set_dtype(...) "
+                "BEFORE enable_gated_delta_training (set_dtype's predicate is "
+                "dtype-keyed and cannot honour qwen3_5's path-keyed cast_predicate)"
+            )
+        B, S, _ = inputs.shape  # noqa: N806
+
+        qkv = self.in_proj_qkv(inputs)
+        b = self.in_proj_b(inputs)
+        a = self.in_proj_a(inputs)
+        if mask is not None:
+            qkv = mx.where(mask[..., None], qkv, 0)
+        conv_state = mx.zeros(
+            (B, self.conv_kernel_size - 1, self.conv_dim), dtype=inputs.dtype
+        )
+        conv_out = nn.silu(self.conv1d(mx.concatenate([conv_state, qkv], axis=1)))
+        q, k, v = [
+            t.reshape(B, S, h, d)
+            for t, h, d in zip(
+                mx.split(conv_out, [self.key_dim, 2 * self.key_dim], -1),
+                [self.num_k_heads, self.num_k_heads, self.num_v_heads],
+                [self.head_k_dim, self.head_k_dim, self.head_v_dim],
+                strict=True,
+            )
+        ]
+
+        # On the RESHAPED k, so head_k_dim -- not key_dim.
+        inv_scale = k.shape[-1] ** -0.5
+        # eps is HARDCODED 1e-6 upstream, not config.rms_norm_eps.
+        q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
+        k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
+        beta = mx.sigmoid(b)
+        # In-tree gate math -- deliberately NOT mlx-lm's module-level @mx.compile
+        # compute_g, whose process-global compiled cache is a recorded candidate
+        # mechanism for an open measurement anomaly in this project.
+        g = mx.exp(-mx.exp(self.A_log.astype(mx.float32)) * nn.softplus(a + self.dt_bias))
+        state0 = mx.zeros(
+            (B, self.num_v_heads, self.head_v_dim, self.head_k_dim), dtype=mx.float32
+        )
+        out, state = self._op(q, k, v, g, beta, state0, mask)
+        return out, state
+
     def __call__(
         self,
-        inputs: mx.array,  # noqa: ARG002 -- forward lands in a later change
-        mask: Any = None,  # noqa: ARG002 -- forward lands in a later change
+        inputs: mx.array,
+        mask: mx.array | None = None,
         cache: Any = None,
     ) -> mx.array:
         if cache is not None:
@@ -209,9 +270,11 @@ class GatedDeltaTrainingProxy(nn.Module):
                 "GatedDeltaTrainingProxy is a training-only path; a cache is not "
                 "supported"
             )
-        raise NotImplementedError(
-            "GatedDeltaTrainingProxy.__call__ forward is not implemented yet"
-        )
+        B, S, _ = inputs.shape  # noqa: N806
+        z = self.in_proj_z(inputs).reshape(B, S, self.num_v_heads, self.head_v_dim)
+        out, _state = self._pre_norm(inputs, mask)
+        out = self.norm(out, z)
+        return self.out_proj(out.reshape(B, S, -1))  # type: ignore[no-any-return]
 
 
 def enable_gated_delta_training(model: Any, *, impl: _Impl = "chunked") -> Any:
