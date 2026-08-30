@@ -85,7 +85,28 @@ class ModelShape:
         `tie_word_embeddings` defaults to False (HF's own default). Quantization
         metadata comes from the `quantization` block `mlx_lm.convert` writes
         (`group_size`/`bits`) -- the same schema `adapters/mlx_lm.py`'s verified
-        quantized-module notes read from a converted model's config."""
+        quantized-module notes read from a converted model's config.
+
+        Refuses (before any key access) a config carrying a positive hybrid
+        attention/recurrent marker -- `text_config` (qwen3_5 nests every model-shape
+        field one level down), `full_attention_interval`, or a `layer_types` entry equal
+        to `"linear_attention"`. This planner's `param_count()` and attention-memory
+        model assume a uniform full-attention stack; a hybrid config would either raise
+        an untyped `KeyError` (nested) or silently return a badly wrong estimate
+        (flattened -- most layers have no attention block at all). `config.get(
+        "layer_types") or []` guards a present-but-null `layer_types` value: the
+        two-arg `.get("layer_types", [])` form only supplies its default when the key
+        is ABSENT, so a null value would still reach `"linear_attention" in None` and
+        raise an untyped `TypeError`."""
+        if ("text_config" in config or "full_attention_interval" in config
+                or "linear_attention" in (config.get("layer_types") or [])):
+            raise PlanInputError(
+                "ModelShape.from_config does not support hybrid attention/recurrent "
+                "configs (e.g. qwen3_5's GatedDelta layers) -- this planner's "
+                "param_count() and attention-memory model assume a uniform "
+                "full-attention stack, which would silently mis-estimate memory for a "
+                "config where most layers have no attention block at all"
+            )
         heads = int(config["num_attention_heads"])
         kv_heads = int(config.get("num_key_value_heads", heads))
         quant = config.get("quantization")
