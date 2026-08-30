@@ -8,21 +8,24 @@ import sys
 import mlx.core as mx
 import pytest
 from mlx import nn
+from mlx.utils import tree_map_with_path
 
 pytest.importorskip("mlx_lm")
 
 import mlx_lm
 from mlx_lm.models import llama, qwen2, qwen3
 from mlx_lm.tuner import trainer as t
+from qwen35_tiny import tiny_qwen35
 
 from mlx_train_perf.adapters.mlx_lm import (
     _head_from_module,
     _quantized_head,
     _tied_head_from_embedding,
     make_loss_fn,
+    make_packed_loss_fn,
     split_model,
 )
-from mlx_train_perf.core.loss import DenseHead, QuantizedHead
+from mlx_train_perf.core.loss import DenseHead, QuantizedHead, linear_cross_entropy
 from mlx_train_perf.errors import AdapterError, MissingDependencyError
 
 
@@ -98,6 +101,34 @@ def test_split_qwen2_tied_head_reuses_embedding_weight() -> None:
     assert isinstance(head, DenseHead)
     assert head.weight is model.model.embed_tokens.weight
     assert head.weight.shape == (256, 64)
+
+
+def test_split_yields_qwen35_trunk_and_head_untied() -> None:
+    # Catches: split_model failing to recognize qwen3_5's differently-nested tree
+    # (model.language_model.model, not model.model) and either raising AdapterError
+    # or reading the wrong head module.
+    model = tiny_qwen35(tie_word_embeddings=False)
+    trunk, head = split_model(model)
+    x = mx.random.randint(0, 128, (2, 8))
+    hidden = trunk(x)
+    assert hidden.shape == (2, 8, 64)
+    assert isinstance(head, DenseHead)
+    assert head.weight.shape == (128, 64)
+    assert head.weight is model.language_model.lm_head.weight
+
+
+def test_split_yields_qwen35_trunk_and_head_tied() -> None:
+    # Catches: split_model reading tied-ness off hasattr(lm, "lm_head") instead of
+    # text_args(model).tie_word_embeddings -- the tied checkpoint has NO lm_head
+    # attribute at all, so a hasattr-based check would misclassify it.
+    model = tiny_qwen35(tie_word_embeddings=True)
+    trunk, head = split_model(model)
+    x = mx.random.randint(0, 128, (2, 8))
+    hidden = trunk(x)
+    assert hidden.shape == (2, 8, 64)
+    assert isinstance(head, DenseHead)
+    assert head.weight is model.language_model.model.embed_tokens.weight
+    assert head.weight.shape == (128, 64)
 
 
 def test_split_tied_head_reuses_embedding_weight() -> None:
@@ -228,6 +259,121 @@ def test_loss_and_ntoks_match_stock_on_qwen2() -> None:
 
     assert int(ntoks_ours.item()) == int(ntoks_stock.item())
     assert abs(ours.item() - stock.item()) < 1e-5
+
+
+def test_loss_and_ntoks_match_stock_on_qwen35_tied() -> None:
+    # Catches: the qwen3_5 split_model branch feeding the head-projection the wrong
+    # tensor, or reproducing the mask/denominator differently from stock -- would show
+    # up as a loss mismatch against mlx-lm's own default_loss on the SAME model/batch.
+    model = tiny_qwen35(tie_word_embeddings=True)
+    mx.random.seed(1)
+    batch = mx.random.randint(0, 128, (2, 12))
+    lengths = mx.array([[0, 12], [0, 7]])
+
+    loss_fn = make_loss_fn(model, impl="chunked")
+    ours, ntoks_ours = loss_fn(model, batch, lengths)
+    stock, ntoks_stock = t.default_loss(model, batch, lengths)
+
+    assert int(ntoks_ours.item()) == int(ntoks_stock.item())
+    # Measured 0.0 on this seed/shape (fp32, single chunk) -- fp32 accumulation noise
+    # ceiling ~1e-6; pinned at ~2x that headroom rather than the exact measured 0.0.
+    assert abs(ours.item() - stock.item()) < 2e-6
+
+
+def test_loss_and_ntoks_match_stock_on_qwen35_untied() -> None:
+    model = tiny_qwen35(tie_word_embeddings=False)
+    mx.random.seed(1)
+    batch = mx.random.randint(0, 128, (2, 12))
+    lengths = mx.array([[0, 12], [0, 7]])
+
+    loss_fn = make_loss_fn(model, impl="chunked")
+    ours, ntoks_ours = loss_fn(model, batch, lengths)
+    stock, ntoks_stock = t.default_loss(model, batch, lengths)
+
+    assert int(ntoks_ours.item()) == int(ntoks_stock.item())
+    # Measured 0.0 on this seed/shape (fp32, single chunk) -- fp32 accumulation noise
+    # ceiling ~1e-6; pinned at ~2x that headroom rather than the exact measured 0.0.
+    assert abs(ours.item() - stock.item()) < 2e-6
+
+
+def test_packed_loss_fn_refuses_qwen35() -> None:
+    # Catches: make_packed_loss_fn falling through to split_model's now-successful
+    # qwen3_5 branch and then crashing on the next line (`model.model.layers` --
+    # qwen3_5 has no `model.model`, only `model.language_model.model`) with a bare
+    # AttributeError instead of a typed, named refusal.
+    model = tiny_qwen35()
+    with pytest.raises(AdapterError, match="does not support qwen3_5"):
+        make_packed_loss_fn(model)
+
+
+def test_padded_batch_leaks_no_gradient_into_pad_positions() -> None:
+    """Catches: pad rows contaminating valid positions through the causal recurrence/
+    conv, or a pad position itself picking up a nonzero gradient through the chunked
+    op's own numerics. The production trainer feeds GDN layers mask=None (mlx-lm's
+    create_ssm_mask returns None whenever there is no cache), so THIS test -- not the
+    ops-level masked parity pins -- carries the claim that padded batching is
+    supported for training. bf16: the regime where the chunked op's log-domain decay
+    over a run of pad steps is most likely to misbehave."""
+    from mlx_train_perf.recurrent.wrapper import enable_gated_delta_training  # noqa: PLC0415
+
+    pack_len = 16
+    valid_lens = (5, 9)  # ragged: two different valid spans, both < pack_len
+
+    model = tiny_qwen35(full_attention_interval=2, num_layers=4)
+    cast_predicate = model.cast_predicate
+
+    def _cast(path: str, value: mx.array) -> mx.array:
+        if cast_predicate(path) and mx.issubdtype(value.dtype, mx.floating):
+            return value.astype(mx.bfloat16)
+        return value
+
+    model.update(tree_map_with_path(_cast, model.parameters()))
+    enable_gated_delta_training(model)
+    mx.eval(model.parameters())
+
+    mx.random.seed(0)
+    rows: list[list[int]] = []
+    lengths: list[list[int]] = []
+    for length in valid_lens:
+        tokens = mx.random.randint(1, 128, (length,)).tolist()  # 1..: never pad id 0
+        pad = [0] * (pack_len + 1 - length)
+        rows.append(tokens + pad)
+        lengths.append([0, length])
+    batch = mx.array(rows, dtype=mx.int32)
+    lengths_arr = mx.array(lengths, dtype=mx.int32)
+
+    inputs = batch[:, :-1]
+    targets = batch[:, 1:]
+    inner = model.language_model.model  # accepts input_embeddings= directly
+    _, head = split_model(model)
+    steps = mx.arange(1, targets.shape[1] + 1)
+    mask = (steps >= lengths_arr[:, 0:1]) & (steps <= lengths_arr[:, 1:])
+
+    def _loss_from_emb(emb: mx.array) -> mx.array:
+        hidden = inner(inputs, input_embeddings=emb)
+        nll = linear_cross_entropy(
+            hidden, head, targets, impl="chunked", reduction="none",
+            validate_targets=False,
+        )
+        ntoks = mask.sum()
+        return (nll * mask).astype(mx.float32).sum() / ntoks
+
+    emb0 = inner.embed_tokens(inputs)
+    mx.eval(emb0)
+    grad_emb = mx.grad(_loss_from_emb)(emb0)
+    mx.eval(grad_emb)
+
+    row_norm = mx.sqrt((grad_emb.astype(mx.float32) ** 2).sum(axis=-1))  # (B, pack_len)
+    for row_idx, length in enumerate(valid_lens):
+        valid_norm = row_norm[row_idx, :length]
+        pad_norm = row_norm[row_idx, length:]
+        assert pad_norm.max().item() == 0.0, (
+            f"row {row_idx}: nonzero gradient at a pad position "
+            f"(max {pad_norm.max().item():.3e})"
+        )
+        assert valid_norm.max().item() > 0.0, (
+            f"row {row_idx}: no gradient reached the valid span"
+        )
 
 
 def test_loss_and_ntoks_match_stock_with_prompt_offset() -> None:

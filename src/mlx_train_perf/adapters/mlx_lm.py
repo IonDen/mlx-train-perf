@@ -44,9 +44,13 @@ Verified against the installed mlx-lm==0.31.3 (mlx==0.31.2) source, 2026-07-04:
   quantization modes (`mxfp4`/`mxfp8`/`nvfp4`) that this project's kernel and chunked
   paths do not implement.
 
-Only the Llama, Qwen2 (Qwen2.5 family) and Qwen3 model families are supported (matched
-by `type(model).__module__`); anything else raises `AdapterError` naming the support
-list.
+`split_model` (and therefore `make_loss_fn`) supports Llama, Qwen2 (Qwen2.5 family),
+Qwen3, and Qwen3.5 (matched by `type(model).__module__`, with qwen3_5's differently
+nested tree handled via `mlx_train_perf.families`); anything else raises `AdapterError`
+naming the support list. `make_packed_loss_fn` supports the same list MINUS qwen3_5 --
+sequence packing threads a `PackedMask` through the flash-attention wrapper, which does
+not wrap qwen3_5's recurrent GatedDelta layers, so a qwen3_5 model is refused there with
+its own typed message.
 """
 from collections.abc import Callable
 from typing import Any, Literal
@@ -63,13 +67,20 @@ from mlx_train_perf.core.loss import (
     tied_head,
 )
 from mlx_train_perf.errors import AdapterError, MissingDependencyError
+from mlx_train_perf.families import is_qwen35
+from mlx_train_perf.families import model_head as qwen35_model_head
+from mlx_train_perf.families import text_model as qwen35_text_model
 
 # Keyed by the exact `type(model).__module__` mlx-lm uses for each family (verified
-# against the installed mlx_lm.models.llama / qwen2 / qwen3 above).
+# against the installed mlx_lm.models.llama / qwen2 / qwen3 above). qwen3_5 is listed
+# here for the "supported" error message only -- its tree is nested differently
+# (`model.language_model.model`, not `model.model`), so `split_model` branches on
+# `families.is_qwen35` before reaching the generic module lookup below.
 _SUPPORTED_FAMILIES: dict[str, str] = {
     "llama": "mlx_lm.models.llama",
     "qwen2": "mlx_lm.models.qwen2",
     "qwen3": "mlx_lm.models.qwen3",
+    "qwen3_5": "mlx_lm.models.qwen3_5",
 }
 
 
@@ -145,6 +156,25 @@ def split_model(model: Any) -> tuple[Callable[[mx.array], mx.array], HeadRef]:
     imported dependency. Support is instead verified structurally, at call time.
     """
     _require_mlx_lm()
+    if is_qwen35(model):
+        # Nested two levels deeper than the other families: the hidden-state trunk is
+        # `model.language_model.model` (a `Qwen3_5TextModel`), and tied-ness is read
+        # from `model.language_model.args.tie_word_embeddings`, never `hasattr(lm,
+        # "lm_head")` -- the real tied checkpoint carries no `lm_head` attribute at
+        # all (see `families.py`'s module docstring).
+        trunk_module = qwen35_text_model(model)
+
+        def qwen35_trunk(x: mx.array) -> mx.array:
+            return trunk_module(x)  # type: ignore[no-any-return]
+
+        head_module, tied = qwen35_model_head(model)
+        head = (
+            _tied_head_from_embedding(head_module)
+            if tied
+            else _head_from_module(head_module)
+        )
+        return qwen35_trunk, head
+
     module_name = type(model).__module__
     if module_name not in _SUPPORTED_FAMILIES.values():
         supported = ", ".join(sorted(_SUPPORTED_FAMILIES))
@@ -252,6 +282,17 @@ def make_packed_loss_fn(
     """
     from mlx_train_perf.attention.segments import PackedMask  # noqa: PLC0415
     from mlx_train_perf.attention.wrapper import FlashAttentionWrapper  # noqa: PLC0415
+
+    # Must run BEFORE split_model: once qwen3_5 is a supported family, split_model
+    # succeeds for it, and the next line (`model.model.layers`) would raise a bare
+    # AttributeError -- qwen3_5 nests its layers at `model.language_model.model.layers`,
+    # not `model.model.layers`. Refuse with a typed, named error instead.
+    if is_qwen35(model):
+        raise AdapterError(
+            "make_packed_loss_fn does not support qwen3_5: sequence packing threads a "
+            "PackedMask through the flash-attention wrapper's self-attention layers, "
+            "and qwen3_5's recurrent GatedDelta layers are not wrapped by it"
+        )
 
     split_model(model)  # family/head fail-fast, result discarded (as in make_loss_fn)
     for i, layer in enumerate(model.model.layers):
