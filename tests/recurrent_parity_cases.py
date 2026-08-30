@@ -51,6 +51,7 @@ CASES = [
      dict(T=128, chunk_size=64, repeat_keys=True, g_mode="one", beta_high=True)),
     ("rf1_real_ratio", "benign", dict(T=96, chunk_size=16, Hk=4, Hv=4)),
     ("gqa_rf2", "benign", dict(T=96, chunk_size=16, Hk=2, Hv=4)),
+    ("gqa_rf4", "benign", dict(T=96, chunk_size=16, Hk=2, Hv=8)),
     ("bf16_inputs", "bf16", dict(T=96, chunk_size=16, dtype=mx.bfloat16)),
     ("bf16_g_one", "bf16", dict(T=96, chunk_size=16, g_mode="one", dtype=mx.bfloat16)),
     ("bf16_g_zero", "bf16", dict(T=96, chunk_size=16, g_mode="zero", dtype=mx.bfloat16)),
@@ -61,6 +62,38 @@ CASES = [
     # Forward-only at T=2048 (2.08 GiB measured, no oracle backward tape).
     ("bf16_repr_T2048", "bf16_representative",
      dict(T=2048, chunk_size=64, dtype=mx.bfloat16, **QWEN35_08B_GEOM)),
+]
+
+
+def losses_pair(state, chunk_size):
+    """The single source of the differentiated loss pair backward-parity tests grade
+    against, so a pin can never silently decouple from the quantity being tested."""
+    from mlx_train_perf.recurrent.ops import chunked_gated_delta  # noqa: PLC0415
+    from mlx_train_perf.recurrent.reference import sequential_gated_delta  # noqa: PLC0415
+
+    def loss_seq(q, k, v, g, beta):
+        y, s = sequential_gated_delta()(q, k, v, g, beta, state)
+        return (y.astype(mx.float32) ** 2).sum() + (s**2).sum()
+
+    def loss_chk(q, k, v, g, beta):
+        y, s = chunked_gated_delta(q, k, v, g, beta, state, chunk_size=chunk_size)
+        return (y.astype(mx.float32) ** 2).sum() + (s**2).sum()
+
+    return loss_seq, loss_chk
+
+
+BWD_CASES = [
+    ("bwd_multi_chunk", "benign", dict(T=96, chunk_size=16)),
+    ("bwd_repeated_keys", "adversarial", dict(T=96, chunk_size=16, repeat_keys=True)),
+    ("bwd_blocked_solve", "benign", dict(T=128, chunk_size=64)),
+    ("bwd_t_not_multiple", "benign", dict(T=70, chunk_size=16)),
+    ("bwd_carried_state", "benign", dict(T=96, chunk_size=16, with_state=True)),
+    # T<=512 ONLY: the oracle's backward tape is 4.05 MiB/token; T=2048 would
+    # peak ~8.2 GiB. The T=2048 evidence lives in scripts/bench_recurrent_layer.py.
+    ("bwd_representative", "representative",
+     dict(T=512, chunk_size=64, **QWEN35_08B_GEOM)),
+    ("bwd_bf16_repr_T512", "bf16_representative",
+     dict(T=512, chunk_size=64, dtype=mx.bfloat16, **QWEN35_08B_GEOM)),
 ]
 
 

@@ -41,6 +41,14 @@ needs_comparative_peak_room = pytest.mark.skipif(
     "nondeterministic on small shared runners",
 )
 
+# Differentiating mlx-lm's sequential oracle costs a measured 4.05 MiB/token at
+# the 0.8B geometry (bf16, B=1): 2.08 GiB at T=512, ~8.2 GiB at T=2048. CI
+# runners are 7 GB and set_memory_limit is advisory (excess PAGES, gotcha 16).
+needs_long_context_room = pytest.mark.skipif(
+    int(mx.device_info()["memory_size"]) < 24 * 1024**3,
+    reason="oracle backward at long T needs >= 24 GiB device memory",
+)
+
 
 def pytest_addoption(parser: pytest.Parser) -> None:
     for m in _GATED:

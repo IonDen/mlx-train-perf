@@ -40,8 +40,8 @@ FWD_PINS: dict[str, dict[str, tuple[float, float]]] = {
     #    g=1-1e-7 bf16-rounds to exactly 1.0 (bf16 ULP near 1.0 is 2^-7), so
     #    there is no decay to damp accumulated bf16 rounding noise across
     #    T=96 -- still well inside the bf16 noise ceiling, not surprising.
-    # state: max_abs=4.172325e-07 (bf16_inputs), rel_fro=2.329307e-07
-    #    (bf16_inputs) -- state stays fp32 across chunks (never cast to bf16
+    # state: max_abs=4.172325e-07 (bf16_g_one), rel_fro=2.329307e-07
+    #    (bf16_g_one) -- state stays fp32 across chunks (never cast to bf16
     #    mid-recurrence), so it tracks the fp32 floor, not the bf16 one.
     "bf16": {"y": (1e-3, 1e-5), "state": (1e-6, 5e-7)},
     # y: max_abs=7.152557e-06, rel_fro=7.788288e-07 (representative_0p8b).
