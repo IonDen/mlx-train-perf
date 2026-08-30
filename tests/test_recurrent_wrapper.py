@@ -7,11 +7,17 @@ proxy's forward pass lands in a later change; here it only needs to refuse a cac
 raising `NotImplementedError`.
 """
 from typing import Any
+from unittest import mock
 
 import mlx.core as mx
 import pytest
 from mlx import nn
-from mlx.utils import tree_flatten
+from mlx.utils import tree_flatten, tree_map_with_path
+
+pytest.importorskip("mlx_lm")
+
+from mlx_lm.tuner.lora import LoRALinear
+from mlx_lm.tuner.utils import linear_to_lora_layers
 from qwen35_tiny import tiny_qwen35
 
 from mlx_train_perf.errors import RecurrentInputError, UnsupportedRecurrentError
@@ -115,14 +121,25 @@ def test_enable_wraps_only_linear_layers():
 def test_parameter_key_set_identical_before_after_enable():
     # Catches: the proxy renaming a submodule (breaking the layers.N.linear_attn.*
     # tree path LoRA/optimizer keys rely on) or retaining `original` as an
-    # attribute (doubling every one of its parameter keys).
+    # attribute (doubling every one of its parameter keys). Also compares the
+    # MODULE-TREE key set (named_modules()), not just the flattened parameters: mlx's
+    # valid_parameter_filter excludes keys starting with "_" from .parameters(), but
+    # named_modules() (which linear_to_lora_layers walks for LoRA target discovery)
+    # does NOT underscore-filter -- so a regression that retained the original under
+    # e.g. `self._original = original` would duplicate every one of its submodules for
+    # LoRA discovery while staying completely invisible to the flattened-parameter
+    # comparison alone (verified: such a retention leaves keys_after == keys_before
+    # but adds 8 extra named_modules() paths under `linear_attn._original.*`).
     model = tiny_qwen35(full_attention_interval=2, num_layers=4)
     keys_before = set(dict(tree_flatten(model.parameters())).keys())
+    module_paths_before = {name for name, _ in model.named_modules()}
 
     enable_gated_delta_training(model)
 
     keys_after = set(dict(tree_flatten(model.parameters())).keys())
     assert keys_after == keys_before
+    module_paths_after = {name for name, _ in model.named_modules()}
+    assert module_paths_after == module_paths_before
 
 
 def test_cache_not_none_refuses():
@@ -269,3 +286,157 @@ def test_enable_refuses_bad_impl():
         enable_gated_delta_training(model, impl="banana")
 
     assert _linear_attn_identities(model) == before
+
+
+# ---------------------------------------------------------------------------
+# integration gates: routing, freeze, LoRA, eval mode, dtype ordering
+# ---------------------------------------------------------------------------
+
+_STOCK_GATED_DELTA_UPDATE = "mlx_lm.models.qwen3_5.gated_delta_update"
+"""qwen3_5 does `from .gated_delta import gated_delta_update` at module level, so the
+name is resolved in the qwen3_5 module's OWN namespace at call time. Patching
+`mlx_lm.models.gated_delta.gated_delta_update` would never bite -- qwen3_5 already
+holds its own reference by the time any layer calls it -- and `gated_delta_kernel` is
+not imported into the qwen3_5 namespace at all."""
+
+
+def test_forward_routes_through_the_op_not_stock_gated_delta_update():
+    # Catches: enable_gated_delta_training wrapping a layer whose forward still falls
+    # through to mlx-lm's own gated_delta_update instead of this project's op (the one
+    # thing the proxy exists to change). See the control below for proof this patch
+    # target genuinely intercepts the call.
+    model = tiny_qwen35(full_attention_interval=2, num_layers=4)
+    enable_gated_delta_training(model)
+    x = mx.random.randint(0, 128, (1, 4))
+
+    with mock.patch(_STOCK_GATED_DELTA_UPDATE, side_effect=AssertionError("poisoned")):
+        out = model(x)
+        mx.eval(out)  # must not raise: the enabled layer never reaches the stock call
+
+
+def test_poison_control_unwrapped_layer_raises():
+    # Control for the routing-proof test above. Without this, a poison test that never
+    # fires (a typo'd patch target, or a target that resolves to a module the executed
+    # code path doesn't actually import from) looks identical to one that correctly
+    # passes -- this proves the patch target bites on the stock (un-enabled) layer.
+    model = tiny_qwen35(full_attention_interval=2, num_layers=4)
+    x = mx.random.randint(0, 128, (1, 4))
+
+    with (
+        mock.patch(_STOCK_GATED_DELTA_UPDATE, side_effect=AssertionError("poisoned")),
+        pytest.raises(AssertionError, match="poisoned"),
+    ):
+        model(x)
+
+
+@pytest.mark.parametrize("freeze_first", [True, False])
+def test_freeze_state_carries(freeze_first: bool):
+    # Catches: the proxy dropping A_log/dt_bias's frozen state in either construction
+    # order -- if either silently became trainable, it would land in a saved adapter
+    # file and contaminate a later convergence comparison against the stock model.
+    model = tiny_qwen35(full_attention_interval=2, num_layers=4)
+    keys_before = set(dict(tree_flatten(model.parameters())).keys())
+
+    if freeze_first:
+        model.freeze()
+        enable_gated_delta_training(model)
+    else:
+        enable_gated_delta_training(model)
+        model.freeze()
+
+    keys_after = set(dict(tree_flatten(model.parameters())).keys())
+    assert keys_after == keys_before
+    trainable = dict(tree_flatten(model.trainable_parameters()))
+    assert trainable == {}
+
+
+_LORA_CONFIG = {
+    "rank": 4,
+    "scale": 10.0,
+    "dropout": 0.0,
+    "keys": {"linear_attn.in_proj_qkv", "linear_attn.in_proj_b"},
+}
+
+
+@pytest.mark.parametrize("enable_first", [True, False])
+def test_lora_attach_either_order(enable_first: bool):
+    # Catches: the proxy renaming or duplicating linear_attn's submodules in a way that
+    # breaks LoRA target discovery (named_modules() by path) in one of the two
+    # construction orders -- the proxy holds the original submodules under their
+    # original names precisely so linear_attn.in_proj_qkv/in_proj_b survive either way.
+    model = tiny_qwen35(full_attention_interval=2, num_layers=4)
+
+    if enable_first:
+        enable_gated_delta_training(model)
+        linear_to_lora_layers(model, num_layers=len(model.layers), config=_LORA_CONFIG)
+    else:
+        linear_to_lora_layers(model, num_layers=len(model.layers), config=_LORA_CONFIG)
+        enable_gated_delta_training(model)
+
+    linear_layer = next(layer for layer in model.language_model.model.layers if layer.is_linear)
+    assert isinstance(linear_layer.linear_attn, GatedDeltaTrainingProxy)
+    assert isinstance(linear_layer.linear_attn.in_proj_qkv, LoRALinear)
+    assert isinstance(linear_layer.linear_attn.in_proj_b, LoRALinear)
+
+    x = mx.random.randint(0, 128, (1, 4))
+    out = model(x)
+    mx.eval(out)
+    assert out.shape[:2] == (1, 4)
+
+
+def test_eval_mode_forward_works():
+    # Catches: a refusal keyed on self.training instead of on cache-is-not-None --
+    # mlx-lm's trainer flips the model to eval() for validation at iteration 1 by
+    # default and back to train() afterward, so a training-keyed refusal would crash
+    # the first validation batch of every fine-tune.
+    model = tiny_qwen35(full_attention_interval=2, num_layers=4)
+    enable_gated_delta_training(model)
+    model.eval()
+
+    x = mx.random.randint(0, 128, (1, 4))
+    out = model(x, cache=None)
+    mx.eval(out)
+    assert out.shape[:2] == (1, 4)
+
+
+def test_a_log_fp32_after_set_dtype_then_enable():
+    # Catches: the forward guard (mis)treating a correctly dtype-protected checkpoint
+    # as corrupted. `Module.set_dtype`'s predicate is called with a DTYPE, never a
+    # path, so honouring qwen3_5's own path-keyed cast_predicate needs a
+    # tree_map_with_path composition -- mirroring mlx_lm.convert's own pattern --
+    # rather than passing cast_predicate straight to set_dtype's predicate kwarg
+    # (which raises: cast_predicate expects a path string and set_dtype calls its
+    # predicate with a dtype). Done BEFORE enable, this is the supported order.
+    model = tiny_qwen35(full_attention_interval=2, num_layers=4)
+    cast_predicate = model.cast_predicate
+
+    def _cast(path: str, value: mx.array) -> mx.array:
+        if cast_predicate(path) and mx.issubdtype(value.dtype, mx.floating):
+            return value.astype(mx.bfloat16)
+        return value
+
+    model.update(tree_map_with_path(_cast, model.parameters()))
+    enable_gated_delta_training(model)
+
+    linear_layer = next(layer for layer in model.language_model.model.layers if layer.is_linear)
+    assert linear_layer.linear_attn.A_log.dtype == mx.float32
+
+    x = mx.random.randint(0, 128, (1, 4))
+    out = model(x)
+    mx.eval(out)
+
+
+def test_a_log_guard_fires_when_set_dtype_runs_after_enable():
+    # Catches: silent precision loss on the gating scalar A_log when a caller runs
+    # this project's own compute-dtype step (model.set_dtype(mx.bfloat16), the plain
+    # default predicate) AFTER enabling gated-delta training. set_dtype's default
+    # predicate is dtype-keyed, not path-keyed, so it downcasts A_log along with
+    # everything else; the guard must raise loud instead of silently training on a
+    # corrupted gate, and its message must name the fix.
+    model = tiny_qwen35(full_attention_interval=2, num_layers=4)
+    enable_gated_delta_training(model)
+    model.set_dtype(mx.bfloat16)
+
+    x = mx.random.randint(0, 128, (1, 4))
+    with pytest.raises(RecurrentInputError, match="BEFORE enable_gated_delta_training"):
+        model(x)
