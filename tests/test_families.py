@@ -64,6 +64,26 @@ class _FakeLlamaModel:
 _FakeLlamaModel.__module__ = "mlx_lm.models.llama"
 
 
+class _FakeTextArgsMissingTieField:
+    """A `.args` object with no `tie_word_embeddings` field at all -- unlike
+    `_FakeLlamaModel`, this tree is correctly *named* (module ==
+    "mlx_lm.models.qwen3_5") but malformed one level deeper."""
+
+
+class _FakeTextModelMissingTieField:
+    def __init__(self) -> None:
+        self.args = _FakeTextArgsMissingTieField()
+        self.model = _FakeTrunk()
+
+
+class _FakeQwen35ModelMissingTieField:
+    def __init__(self) -> None:
+        self.language_model = _FakeTextModelMissingTieField()
+
+
+_FakeQwen35ModelMissingTieField.__module__ = "mlx_lm.models.qwen3_5"
+
+
 def _tiny_real_qwen35(*, tie_word_embeddings: bool = True):
     qwen3_5 = pytest.importorskip("mlx_lm.models.qwen3_5")
     text_config = {
@@ -179,6 +199,16 @@ def test_model_head_returns_lm_head_and_tied_false():
 
 def test_model_head_raises_typed_error_when_untied_lm_head_missing():
     model = _FakeQwen35Model(tie_word_embeddings=False, with_lm_head=False)
+    with pytest.raises(UnsupportedRecurrentError):
+        model_head(model)
+
+
+def test_model_head_raises_typed_error_when_tie_word_embeddings_missing():
+    # Catches: `model_head` reading `text_args(model).tie_word_embeddings`
+    # unwrapped -- a correctly-named qwen3_5 tree (module == "mlx_lm.models.
+    # qwen3_5") whose text args object lacks that field must still raise
+    # UnsupportedRecurrentError, not a bare AttributeError.
+    model = _FakeQwen35ModelMissingTieField()
     with pytest.raises(UnsupportedRecurrentError):
         model_head(model)
 

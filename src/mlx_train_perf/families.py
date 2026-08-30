@@ -91,7 +91,13 @@ def model_head(model: Any) -> tuple[nn.Module, bool]:
     which the real tied checkpoint (no `lm_head` attribute at all) would
     read backwards.
     """
-    tied = bool(text_args(model).tie_word_embeddings)
+    args = text_args(model)
+    try:
+        tied = bool(args.tie_word_embeddings)
+    except AttributeError as exc:
+        raise UnsupportedRecurrentError(
+            "qwen3_5 model's text args are missing tie_word_embeddings"
+        ) from exc
     if tied:
         try:
             return text_model(model).embed_tokens, True
