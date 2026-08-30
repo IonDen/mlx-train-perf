@@ -5,6 +5,7 @@ without the optional `mlx-lm` extra; only the two tests that need a real
 `mlx_lm.models.qwen3_5.Model` are guarded with `pytest.importorskip`.
 """
 import pytest
+from qwen35_tiny import tiny_qwen35
 
 from mlx_train_perf.errors import UnsupportedRecurrentError
 from mlx_train_perf.families import is_qwen35, model_head, text_args, text_model
@@ -84,33 +85,6 @@ class _FakeQwen35ModelMissingTieField:
 _FakeQwen35ModelMissingTieField.__module__ = "mlx_lm.models.qwen3_5"
 
 
-def _tiny_real_qwen35(*, tie_word_embeddings: bool = True):
-    qwen3_5 = pytest.importorskip("mlx_lm.models.qwen3_5")
-    text_config = {
-        "model_type": "qwen3_5",
-        "hidden_size": 32,
-        "intermediate_size": 64,
-        "num_hidden_layers": 2,
-        "num_attention_heads": 4,
-        "rms_norm_eps": 1e-6,
-        "vocab_size": 48,
-        "num_key_value_heads": 2,
-        "max_position_embeddings": 64,
-        "linear_num_value_heads": 4,
-        "linear_num_key_heads": 2,
-        "linear_key_head_dim": 8,
-        "linear_value_head_dim": 8,
-        "linear_conv_kernel_dim": 4,
-        "tie_word_embeddings": tie_word_embeddings,
-        "attention_bias": False,
-        # Both layers land on the linear (GatedDeltaNet) branch at this
-        # interval, so construction never needs the qwen3_next Attention block.
-        "full_attention_interval": 4,
-    }
-    args = qwen3_5.ModelArgs(model_type="qwen3_5", text_config=text_config)
-    return qwen3_5.Model(args)
-
-
 # ---------------------------------------------------------------------------
 # is_qwen35
 # ---------------------------------------------------------------------------
@@ -131,7 +105,11 @@ def test_is_qwen35_false_for_unrelated_module():
 
 
 def test_is_qwen35_true_for_real_qwen3_5_model():
-    model = _tiny_real_qwen35()
+    # Two layers at interval 4: (idx + 1) % 4 != 0 for both idx 0 and 1, so
+    # both land on the linear (GatedDeltaNet) branch and construction never
+    # needs the qwen3_next Attention block -- irrelevant here, this test only
+    # checks module-tree navigation.
+    model = tiny_qwen35(full_attention_interval=4, num_layers=2)
     assert type(model).__module__ == "mlx_lm.models.qwen3_5"
     assert is_qwen35(model) is True
 
@@ -219,7 +197,7 @@ def test_model_head_raises_typed_error_for_non_qwen35_model():
 
 
 def test_model_head_tied_branch_on_real_qwen3_5_model():
-    model = _tiny_real_qwen35(tie_word_embeddings=True)
+    model = tiny_qwen35(full_attention_interval=4, num_layers=2, tie_word_embeddings=True)
     # Matches the real mlx-community/Qwen3.5-0.8B-4bit checkpoint: tied means
     # no lm_head attribute exists on the text model at all.
     assert not hasattr(model.language_model, "lm_head")
