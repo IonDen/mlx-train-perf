@@ -36,7 +36,6 @@ import mlx.core as mx
 from mlx.utils import tree_flatten, tree_map_with_path
 
 from mlx_train_perf.core.guards import (
-    DEFAULT_WALL_BUDGET_S,
     effective_memory_ceiling,
     install_guardrails,
     install_memory_watchdog,
@@ -48,6 +47,14 @@ _MODEL_REPO = "mlx-community/Qwen3.5-0.8B-4bit"
 _BATCH = 2
 _MAX_SEQ_LENGTH = 192
 _ITERS = 4
+# Comfortably above the observed end-to-end runtime (model load + 4 iters is
+# single-digit seconds on a cached checkpoint) but MUST stay strictly below
+# the parent test's `subprocess.run(..., timeout=600)` -- if this budget ever
+# grew past 600s, the parent's timeout would SIGKILL the child first on a
+# genuine hang, discarding the `::SMOKE_MEMORY_BREACH::` marker and the clean
+# `os._exit(2)` this watchdog exists to provide in favour of a bare
+# `TimeoutExpired` with whatever stdout happened to be captured.
+_WALL_BUDGET_S = 240.0
 _LORA_CONFIG = {
     "rank": 8,
     "scale": 20.0,
@@ -143,7 +150,7 @@ def main() -> None:
     ceiling = effective_memory_ceiling()
     watchdog = install_memory_watchdog(
         ceiling_bytes=ceiling.ceiling_bytes,
-        wall_budget_s=DEFAULT_WALL_BUDGET_S,
+        wall_budget_s=_WALL_BUDGET_S,
         sampler=lambda: mx.get_active_memory() + mx.get_cache_memory(),
         interval_s=0.05,
         on_breach=_on_memory_breach,
