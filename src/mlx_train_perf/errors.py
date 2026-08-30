@@ -74,3 +74,11 @@ class MachineDetectionError(MlxTrainPerfError):
 class PackingError(MlxTrainPerfError):
     """Sequence-packing input validation failure (empty dataset, zero-length sequence,
     non-positive pack_len) -- no silent fallback."""
+
+
+class UnsupportedRecurrentError(MlxTrainPerfError):
+    """The model family/config is outside the supported recurrent-training surface."""
+
+
+class RecurrentInputError(MlxTrainPerfError):
+    """Invalid inputs to the recurrent training path (e.g. a cache on the training-only proxy)."""
