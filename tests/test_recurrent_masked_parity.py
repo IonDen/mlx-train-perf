@@ -26,11 +26,19 @@ T_MAX = 512
 LENGTHS = (512, 384, 256, 128)  # T, 3T/4, T/2, T/4 -- right-padded to T_MAX
 DTYPES = (("fp32", mx.float32), ("bf16", mx.bfloat16))
 
+# T_MAX=512 is an exact multiple of CHUNK_SIZE=64, so the driver's own structural
+# pad (pad_len = (-T) % C) never fires above -- the mask-substitution and
+# pad-substitution identity steps are never exercised TOGETHER. T=500 is not a
+# multiple of 64 (pad_len = (-500) % 64 = 12), so it exercises that interaction;
+# pad_len depends on T, not on the per-row mask lengths below.
+T_500 = 500
+LENGTHS_500 = (500, 375, 250, 125)  # T, 3T/4, T/2, T/4 -- right-padded to T_500
 
-def _ragged_mask() -> mx.array:
-    lengths = mx.array(LENGTHS)
-    positions = mx.arange(T_MAX)
-    mask = positions[None, :] < lengths[:, None]
+
+def _ragged_mask(t_max: int = T_MAX, lengths: tuple[int, ...] = LENGTHS) -> mx.array:
+    lengths_arr = mx.array(lengths)
+    positions = mx.arange(t_max)
+    mask = positions[None, :] < lengths_arr[:, None]
     mx.eval(mask)
     return mask
 
@@ -85,6 +93,37 @@ FWD_MASKED_PINS: dict[str, dict[str, tuple[float, float]]] = {
     #   state stays fp32 across chunks even in the bf16 arm, so it tracks
     #   the fp32 floor, matching the single-row bf16_representative pin.
     "bf16": {"y": (8e-3, 1e-4), "state": (2e-6, 2.5e-6)},
+}
+
+# Separate pin for the STRUCTURAL-PADDING regime (T=500, pad_len=(-500)%64=12) --
+# NOT a substitute for FWD_MASKED_PINS["fp32"] above, which stays unmodified and
+# keeps governing every T_MAX=512 chunk-aligned (pad_len=0) case.
+#
+# A controller-run three-arm probe (2026-08-30), same geometry (QWEN35_08B_GEOM),
+# chunk_size=64, isolated per-row STATE rel_fro across:
+#   T=512 masked, pad_len=0 (chunk-aligned):        8.6e-7 - 9.8e-7
+#     (n=512:9.75e-7 n=384:9.58e-7 n=256:9.20e-7 n=128:8.59e-7)
+#   T=500 all-valid, pad_len=12, NO masking (padded-only): 1.21e-6 - 2.42e-6
+#     (n=500:1.945e-6 n=375:1.988e-6 n=250:1.452e-6 n=125:2.423e-6)
+#   T=500 masked, pad_len=12 (padded+masked):        1.85e-6 - 2.09e-6
+#     (n=500:1.945e-6 n=375:1.851e-6 n=250:2.091e-6 n=125:1.209e-6)
+# The masked arm's worst (2.091e-6) sits INSIDE the unmasked padded-only arm's
+# spread (up to 2.423e-6) -- masking contributes NOTHING on top of the
+# structural-padding effect. The ~2x elevation over the chunk-aligned floor is a
+# property of padding itself (T not a multiple of chunk_size), not of the
+# mask/pad interaction the T=500 case was added to probe -- so the two identity-
+# step mechanisms compose cleanly, and the elevation gets its own honest pin
+# instead of being forced under the chunk-aligned one. fp32 accumulation floor
+# ~1e-6 -- the padded worst (2.423e-6) is a real, if small, excursion above that
+# floor (~2.4x), still fp32-floor-class, but a genuinely different regime.
+# Pinned at measured-worst (2.423e-6) x ~2 = 5e-6. y and state max_abs are
+# untouched by padding (measured T=500 masked: y max_abs=6.914139e-06, y
+# rel_fro=7.446606e-07, state max_abs=1.788139e-06 -- all comfortably inside the
+# existing chunk-aligned FWD_MASKED_PINS["fp32"] values), so only the elevated
+# state rel_fro axis gets a new number; y and state max_abs are reused as-is.
+FWD_MASKED_PADDED_PINS: dict[str, tuple[float, float]] = {
+    "y": FWD_MASKED_PINS["fp32"]["y"],
+    "state": (FWD_MASKED_PINS["fp32"]["state"][0], 5e-6),
 }
 
 # Measured in this tree (2026-08-30) by running mx.grad of the masked-batch
@@ -203,3 +242,67 @@ def test_masked_batch_bwd_padded_positions_get_zero_gradient(dtype_name, dtype):
         gr_pad = mx.where(m, gr, mx.zeros_like(gr))
         assert float(mx.abs(gr_pad).max()) == 0.0, \
             f"{name}: padded positions received nonzero gradient"
+
+
+@needs_long_context_room
+def test_masked_batch_fwd_matches_per_row_oracle_at_seqlen_not_chunk_multiple() -> None:
+    # Catches: the mask-substitution and structural-pad-substitution identity
+    # steps composing incorrectly when BOTH fire together in the same forward
+    # pass -- T_MAX=512 above is an exact multiple of CHUNK_SIZE=64 and never
+    # exercises this interaction; T_500=500 forces pad_len=12 structural pad
+    # steps to stack on top of the per-row mask's own identity steps. Graded
+    # against FWD_MASKED_PADDED_PINS (see its comment): a controller-run
+    # three-arm probe isolated the elevated state-rel_fro reading to the
+    # STRUCTURAL PADDING regime itself (not the mask/pad interaction -- the
+    # masked arm's worst sits inside the unmasked padded-only arm's spread),
+    # so this test is graded against that regime's own pin rather than the
+    # chunk-aligned FWD_MASKED_PINS["fp32"], which stays unmodified.
+    d = build_case(T=T_500, chunk_size=CHUNK_SIZE, B=len(LENGTHS_500), dtype=mx.float32,
+                    seed=SEED, **QWEN35_08B_GEOM)
+    mask = _ragged_mask(t_max=T_500, lengths=LENGTHS_500)
+    y_batch, st_batch = chunked_gated_delta(
+        d["q"], d["k"], d["v"], d["g"], d["beta"], mask=mask, chunk_size=CHUNK_SIZE)
+    mx.eval(y_batch, st_batch)
+
+    pin = FWD_MASKED_PADDED_PINS
+    for b, n in enumerate(LENGTHS_500):
+        y_ref, st_ref = sequential_gated_delta()(
+            d["q"][b:b + 1, :n], d["k"][b:b + 1, :n], d["v"][b:b + 1, :n],
+            d["g"][b:b + 1, :n], d["beta"][b:b + 1, :n], None)
+        mx.eval(y_ref, st_ref)
+        assert_under_pin(f"row{b}(n={n})/y",
+                          metrics(y_batch[b:b + 1, :n], y_ref), pin["y"])
+        assert_under_pin(f"row{b}(n={n})/state",
+                          metrics(st_batch[b:b + 1], st_ref), pin["state"])
+
+
+@needs_long_context_room
+def test_masked_batch_bwd_restricted_to_row_matches_row_oracle_at_seqlen_not_chunk_multiple() \
+        -> None:
+    # Catches: the same pad-x-mask interaction as the forward case above, but
+    # for the backward pass -- a structural pad step at the tail of the last
+    # chunk (pad_len=12 at T_500=500) could leak gradient into a row's own
+    # valid positions, or diverge from the per-row oracle, if pad-substitution
+    # and mask-substitution do not compose cleanly in the vjp. Reuses the
+    # file's EXISTING fp32 pin (BWD_MASKED_PINS["fp32"]) unmodified.
+    d = build_case(T=T_500, chunk_size=CHUNK_SIZE, B=len(LENGTHS_500), dtype=mx.float32,
+                    seed=SEED, **QWEN35_08B_GEOM)
+    mask = _ragged_mask(t_max=T_500, lengths=LENGTHS_500)
+    loss_batch = _masked_batch_loss(mask, CHUNK_SIZE)
+    grads_batch = mx.grad(loss_batch, argnums=(0, 1, 2, 3, 4))(
+        d["q"], d["k"], d["v"], d["g"], d["beta"])
+    mx.eval(*grads_batch)
+
+    pin = BWD_MASKED_PINS["fp32"]
+    loss_row = _row_oracle_loss()
+    for b, n in enumerate(LENGTHS_500):
+        q_r, k_r, v_r, g_r, beta_r = (
+            d[name][b:b + 1, :n] for name in ("q", "k", "v", "g", "beta"))
+        grads_row = mx.grad(loss_row, argnums=(0, 1, 2, 3, 4))(
+            q_r, k_r, v_r, g_r, beta_r)
+        mx.eval(*grads_row)
+        for name, g_full, g_row in zip(
+            ("dq", "dk", "dv", "dg", "dbeta"), grads_batch, grads_row, strict=True
+        ):
+            assert_under_pin(f"row{b}(n={n})/{name}",
+                              metrics(g_full[b:b + 1, :n], g_row), pin[name])
