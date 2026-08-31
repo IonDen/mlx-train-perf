@@ -45,7 +45,8 @@ Including the cases where it does not.
 | You want to know whether a config fits before spending an hour finding out | Yes. [`mlx-train-perf plan`](https://github.com/IonDen/mlx-train-perf#ram-fit-planner) answers without loading the model. |
 | Everything already fits at the 2048 default | Not for the memory work — below roughly 2,100 tokens stock attention is the faster of the two. Packing can still help if your examples are short. |
 | Memory that climbs across iterations at a fixed shape | No. That is a leak somewhere else; these kernels change what one step allocates, not what accumulates between steps. |
-| Gemma, Mistral, Phi, or a hybrid model with sliding-window attention | Not yet. Llama, Qwen2 and Qwen3 with full attention, and it refuses the rest up front rather than failing halfway through a run. |
+| Gemma, Mistral, Phi, or a model that mixes full attention with sliding-window layers | Not yet, on any path. It refuses these up front rather than failing halfway through a run. |
+| Qwen 3.5, which mixes full attention with GatedDelta (linear-attention) layers | Partly. [`enable_gated_delta_training`](https://github.com/IonDen/mlx-train-perf#gateddelta-training-for-qwen-35) gives the GatedDelta layers a training path; the full-attention layers stay on stock attention, and sequence packing and the RAM planner don't cover this family yet. |
 | Inference or serving speed | No. This is training only. |
 
 Every number here has a committed script under `scripts/` that reproduces it, all measured on one M1 Max (32 GB, macOS 26.5). The loss-layer figures were taken on mlx 0.31.2 and reproduce on the pinned 0.32.0; the flash-attention memory figures were taken on 0.32.0 in 0.2.0, and the 0.3.0 context-ceiling figures on 0.32.0.
@@ -138,19 +139,23 @@ The alternative is a 16 GB download and an out-of-memory crash three minutes int
 
 ## If you maintain a trainer
 
-The two kernels are usable without `mlx_lm` and without this project's adapter. `mlx` is the
+These pieces are usable without `mlx_lm` and without this project's adapter. `mlx` is the
 only runtime dependency; `mlx-lm` is an optional extra that exists solely for the adapter and
-the `enable_flash_attention` wrapper.
+the model-instance wrappers.
 
 ```python
 from mlx_train_perf import linear_cross_entropy, DenseHead, QuantizedHead
 from mlx_train_perf.attention import flash_attention
+from mlx_train_perf.recurrent import chunked_gated_delta
 
 # Loss: hidden states in, scalar out, no (N, V) tensor in between.
 loss = linear_cross_entropy(hidden, head, targets, impl="auto", reduction="mean")
 
 # Attention: a drop-in for mx.fast.scaled_dot_product_attention on the training path.
 out = flash_attention(q, k, v, scale=scale, causal=True)
+
+# GatedDelta: Qwen 3.5's linear-attention recurrence, argument-compatible with mlx-lm's own op.
+out, state = chunked_gated_delta(q, k, v, g, beta, state, mask=mask)
 ```
 
 `head` is a `DenseHead`, a `QuantizedHead`, or a tied embedding via `tied_head(...)`. `q`/`k`/`v`
@@ -160,10 +165,12 @@ for block-diagonal packing.
 
 What you are signing up for, stated plainly:
 
-- **In-place mutation.** `enable_flash_attention(model)` swaps attention on a live model object
-  and has no undo. `flash_attention` itself is a pure function and mutates nothing, so if you
-  own your model code, call it directly and skip the wrapper.
-- **Training only.** Both refuse a KV cache. Reload the model for inference.
+- **In-place mutation.** `enable_flash_attention(model)` and `enable_gated_delta_training(model)`
+  both swap layers on a live model object and have no undo. `flash_attention` and
+  `chunked_gated_delta` are themselves pure functions and mutate nothing, so if you own your
+  model code, call them directly and skip the wrappers.
+- **Training only.** `enable_flash_attention` and `enable_gated_delta_training` both refuse a
+  KV cache. Reload the model for inference.
 - **Typed refusals, never silent fallbacks.** An unsupported architecture, head dim, dtype or
   mask raises at enable time or on the first call, naming the reason.
 - **The mlx pin is a policy, not neglect.** `mlx>=0.32.0,<0.33` is narrow because the kernels'
@@ -302,6 +309,55 @@ train(
 
 `packed_iterate_batches` re-packs each epoch with a fresh shuffle and hands the trainer fixed-shape batches; `make_packed_loss_fn` walks the model's layers itself to thread the segment mask (the stock model call hardcodes a causal mask) and refuses at construction if `enable_flash_attention` has not run. Pass `packed=True` with `seq_len` equal to your pack length and `batch_size` equal to your training batch: the calibration caches key on the exact batch size and sequence bucket, so matching hints keep the one-time kernel timing probes in the controlled window before `mx.compile` traces the step. The pack length must not exceed the model's trained context — packed sequences keep their relative positions, and the row as a whole runs at absolute positions up to the pack length.
 
+## GatedDelta training for Qwen 3.5
+
+New in 0.7.0 and opt-in. Qwen 3.5 mixes full-attention layers with GatedDeltaNet (linear-attention) ones in the same model, an architecture `enable_flash_attention` was never built to reach: most of its layers have no full-attention block at all. `enable_gated_delta_training` gives those layers a training path of their own, an in-tree chunk-parallel implementation of the same recurrence, switched on per loaded model the way the flash-attention wrapper already is.
+
+```python
+from mlx_train_perf.recurrent import enable_gated_delta_training
+from mlx_train_perf.adapters.mlx_lm import make_loss_fn
+
+enable_gated_delta_training(model, impl="chunked")
+loss = make_loss_fn(model, impl="auto")
+```
+
+Call it in place, on a loaded model, before you build the loss and call `train`, the same order `enable_flash_attention` uses. Every structurally linear-attention layer's `GatedDeltaNet` gets replaced by a proxy that routes through the chunk-parallel op; the model's full-attention layers are untouched and keep running on stock attention. Right-padded batches work as you'd expect: because the recurrence only ever looks backward, a masked-out position becomes an identity step and can never reach a real token's output ahead of it.
+
+What this release covers, and what it does not:
+
+| Surface | This release |
+|---|---|
+| GatedDelta training path (`enable_gated_delta_training`) | Yes |
+| Fused cross-entropy loss (`make_loss_fn`), tied and untied embeddings | Yes |
+| Right-padded (ragged) batches | Yes |
+| Full-attention layers on the flash-attention path | No. They stay on stock attention; the flash kernels don't support this family's head dimension. |
+| Sequence packing (`make_packed_loss_fn`) | No. Packing threads its segment mask through the flash-attention wrapper, which doesn't wrap GatedDelta layers. |
+| The RAM-fit planner | No. `mlx-train-perf plan` refuses any hybrid attention/recurrent config rather than silently mis-estimating memory for layers that have no attention block. |
+| The MoE variant, and the separate `qwen3_next` family | No. Both refuse at enable time. |
+| Inference or generation | No. The training proxy refuses a KV cache. Save your adapters and reload the model to generate or evaluate. |
+
+`impl="sequential"` is a benchmarking control, not a second production path. It swaps in the same proxy but routes it through mlx-lm's own sequential op instead of this project's chunk-parallel one, which is what lets a throughput comparison attribute a difference to the op itself rather than to the proxy's block rewrite. Use the default `impl="chunked"` unless you're running that comparison yourself.
+
+### Casting a 4-bit checkpoint
+
+A loaded 4-bit checkpoint needs its floating parameters cast to bf16 before training, and the obvious way to do that is unsafe for this family:
+
+```python
+import mlx.core as mx
+from mlx.utils import tree_map_with_path
+
+cast_predicate = model.cast_predicate
+
+def cast_bf16(path, value):
+    if cast_predicate(path) and mx.issubdtype(value.dtype, mx.floating):
+        return value.astype(mx.bfloat16)
+    return value
+
+model.update(tree_map_with_path(cast_bf16, model.parameters()))
+```
+
+Do this before calling `enable_gated_delta_training`. `model.set_dtype(mx.bfloat16)` calls its predicate with a dtype, not a path, so it can never run qwen3_5's own `cast_predicate`, the rule that keeps `A_log` (the GatedDelta gating log-rates) in fp32, and it downcasts `A_log` along with everything else without telling you. `enable_gated_delta_training` refuses the forward outright when it sees a non-fp32 `A_log`, so the failure shows up as an error instead of a quietly wrong model.
+
 ## Implementations
 
 `impl` picks how the loss is computed. `"auto"` is the default and the one to use.
@@ -341,7 +397,7 @@ mlx-train-perf plan --config path/to/config.json --seq-len 8192 --lora-rank 8 --
 
 ## Supported models
 
-- Architectures: Llama, Qwen2 (the Qwen2.5 family), and Qwen3, for both the loss adapter and the flash-attention wrapper. The adapter's model splitter handles these; others raise a typed error.
+- Architectures: Llama, Qwen2 (the Qwen2.5 family), and Qwen3, for both the loss adapter and the flash-attention wrapper. Qwen 3.5 is supported by the loss adapter and by its own [GatedDelta training path](https://github.com/IonDen/mlx-train-perf#gateddelta-training-for-qwen-35); its full-attention layers are not on the flash-attention wrapper yet, and sequence packing and the RAM-fit planner don't cover it. The adapter's model splitter handles all of these; other families raise a typed error.
 - Quantization: 4-bit group-size-64 (the mlx-community QLoRA default), or a dense fp32/bf16 head.
 - Training: LoRA / QLoRA. Full fine-tuning is estimated by the planner but is not the case this is tuned for.
 - Hardware: Apple Silicon.

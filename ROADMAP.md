@@ -2,6 +2,14 @@
 
 ## Released
 
+### 0.7.0 - 2026-08-31
+- GatedDelta training for Qwen 3.5. `enable_gated_delta_training` gives the family's
+  GatedDeltaNet (linear-attention) layers, the ones the flash-attention wrapper can't reach, a
+  training path through an in-tree chunk-parallel implementation of the same recurrence, and
+  `make_loss_fn` now covers the family too. The full-attention layers stay on stock attention,
+  sequence packing and the RAM-fit planner don't cover this family yet, and generating text
+  needs a fresh, KV-cache-capable reload of the model.
+
 ### 0.6.0 - 2026-08-26
 - Per-loss-implementation flash memory coefficients in the planner. `plan --attention
   flash` with the fused loss no longer carries the stock-loss arm's worst-case margin:

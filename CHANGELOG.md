@@ -4,6 +4,34 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] - 2026-08-31
+
+Adds Qwen 3.5 to the supported model list. The family mixes full-attention layers with
+GatedDeltaNet (linear-attention) ones in the same model, an architecture the flash-attention
+wrapper was never built to reach: most of its layers have no full-attention block at all.
+`enable_gated_delta_training` gives those layers a training path of their own.
+
+### Added
+- `enable_gated_delta_training(model, impl="chunked")` (`mlx_train_perf.recurrent`, also
+  exporting `chunked_gated_delta` directly): replaces every GatedDeltaNet layer on a loaded
+  qwen3_5 model, in place, with a training proxy that routes the recurrence through this
+  project's chunk-parallel op. Right-padded (ragged) batches are supported: because the
+  recurrence only ever looks backward, a masked-out position becomes an identity step and can
+  never reach a real token's output ahead of it. `impl="sequential"` swaps in mlx-lm's own
+  sequential op instead, as a benchmarking control for isolating the chunked op's own
+  contribution.
+- `make_loss_fn` now accepts qwen3_5 (tied and untied embeddings), so the fused cross-entropy
+  loss works on this family the same way it does on Llama, Qwen2, and Qwen3.
+- Typed refusals for the parts of this family the release does not cover: the full-attention
+  layers stay on stock attention, because the flash kernels don't support this family's head
+  dimension; `make_packed_loss_fn` refuses a qwen3_5 model, because sequence packing threads its
+  segment mask through the flash-attention wrapper, which doesn't wrap GatedDelta layers;
+  `mlx-train-perf plan` refuses any hybrid attention/recurrent config, rather than
+  mis-estimating memory for layers that have no attention block at all; the qwen3_5 MoE variant
+  and the separate `qwen3_next` family both refuse at enable time; and the training proxy
+  refuses a KV cache, so generating text needs a freshly loaded model with the saved adapters
+  applied.
+
 ## [0.6.0] - 2026-08-26
 
 The planner stops over-charging the fused loss on the flash-attention path. Since 0.5.0, one
@@ -329,6 +357,7 @@ Silicon, with an mlx-lm adapter, a RAM-fit planner, and a benchmark harness.
   `ROADMAP.md`).
 - Architectures: Llama and Qwen3 only. Training: LoRA / QLoRA. Apple Silicon only.
 
+[0.7.0]: https://github.com/IonDen/mlx-train-perf/releases/tag/v0.7.0
 [0.6.0]: https://github.com/IonDen/mlx-train-perf/releases/tag/v0.6.0
 [0.5.1]: https://github.com/IonDen/mlx-train-perf/releases/tag/v0.5.1
 [0.5.0]: https://github.com/IonDen/mlx-train-perf/releases/tag/v0.5.0
