@@ -438,5 +438,23 @@ def test_a_log_guard_fires_when_set_dtype_runs_after_enable():
     model.set_dtype(mx.bfloat16)
 
     x = mx.random.randint(0, 128, (1, 4))
-    with pytest.raises(RecurrentInputError, match="BEFORE enable_gated_delta_training"):
+    with pytest.raises(RecurrentInputError, match="tree_map_with_path"):
+        model(x)
+
+
+def test_forward_refuses_when_sharding_group_set_after_enable():
+    # Catches: enable_gated_delta_training checking sharding_group only at construction
+    # time. Model.shard() runs AFTER enable in the normal distributed-setup order and
+    # sets sharding_group directly on whatever object is currently installed as
+    # linear_attn -- it assigns by attribute, not by an isinstance check -- so it lands
+    # on the proxy without the enable-time refusal in _select_linear_layer ever seeing
+    # it. Without a forward-time check too, the proxy would silently skip the
+    # sum_gradients/all_sum collectives the stock forward wraps around a sharded layer.
+    model = tiny_qwen35(full_attention_interval=2, num_layers=4)
+    enable_gated_delta_training(model)
+    linear_layer = next(layer for layer in model.language_model.model.layers if layer.is_linear)
+    linear_layer.linear_attn.sharding_group = object()
+
+    x = mx.random.randint(0, 128, (1, 4))
+    with pytest.raises(UnsupportedRecurrentError, match="sharding_group"):
         model(x)

@@ -45,7 +45,7 @@ Including the cases where it does not.
 | You want to know whether a config fits before spending an hour finding out | Yes. [`mlx-train-perf plan`](https://github.com/IonDen/mlx-train-perf#ram-fit-planner) answers without loading the model. |
 | Everything already fits at the 2048 default | Not for the memory work — below roughly 2,100 tokens stock attention is the faster of the two. Packing can still help if your examples are short. |
 | Memory that climbs across iterations at a fixed shape | No. That is a leak somewhere else; these kernels change what one step allocates, not what accumulates between steps. |
-| Gemma, Mistral, Phi, or a model that mixes full attention with sliding-window layers | Not yet, on any path. It refuses these up front rather than failing halfway through a run. |
+| Gemma, Mistral, Phi, or a model that mixes full attention with sliding-window layers | Depends on the path. The loss adapter and the flash-attention wrapper both refuse these architectures up front. `mlx-train-perf plan` does not carry the same check and returns an estimate instead of a refusal — fine for a config that turns out to be uniform full attention, wrong for one that genuinely mixes in sliding-window layers, since the estimate ignores the window. |
 | Qwen 3.5, which mixes full attention with GatedDelta (linear-attention) layers | Partly. [`enable_gated_delta_training`](https://github.com/IonDen/mlx-train-perf#gateddelta-training-for-qwen-35) gives the GatedDelta layers a training path; the full-attention layers stay on stock attention, and sequence packing and the RAM planner don't cover this family yet. |
 | Inference or serving speed | No. This is training only. |
 
@@ -157,6 +157,8 @@ out = flash_attention(q, k, v, scale=scale, causal=True)
 # GatedDelta: Qwen 3.5's linear-attention recurrence, argument-compatible with mlx-lm's own op.
 out, state = chunked_gated_delta(q, k, v, g, beta, state, mask=mask)
 ```
+
+At masked positions, `chunked_gated_delta`'s `y` is unspecified and differs from `gated_delta_ops`'s own output there — the two agree on `state` and on every valid position's `y`, but not on what a masked position's output looks like. Mask your own loss the same way `mlx_train_perf`'s adapter does, and don't rely on `y` at those positions.
 
 `head` is a `DenseHead`, a `QuantizedHead`, or a tied embedding via `tied_head(...)`. `q`/`k`/`v`
 are `(B, H, N, D)` with `head_dim` in {64, 96, 128} and grouped-query heads mapped contiguously,
@@ -321,7 +323,7 @@ enable_gated_delta_training(model, impl="chunked")
 loss = make_loss_fn(model, impl="auto")
 ```
 
-Call it in place, on a loaded model, before you build the loss and call `train`, the same order `enable_flash_attention` uses. Every structurally linear-attention layer's `GatedDeltaNet` gets replaced by a proxy that routes through the chunk-parallel op; the model's full-attention layers are untouched and keep running on stock attention. Right-padded batches work as you'd expect: because the recurrence only ever looks backward, a masked-out position becomes an identity step and can never reach a real token's output ahead of it.
+Call it in place, on a loaded model, before you build the loss and call `train`, the same order `enable_flash_attention` uses. Every structurally linear-attention layer's `GatedDeltaNet` gets replaced by a proxy that routes through the chunk-parallel op; the model's full-attention layers are untouched and keep running on stock attention. Right-padded batches work as you'd expect: the recurrence and its depthwise convolution are both causal, so a padded position can only influence positions after it, and with right padding those are all padding too. The loss already masks out padded targets, so nothing downstream ever depends on what a pad position's own output was.
 
 What this release covers, and what it does not:
 
@@ -330,7 +332,7 @@ What this release covers, and what it does not:
 | GatedDelta training path (`enable_gated_delta_training`) | Yes |
 | Fused cross-entropy loss (`make_loss_fn`), tied and untied embeddings | Yes |
 | Right-padded (ragged) batches | Yes |
-| Full-attention layers on the flash-attention path | No. They stay on stock attention; the flash kernels don't support this family's head dimension. |
+| Full-attention layers on the flash-attention path | No. They stay on stock attention; the flash kernels don't cover this family's attention block — a different head dimension and a differently shaped block. |
 | Sequence packing (`make_packed_loss_fn`) | No. Packing threads its segment mask through the flash-attention wrapper, which doesn't wrap GatedDelta layers. |
 | The RAM-fit planner | No. `mlx-train-perf plan` refuses any hybrid attention/recurrent config rather than silently mis-estimating memory for layers that have no attention block. |
 | The MoE variant, and the separate `qwen3_next` family | No. Both refuse at enable time. |

@@ -102,10 +102,14 @@ class ModelShape:
                 or "linear_attention" in (config.get("layer_types") or [])):
             raise PlanInputError(
                 "ModelShape.from_config does not support hybrid attention/recurrent "
-                "configs (e.g. qwen3_5's GatedDelta layers) -- this planner's "
-                "param_count() and attention-memory model assume a uniform "
-                "full-attention stack, which would silently mis-estimate memory for a "
-                "config where most layers have no attention block at all"
+                "configs (e.g. qwen3_5's GatedDelta layers, where most layers have no "
+                "attention block at all) -- this planner's param_count() and "
+                "attention-memory model assume a uniform full-attention stack read "
+                "directly off the top-level config. The same guard also fires on a "
+                "config that is not hybrid at all but merely nested: some VLM configs "
+                "put every language-model field one level down under `text_config` "
+                "with otherwise-uniform full attention, and from_config cannot tell "
+                "that apart from a genuinely hybrid config using top-level keys alone"
             )
         heads = int(config["num_attention_heads"])
         kv_heads = int(config.get("num_key_value_heads", heads))

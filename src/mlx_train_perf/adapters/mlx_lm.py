@@ -46,8 +46,13 @@ Verified against the installed mlx-lm==0.31.3 (mlx==0.31.2) source, 2026-07-04:
 
 `split_model` (and therefore `make_loss_fn`) supports Llama, Qwen2 (Qwen2.5 family),
 Qwen3, and Qwen3.5 (matched by `type(model).__module__`, with qwen3_5's differently
-nested tree handled via `mlx_train_perf.families`); anything else raises `AdapterError`
-naming the support list. `make_packed_loss_fn` supports the same list MINUS qwen3_5 --
+nested tree handled via `mlx_train_perf.families`); a model whose module name matches
+none of these raises `AdapterError` naming the support list. A model whose module name
+DOES match qwen3_5 but whose tree is unexpectedly shaped (a missing
+`language_model.model` / `language_model.args` / similar) raises `UnsupportedRecurrentError`
+instead, out of `families.py`'s own accessors -- both share the common `MlxTrainPerfError`
+base, so a caller catching the package root catches either. `make_packed_loss_fn` supports
+the same list MINUS qwen3_5 --
 sequence packing threads a `PackedMask` through the flash-attention wrapper, which does
 not wrap qwen3_5's recurrent GatedDelta layers, so a qwen3_5 model is refused there with
 its own typed message.
@@ -204,9 +209,11 @@ def make_loss_fn(
     `loss(model, batch, lengths) -> (loss, ntoks)` (see the module docstring for the
     exact, version-cited contract this reproduces).
 
-    Fails fast: an unsupported architecture (`AdapterError`) or a missing `mlx-lm`
-    install (`MissingDependencyError`) is raised immediately, before any training step
-    runs, rather than on the first call.
+    Fails fast: an unsupported architecture (`AdapterError` for a wrong model family,
+    `UnsupportedRecurrentError` for a qwen3_5-shaped model whose tree is unexpectedly
+    structured -- see the module docstring) or a missing `mlx-lm` install
+    (`MissingDependencyError`) is raised immediately, before any training step runs,
+    rather than on the first call.
     """
     # Fail fast only -- the (trunk, head) pair itself is discarded. `loss_fn` below
     # re-derives both from the live `model` argument on every call (see the module

@@ -97,6 +97,16 @@
 
 ## Planned
 
+### Flash attention for Qwen 3.5's full-attention layers
+The flash kernels don't cover this family's attention block — a different head dimension
+and a differently shaped block. Those layers stay on stock attention until the kernels
+grow that coverage.
+
+### Sequence packing for Qwen 3.5
+Packing threads its segment mask through the flash-attention wrapper, which doesn't wrap
+GatedDelta layers. Extending packing to this family needs a segment carrier the recurrent
+training path understands too.
+
 ### Faster dK/dV backward kernels
 The dK/dV backward is the slowest part of the flash path. A register-scheduling change to its
 Metal kernel (interleaving the key-tile work to lower register pressure) is the next lever on

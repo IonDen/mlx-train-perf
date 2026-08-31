@@ -34,7 +34,11 @@ Verified against the installed mlx-lm==0.31.3 source (`mlx_lm/models/qwen3_5.py`
   the attribute is always present. When set, the stock forward wraps
   `sum_gradients`/`all_sum` distributed calls around the block; the proxy does not
   reproduce those, so a sharded layer refuses at enable time instead of silently
-  dropping the collective.
+  dropping the collective. `Model.shard()` sets it by plain attribute assignment
+  (`layer.linear_attn.sharding_group = group`), not through an isinstance check, so it
+  lands on the proxy just as readily if `shard()` runs AFTER enable -- the proxy copies
+  the attribute and `_pre_norm` checks it again on every forward call, so that ordering
+  refuses too instead of silently dropping the collective.
 
 - **`nn.Module.__setattr__` registers any `mx.array`/`dict`/`list`/`tuple`-valued
   attribute as a dict child** (verified against the installed `nn.Module` source, same
@@ -182,6 +186,12 @@ class GatedDeltaTrainingProxy(nn.Module):
         self.conv_kernel_size = original.conv_kernel_size
         self.conv_dim = original.conv_dim
         self.layer_norm_epsilon = original.layer_norm_epsilon
+        # Guaranteed None here (_select_linear_layer refuses a sharded original before
+        # construction), but copied rather than hardcoded so a later Model.shard() call
+        # -- which sets sharding_group by plain attribute assignment on whatever object
+        # is currently installed as linear_attn, not by an isinstance check -- has an
+        # attribute to land on that _pre_norm can check on every forward call.
+        self.sharding_group = original.sharding_group
 
         # Carry the freeze state over -- fail loud rather than silently losing it.
         missing = {k for k in original._no_grad if not hasattr(self, k)}
@@ -216,11 +226,22 @@ class GatedDeltaTrainingProxy(nn.Module):
         it depends only on `inputs`, not on anything this method produces, so
         `__call__` computes it itself rather than threading it through an
         `(out, state)`-shaped return."""
+        if self.sharding_group is not None:
+            raise UnsupportedRecurrentError(
+                "this layer's GatedDeltaNet has a distributed sharding_group set "
+                "(likely from calling Model.shard() after enable_gated_delta_training); "
+                "the training proxy does not wrap the distributed sum_gradients/all_sum "
+                "calls the stock forward applies around a sharded layer"
+            )
         if self.A_log.dtype != mx.float32:
             raise RecurrentInputError(
-                f"A_log was cast to {self.A_log.dtype}: call model.set_dtype(...) "
-                "BEFORE enable_gated_delta_training (set_dtype's predicate is "
-                "dtype-keyed and cannot honour qwen3_5's path-keyed cast_predicate)"
+                f"A_log was cast to {self.A_log.dtype}: model.set_dtype(...) cannot cast "
+                "this checkpoint safely at any call order -- its predicate is keyed on "
+                "dtype alone and never sees qwen3_5's own path-keyed cast_predicate, so it "
+                "downcasts A_log along with every other floating parameter regardless of "
+                "when it runs. Cast with mlx.utils.tree_map_with_path against "
+                "model.cast_predicate instead -- see the README's \"Casting a 4-bit "
+                "checkpoint\" section"
             )
         B, S, _ = inputs.shape  # noqa: N806
 

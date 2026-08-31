@@ -15,17 +15,18 @@ wrapper was never built to reach: most of its layers have no full-attention bloc
 - `enable_gated_delta_training(model, impl="chunked")` (`mlx_train_perf.recurrent`, also
   exporting `chunked_gated_delta` directly): replaces every GatedDeltaNet layer on a loaded
   qwen3_5 model, in place, with a training proxy that routes the recurrence through this
-  project's chunk-parallel op. Right-padded (ragged) batches are supported: because the
-  recurrence only ever looks backward, a masked-out position becomes an identity step and can
-  never reach a real token's output ahead of it. `impl="sequential"` swaps in mlx-lm's own
-  sequential op instead, as a benchmarking control for isolating the chunked op's own
-  contribution.
+  project's chunk-parallel op. Right-padded (ragged) batches are supported: the recurrence
+  and its depthwise convolution are both causal, so a padded position can only influence
+  positions after it, and with right padding those are all padding too; the loss already
+  masks out padded targets. `impl="sequential"` swaps in mlx-lm's own sequential op instead,
+  as a benchmarking control for isolating the chunked op's own contribution.
 - `make_loss_fn` now accepts qwen3_5 (tied and untied embeddings), so the fused cross-entropy
   loss works on this family the same way it does on Llama, Qwen2, and Qwen3.
 - Typed refusals for the parts of this family the release does not cover: the full-attention
-  layers stay on stock attention, because the flash kernels don't support this family's head
-  dimension; `make_packed_loss_fn` refuses a qwen3_5 model, because sequence packing threads its
-  segment mask through the flash-attention wrapper, which doesn't wrap GatedDelta layers;
+  layers stay on stock attention, because the flash kernels don't cover this family's attention
+  block — a different head dimension and a differently shaped block; `make_packed_loss_fn`
+  refuses a qwen3_5 model, because sequence packing threads its segment mask through the
+  flash-attention wrapper, which doesn't wrap GatedDelta layers;
   `mlx-train-perf plan` refuses any hybrid attention/recurrent config, rather than
   mis-estimating memory for layers that have no attention block at all; the qwen3_5 MoE variant
   and the separate `qwen3_next` family both refuse at enable time; and the training proxy

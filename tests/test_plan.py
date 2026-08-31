@@ -129,6 +129,26 @@ def test_from_config_refuses_flattened_hybrid_config() -> None:
         ModelShape.from_config(config)
 
 
+def test_from_config_hybrid_refusal_names_the_merely_nested_case() -> None:
+    """The `text_config` marker also fires on a config that is NOT hybrid at all -- a
+    plain VLM wrapping a uniform full-attention text model, with every field nested one
+    level down under `text_config` and no `full_attention_interval` or
+    `linear_attention` layer_types entry anywhere. Bug this catches: the refusal message
+    calling this "a hybrid attention/recurrent config" is a misdiagnosis for this case --
+    it must also name the merely-nested possibility, since `from_config` cannot actually
+    tell the two apart from the top-level keys alone."""
+    config = {
+        "model_type": "some_vlm",
+        "text_config": {
+            "hidden_size": 1024, "intermediate_size": 3584, "num_hidden_layers": 24,
+            "num_attention_heads": 8, "num_key_value_heads": 8, "vocab_size": 32000,
+            "tie_word_embeddings": True,
+        },
+    }
+    with pytest.raises(PlanInputError, match="nested"):
+        ModelShape.from_config(config)
+
+
 def test_from_config_null_layer_types_does_not_raise_type_error() -> None:
     """`layer_types` present with an explicit `None` value (no other hybrid marker
     present) must not crash the marker check with a bare `TypeError`. Bug this catches:

@@ -155,6 +155,12 @@ def chunked_gated_delta(
     ``[B, T, Hv]``, ``state`` is ``[B, Hv, Dv, Dk] | None``, ``mask`` is
     ``[B, T] bool | None``. Returns ``y: [B, T, Hv, Dv]``, ``state:
     [B, Hv, Dv, Dk]``.
+
+    Argument-compatible means shapes and dtypes only. At masked positions
+    (``mask`` False), ``y`` is unspecified and differs from
+    ``gated_delta_ops``'s own output there by design -- ``state`` and every
+    valid (unmasked) position's ``y`` match. Callers must mask their own loss
+    rather than rely on a masked position's output.
     """
     if g.ndim != 3:
         raise RecurrentInputError(
@@ -163,6 +169,13 @@ def chunked_gated_delta(
         )
     B, T, Hk, Dk = q.shape  # noqa: N806
     Hv, Dv = v.shape[-2:]  # noqa: N806
+    if Hv % Hk != 0:
+        raise RecurrentInputError(
+            f"v's head count Hv={Hv} must be a multiple of q/k's head count Hk={Hk} "
+            "(grouped-query broadcast requires an integer repeat factor); Hv < Hk would "
+            "otherwise floor to a zero repeat factor and skip the broadcast entirely, "
+            "failing later on an unrelated shape mismatch"
+        )
     C = chunk_size or CHUNK_SIZE  # noqa: N806
     repeat_factor = Hv // Hk
     if state is None:
