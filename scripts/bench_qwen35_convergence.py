@@ -12,11 +12,15 @@ same way stock does, on real data.
 Both arms cast the checkpoint's floating parameters to bf16 via the same path-aware,
 `A_log`-protecting walk `bench_qwen35_training.py` uses (see that script's module
 docstring for why a bare `model.set_dtype` cannot do this), and read training batches
-through the SAME seeded `mlx_lm.tuner.trainer.iterate_batches` (`seed=` fixes both the
-len-sorted batch grouping's processing order and the validation batch order) -- so two
-arms invoked with the same `--seed`/`--data`/`--batch-size`/`--max-seq-length` see
-byte-identical training and validation batches in the same order, and a loss-curve
-divergence is attributable to the arm, not to different data.
+through the SAME seeded `mlx_lm.tuner.trainer.iterate_batches` -- so two arms invoked
+with the same `--seed`/`--data`/`--batch-size`/`--max-seq-length` see byte-identical
+training and validation batches in the same order, and a loss-curve divergence is
+attributable to the arm, not to different data. That determinism does NOT come from
+the `seed=` kwarg threaded into `iterate_batches` alone: installed `iterate_batches`
+only reseeds numpy when `if seed:` is truthy, a no-op at `--seed 0` (this script's own
+default) that would otherwise leave the batch-order permutation to whatever ambient
+numpy global-RNG state a freshly-launched subprocess happens to carry. `_seed_batch_order`
+seeds numpy explicitly, before `train()`'s first batch draw, so this holds for ANY seed.
 
 Validation is scored on a HELD-OUT prefix of the same jsonl (the first `--val-examples`
 records; deterministic, so "held out" means the same physical examples for both arms)
@@ -295,6 +299,24 @@ def _make_reasserting_loss(
     return wrapped
 
 
+def _seed_batch_order(seed: int) -> None:
+    """Seed numpy's global RNG so `mlx_lm.tuner.trainer.iterate_batches`'s own
+    permutation draws are deterministic. Installed `iterate_batches` only reseeds when
+    `if seed:` is truthy (`site-packages/mlx_lm/tuner/trainer.py`) -- a seed of `0`
+    (this script's own `--seed` default) is therefore a NO-OP there, leaving the
+    training/validation batch-order permutation to whatever ambient numpy global-RNG
+    state this subprocess happens to carry at that point. This explicit call is what
+    actually guarantees the permutation stream is deterministic for ANY seed value,
+    including 0 -- the "both arms see the same example order" premise the whole
+    convergence comparison rests on (module docstring, `--compare`'s disclosure) depends
+    on THIS call, not on the `seed=` kwarg separately threaded into `iterate_batches`.
+    Do not delete this as redundant with that kwarg -- it is not."""
+    import numpy as np  # noqa: PLC0415 -- transitive mlx-lm dep, lazy like this script's
+    # other mlx_lm-adjacent imports
+
+    np.random.seed(seed)
+
+
 def _load_dataset(path: str) -> list[tuple[list[int], int]]:
     """Read a prep_alpaca jsonl -- one `{"tokens": [...], "offset": N}` object per line
     -- into the `(tokens, offset)` pairs `iterate_batches` consumes."""
@@ -389,11 +411,17 @@ def run_convergence(
     callback = _FlushingCallback(out_path, identity)
     # Seeds BOTH the len-sorted batch grouping's processing order (training) and the
     # validation batch order -- the SAME seed across two invocations therefore means the
-    # SAME example order for both arms (see the module docstring).
+    # SAME example order for both arms (see the module docstring). Belt-and-braces only:
+    # installed iterate_batches' own `if seed:` gate is a no-op at seed=0, so this kwarg
+    # alone does NOT guarantee determinism -- `_seed_batch_order` below is what does.
     seeded_iterate = functools.partial(iterate_batches, seed=condition.seed)
 
     active_before = mx.get_active_memory()
     mx.reset_peak_memory()
+    # Must run BEFORE train()'s first iterate_batches() call (its generator draws its
+    # first permutation immediately) -- see `_seed_batch_order`'s own docstring for why
+    # this explicit call, not the `seed=` kwarg above, is the actual determinism guarantee.
+    _seed_batch_order(condition.seed)
     with tempfile.TemporaryDirectory(prefix="mlx-train-perf-convergence-") as tmp_dir:
         args = TrainingArgs(
             batch_size=condition.batch_size, iters=condition.steps,
@@ -558,7 +586,10 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--lora-rank", type=int, default=8)
     ap.add_argument("--lora-layers", type=int, default=-1, help="-1 == all layers")
     ap.add_argument("--learning-rate", type=float, default=1e-5)
-    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--seed", type=int, default=0,
+                    help="training/validation batch order + LoRA init seed -- 0 is safe "
+                        "(explicitly re-seeded via _seed_batch_order; not left to "
+                        "mlx-lm's own no-op-at-zero reseed gate)")
     ap.add_argument("--grad-checkpoint", action="store_true",
                     help="gradient checkpointing (the realistic long-context QLoRA setup)")
     ap.add_argument("--out", type=Path, default=None,
