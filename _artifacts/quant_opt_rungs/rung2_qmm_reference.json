@@ -1,0 +1,27 @@
+{
+  "identity": {
+    "schema_version": 1,
+    "mlx_version": "0.31.2",
+    "machine": "arm64",
+    "macos": "26.5.1",
+    "code_sha": "13dd5bee6114a910",
+    "probe": "rung2_hoist",
+    "condition": "qmm_reference",
+    "n": 8192,
+    "v": 151936,
+    "d": 4096,
+    "group_size": 64,
+    "bits": 4,
+    "note": "materializes (N,V) logits \u2014 pays write traffic the fused kernel avoids; external ceiling datum, not apples-to-apples"
+  },
+  "status": "ok",
+  "wall_s_median": 2.2099,
+  "wall_s_all": [
+    2.2099,
+    2.2099,
+    2.2098
+  ],
+  "g_mac_per_s": 2307.0,
+  "active_before_gb": 2.707,
+  "marginal_peak_gb": 0.0
+}

@@ -1,0 +1,28 @@
+{
+  "rung": "rung2_mma_regresident",
+  "variant": "mma",
+  "git_sha": "dff6f70",
+  "mlx": "0.32.0",
+  "shape": {
+    "b": 1,
+    "hq": 32,
+    "hkv": 8,
+    "n": 8192,
+    "d": 128,
+    "dtype": "bfloat16"
+  },
+  "canary_rows": 512,
+  "canary_s": 0.0412,
+  "canary_g_mac_s": 834.69,
+  "walls_s": [
+    0.3364,
+    0.3287,
+    0.2956,
+    0.3051,
+    0.2997
+  ],
+  "median_s": 0.3051,
+  "achieved_g_mac_s": 900.93,
+  "peak_gb": 0.281,
+  "reps": 5
+}

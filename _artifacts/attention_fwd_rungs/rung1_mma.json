@@ -1,0 +1,18 @@
+{
+  "rung": "rung1_mma",
+  "variant": "mma",
+  "git_sha": "6df36d8",
+  "mlx": "0.32.0",
+  "shape": {
+    "b": 1,
+    "hq": 32,
+    "hkv": 8,
+    "n": 8192,
+    "d": 128,
+    "dtype": "bfloat16"
+  },
+  "canary_rows": 512,
+  "canary_s": 0.3961,
+  "canary_g_mac_s": 86.75,
+  "note": "full forward not run: projected total exceeds the safe per-eval class"
+}

@@ -88,7 +88,10 @@ dev = [
 [tool.ruff]
 line-length = 100
 target-version = "py311"
-extend-exclude = ["typings"]  # vendored mlx.core stubs (see [tool.mypy] note) -- not ours to lint
+extend-exclude = [
+    "typings",  # vendored mlx.core stubs (see [tool.mypy] note) -- not ours to lint
+    "_artifacts",  # tracked sweep drivers are measurement records, committed as they ran
+]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "N", "UP", "B", "A", "C4", "PT", "RET", "SIM", "ARG", "PTH", "PL", "RUF"]

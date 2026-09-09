@@ -1,0 +1,27 @@
+{
+  "identity": {
+    "schema_version": 1,
+    "mlx_version": "0.31.2",
+    "machine": "arm64",
+    "macos": "26.5.1",
+    "code_sha": "45e139d784ff9387",
+    "probe": "rung1_quant_rt2",
+    "condition": "dense_control",
+    "n": 8192,
+    "v": 151936,
+    "d": 4096,
+    "tile": 8192,
+    "row_tiles": 4
+  },
+  "status": "ok",
+  "wall_s_median": 2.0994,
+  "wall_s_all": [
+    2.1101,
+    2.0976,
+    2.0994
+  ],
+  "g_mac_per_s": 2428.4,
+  "rep_spread_frac": 0.006,
+  "active_before_gb": 1.222,
+  "marginal_peak_gb": 0.001
+}

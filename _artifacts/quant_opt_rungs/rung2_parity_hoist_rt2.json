@@ -1,0 +1,49 @@
+{
+  "identity": {
+    "schema_version": 1,
+    "mlx_version": "0.31.2",
+    "machine": "arm64",
+    "macos": "26.5.1",
+    "code_sha": "13dd5bee6114a910",
+    "probe": "rung2_hoist",
+    "condition": "parity_hoist_rt2",
+    "row_tiles": 2,
+    "grid": [
+      [
+        64,
+        64,
+        1024,
+        256
+      ],
+      [
+        64,
+        128,
+        1024,
+        333
+      ],
+      [
+        65,
+        192,
+        1027,
+        256
+      ],
+      [
+        128,
+        64,
+        8192,
+        1024
+      ]
+    ],
+    "group_size": 64,
+    "bits": 4
+  },
+  "status": "ok",
+  "worst_bf16_vs_dq_oracle": 0.002868175506591797,
+  "worst_fp32_ablation": 0.0,
+  "worst_vs_naive_fp32": 0.002868175506591797,
+  "gates": {
+    "bf16": 0.008,
+    "fp32_ablation": 1e-05,
+    "naive": 0.008
+  }
+}

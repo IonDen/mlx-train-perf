@@ -1,0 +1,10 @@
+{
+  "rung": "rung0_scalar_v0",
+  "git_sha": "e77514a+canary-fix-uncommitted",
+  "mlx": "0.32.0",
+  "shape": {"b": 1, "hq": 32, "hkv": 8, "n": 8192, "d": 128, "dtype": "bfloat16"},
+  "achieved_g_mac_s": 31.6,
+  "measurement": "canary-derived (median-of-3 tail-range dispatches against the FULL 8192-key working set, ~0.1 s each) -- NOT a full-forward wall. Two full-forward attempts were killed by macOS (kIOGPUCommandBufferCallbackErrorImpactingInteractivity): the kill is per COMMAND BUFFER / cumulative eval GPU-time, not per dispatch -- 35 honest 0.5s-projected (~0.25s real) range dispatches packed into one eval (~8.7 s total GPU work) died, while the CE kernel's ~2.2 s evals ship fine. Per-dispatch budget sizing alone cannot prevent this class; ground-truth probe scheduled before T9 (chained backward is the next exposed path).",
+  "calibration": "N-aware ramp + full-working-set canary (this rung motivated both fixes); pre-canary optimistic rate was 106.2 G (3.4x over)",
+  "role": "T6 ladder baseline (the 'before' for the simdgroup_matrix restructure)"
+}

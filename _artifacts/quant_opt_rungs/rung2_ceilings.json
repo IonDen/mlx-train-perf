@@ -1,0 +1,39 @@
+{
+  "identity": {
+    "schema_version": 1,
+    "mlx_version": "0.31.2",
+    "machine": "arm64",
+    "macos": "26.5.1",
+    "code_sha": "13dd5bee6114a910",
+    "probe": "rung2_hoist",
+    "condition": "ceilings"
+  },
+  "status": "ok",
+  "facts": {
+    "dense_rt4": {
+      "max_total_threads_per_threadgroup": 448,
+      "thread_execution_width": 32
+    },
+    "quant_rt2": {
+      "max_total_threads_per_threadgroup": 512,
+      "thread_execution_width": 32
+    },
+    "quant_rt4": {
+      "max_total_threads_per_threadgroup": 384,
+      "thread_execution_width": 32
+    },
+    "hoist_rt2": {
+      "max_total_threads_per_threadgroup": 384,
+      "thread_execution_width": 32
+    },
+    "hoist_rt4": {
+      "max_total_threads_per_threadgroup": 384,
+      "thread_execution_width": 32
+    }
+  },
+  "baselines_expected": {
+    "dense_rt4": 448,
+    "quant_rt2": 512,
+    "quant_rt4": 384
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "rung": "rung2b_dslab16",
+  "d_slab": 16,
+  "git_sha": "dff6f70",
+  "mlx": "0.32.0",
+  "parity_worst_n256": 0.001953125,
+  "canary_s": 0.0654,
+  "canary_g_mac_s": 525.7,
+  "median_s": 0.5349,
+  "achieved_g_mac_s": 513.95,
+  "walls_s": [
+    0.5304,
+    0.547,
+    0.536,
+    0.5349,
+    0.5333
+  ]
+}

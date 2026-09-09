@@ -1,0 +1,31 @@
+{
+  "identity": {
+    "schema_version": 1,
+    "mlx_version": "0.31.2",
+    "machine": "arm64",
+    "macos": "26.5.1",
+    "code_sha": "13dd5bee6114a910",
+    "probe": "rung2_hoist",
+    "condition": "hoist_rt2_tile2048",
+    "n": 8192,
+    "v": 151936,
+    "d": 4096,
+    "tile": 2048,
+    "row_tiles": 2,
+    "group_size": 64,
+    "bits": 4
+  },
+  "status": "ok",
+  "wall_s_median": 3.7926,
+  "wall_s_all": [
+    3.7926,
+    3.7893,
+    3.8069
+  ],
+  "g_mac_per_s": 1344.2,
+  "rep_spread_frac": 0.0047,
+  "active_before_gb": 0.389,
+  "marginal_peak_gb": 0.001,
+  "guard_raw_rate_macs_per_s": 477439587828.1,
+  "guard_rate_macs_per_s": 238719793914.0
+}
