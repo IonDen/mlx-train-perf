@@ -7,6 +7,8 @@ __pycache__/
 *.egg-info/
 .coverage
 dist/
+# Finder metadata
+.DS_Store
 # _artifacts/ is scratch by default. The directories negated below are measurement
 # evidence cited from the source, the README, or a published note, and are tracked so a
 # quoted number has a public record. Add a directory here when its results get cited;

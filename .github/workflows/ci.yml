@@ -22,6 +22,12 @@ jobs:
       - uses: astral-sh/setup-uv@v5
       - run: uv sync --all-extras
       - run: uv run ruff check src/ tests/
+      - name: Tracked artifacts carry no local paths
+        run: |
+          if grep -rlE '/Users/|/home/' _artifacts/attention_fwd_rungs _artifacts/attention_bwd_rungs _artifacts/quant_opt_rungs; then
+            echo "tracked artifact files must not contain absolute home paths" >&2
+            exit 1
+          fi
       - run: uv run mypy src/
       # coverage REPORTED but not gated here: the metal marker gates CORE code (kernel
       # launch/loss paths), so the default lane can't reach fail_under=85 by construction.
