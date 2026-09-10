@@ -7,7 +7,23 @@ __pycache__/
 *.egg-info/
 .coverage
 dist/
-_artifacts/
+# Finder metadata
+.DS_Store
+# _artifacts/ is scratch by default. The directories negated below are measurement
+# evidence cited from the source, the README, or a published note, and are tracked so a
+# quoted number has a public record. Add a directory here when its results get cited;
+# do not force-add files one by one.
+_artifacts/*
+!_artifacts/attention_fwd_rungs/
+!_artifacts/attention_bwd_rungs/
+!_artifacts/quant_opt_rungs/
+!_artifacts/bench_train_step_flash/
+!_artifacts/bench_train_step_flash_llama3b/
+!_artifacts/calib_050/
+!_artifacts/packed_bench_050/
+!_artifacts/packed_dkv/
+# Probe outputs that record an absolute local path in their command line; kept local.
+_artifacts/attention_bwd_rungs/buffer_packing_probe/
 # The contribution kit's intermediate per-condition artifacts; only the single
 # community-benchmarks/<chip>-<ram>gb-<date>.json is meant to be committed.
 /community-benchmarks/_work/

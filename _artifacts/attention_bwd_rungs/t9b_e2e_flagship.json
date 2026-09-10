@@ -1,0 +1,39 @@
+{
+  "rung": "t9b_e2e_flagship",
+  "shape": {
+    "b": 1,
+    "hq": 32,
+    "hkv": 8,
+    "n": 8192,
+    "d": 128,
+    "dtype": "bfloat16",
+    "causal": true,
+    "impl": "kernel"
+  },
+  "git_sha": "e412ef6",
+  "mlx": "0.32.0",
+  "fwd_median_s": 0.1828,
+  "fwd_walls_s": [
+    0.182,
+    0.1831,
+    0.1814,
+    0.184,
+    0.1828
+  ],
+  "fwd_bwd_median_s": 0.7576,
+  "fwd_bwd_walls_s": [
+    0.772,
+    0.7586,
+    0.7576,
+    0.7562,
+    0.7572
+  ],
+  "bwd_derived_s": 0.5748,
+  "grad_marginal_peak_gb": 1.002,
+  "ladder_reference": {
+    "fwd": 0.1831,
+    "dq_full": 0.2036,
+    "dkv_full": 0.3829,
+    "d_kernel": 0.0007
+  }
+}

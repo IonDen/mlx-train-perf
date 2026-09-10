@@ -1,0 +1,102 @@
+{
+  "rung": "t9b_step1_bwd_timing",
+  "shape": {
+    "b": 1,
+    "hq": 32,
+    "hkv": 8,
+    "n": 8192,
+    "d": 128,
+    "dtype": "bfloat16",
+    "causal": true
+  },
+  "git_sha": "2ccbee0",
+  "mlx": "0.32.0",
+  "budgets": {
+    "max_dispatch_s": 0.5,
+    "max_total_s": 2.0
+  },
+  "forward": {
+    "tile": {
+      "variant": "mma",
+      "d_slab": 128,
+      "provisional": false
+    },
+    "calibrated_rate_g": 1487.6,
+    "median_s": 0.1831,
+    "walls_s": [
+      0.1829,
+      0.1869,
+      0.1828,
+      0.1838,
+      0.1831
+    ],
+    "achieved_g_mac_s_causal_true": 1501.2
+  },
+  "bwd_D": {
+    "median_s": 0.0007,
+    "walls_s": [
+      0.0007,
+      0.0007,
+      0.0007,
+      0.0007,
+      0.0007
+    ]
+  },
+  "bwd_dq": {
+    "canary_rows": 75,
+    "median_s": 0.2145,
+    "walls_s": [
+      0.2145,
+      0.2145,
+      0.2146,
+      0.2145,
+      0.2151
+    ],
+    "achieved_g_mac_s": 35.2
+  },
+  "bwd_dkv": {
+    "canary_rows": 151,
+    "median_s": 0.2445,
+    "walls_s": [
+      0.2445,
+      0.2571,
+      0.1808,
+      0.2226,
+      0.264
+    ],
+    "achieved_g_mac_s": 82.89
+  },
+  "production_verdicts": {
+    "calibrated_bwd_rate_g": 35.84,
+    "calibrated_fwd_rate_g": 1487.6,
+    "dkv_flagship": {
+      "verdict": "REFUSES",
+      "error": "projected 0.50 s/dispatch (133 rows), 31 s total at 35.8 G MAC/s (budget 0.5 s / 2.0 s). Reduce shape/context, or pass a measured rate."
+    },
+    "dq_flagship": {
+      "verdict": "REFUSES",
+      "error": "projected 0.50 s/dispatch (178 rows), 23 s total at 35.8 G MAC/s (budget 0.5 s / 2.0 s). Reduce shape/context, or pass a measured rate."
+    }
+  },
+  "projections_causal_true": {
+    "dq_full_pass_s": 11.71,
+    "dkv_full_pass_s": 6.63,
+    "backward_total_s": 18.35,
+    "forward_measured_s": 0.1831,
+    "bwd_over_fwd_wall": 100.2,
+    "spec_4_4_reference": "realistic v1 ~0.3 TMAC/s => dkv ~1.8s; bwd ~3x fwd wall"
+  },
+  "shared_rate_condition": {
+    "throughput_dq_g": 35.2,
+    "half_throughput_dkv_g": 41.45,
+    "dq_ge_half_dkv": false
+  },
+  "compiled_ceilings": {
+    "dq_d64": 384,
+    "dkv_d64": 1024,
+    "dq_d96": 384,
+    "dkv_d96": 1024,
+    "dq_d128": 1024,
+    "dkv_d128": 1024
+  }
+}

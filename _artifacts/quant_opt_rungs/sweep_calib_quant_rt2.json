@@ -1,0 +1,30 @@
+{
+  "identity": {
+    "schema_version": 1,
+    "mlx_version": "0.31.2",
+    "machine": "arm64",
+    "macos": "26.5.1",
+    "code_sha": "9ea8f464529f53bb",
+    "probe": "sweep_calibration_verify",
+    "condition": "quant_rt2",
+    "n": 8192,
+    "v": 151936,
+    "d": 4096,
+    "tile": 8192
+  },
+  "status": "ok",
+  "calibrated_raw_macs_per_s": 1284948046706.1,
+  "full_g_mac_per_s": 1306.1,
+  "ratio_cal_over_full": 0.984,
+  "wall_s_median": 3.9033,
+  "wall_s_all": [
+    3.9076,
+    3.9033,
+    3.8949
+  ],
+  "calibration_seconds": 1.965,
+  "acceptance_band": [
+    0.7,
+    1.3
+  ]
+}

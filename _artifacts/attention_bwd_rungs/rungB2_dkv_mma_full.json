@@ -1,0 +1,15 @@
+{
+  "rung": "rungB2_dkv_mma_full",
+  "d_slab": 128,
+  "git_sha": "a64b561",
+  "mlx": "0.32.0",
+  "rate_passed_g": 1857.94,
+  "outcome": "ran",
+  "median_s": 0.3829,
+  "walls_s": [
+    0.3901,
+    0.3799,
+    0.3829
+  ],
+  "achieved_g_mac_s_causal_true": 1435.77
+}

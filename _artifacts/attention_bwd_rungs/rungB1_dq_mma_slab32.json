@@ -1,0 +1,17 @@
+{
+  "rung": "rungB1_dq_mma_slab32",
+  "d_slab": 32,
+  "git_sha": "9096451",
+  "mlx": "0.32.0",
+  "canary_rows": 672,
+  "median_s": 0.0909,
+  "walls_s": [
+    0.0886,
+    0.0906,
+    0.0909,
+    0.1106,
+    0.102
+  ],
+  "achieved_g_mac_s": 744.18,
+  "xvariant_maxdiff_n256_vs_scalar": 0.0
+}
