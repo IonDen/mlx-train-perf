@@ -4,7 +4,7 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.7.0] - 2026-08-31
+## [0.7.0] - 2026-09-15
 
 Adds Qwen 3.5 to the supported model list. The family mixes full-attention layers with
 GatedDeltaNet (linear-attention) ones in the same model, an architecture the flash-attention

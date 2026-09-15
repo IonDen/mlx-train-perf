@@ -225,7 +225,13 @@ class GatedDeltaTrainingProxy(nn.Module):
         `z` (the gate the post-norm step needs) is intentionally not computed here --
         it depends only on `inputs`, not on anything this method produces, so
         `__call__` computes it itself rather than threading it through an
-        `(out, state)`-shaped return."""
+        `(out, state)`-shaped return.
+
+        `mask` is always None on the mlx-lm trainer path (without a cache,
+        `create_ssm_mask` returns None), and right-padded batches are safe there by
+        causality alone. The masked branch exists for direct `chunked_gated_delta`
+        callers and is covered by the masked-parity suite -- it is not dead code, and
+        its absence from the trainer path is not a bug to fix."""
         if self.sharding_group is not None:
             raise UnsupportedRecurrentError(
                 "this layer's GatedDeltaNet has a distributed sharding_group set "

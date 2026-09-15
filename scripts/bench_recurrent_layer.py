@@ -225,8 +225,15 @@ def _build_layer(*, dtype: mx.Dtype, seed: int) -> Any:
         model_type="qwen3_5", **cast("dict[str, Any]", QWEN35_08B_TEXT_CONFIG)
     )
     layer: Any = GatedDeltaNet(config)
+    # `set_dtype`'s predicate is keyed on dtype alone, so a bare call would downcast
+    # A_log to bf16 -- the exact cast the training proxy refuses at its first forward.
+    # Preserve it fp32 the way the model-level path's cast_predicate does.
+    a_log = layer.A_log
     layer.set_dtype(dtype)
+    layer.A_log = a_log
     mx.eval(layer.parameters())
+    if layer.A_log.dtype != mx.float32:
+        raise RuntimeError("A_log must stay float32 for representative gate decay rates")
     return layer
 
 

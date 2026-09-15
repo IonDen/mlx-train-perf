@@ -416,6 +416,11 @@ def run_convergence(
     # alone does NOT guarantee determinism -- `_seed_batch_order` below is what does.
     seeded_iterate = functools.partial(iterate_batches, seed=condition.seed)
 
+    # Settle the allocator before the baseline snapshot (gotcha 15): model prep just
+    # dropped the pre-cast parameter tree and LoRA-injection temporaries, and their
+    # release is deferred -- an unsettled read here under-reads the marginal peak.
+    mx.synchronize()
+    mx.clear_cache()
     active_before = mx.get_active_memory()
     mx.reset_peak_memory()
     # Must run BEFORE train()'s first iterate_batches() call (its generator draws its
@@ -471,8 +476,10 @@ def _run_single_condition(
         ceiling = effective_memory_ceiling()
     except MemoryBudgetError as exc:
         # Too crowded to START safely is an ENVIRONMENT-transient outcome -- its own
-        # status, distinct from a crash. Only "ok" artifacts are fresh on resume, so a
-        # later, quieter invocation re-runs this condition automatically.
+        # status, distinct from a crash. `result_is_fresh` never treats it as complete,
+        # so a re-run under the SAME session id repeats this condition instead of
+        # reusing the refusal (each plain invocation draws a fresh session id and
+        # re-runs everything regardless).
         write_result(out_path, identity, "refused_environment", error=str(exc))
         return cast("dict[str, object]", json.loads(out_path.read_text()))
     warning_field: dict[str, object] = (

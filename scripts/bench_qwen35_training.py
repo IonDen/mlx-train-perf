@@ -386,6 +386,11 @@ def measure_condition(condition: TrainCondition) -> dict[str, object]:
     expected_wired, _soft = clamped_caps(dev_max)
     opt = optim.Adam(learning_rate=condition.learning_rate)
 
+    # Settle the allocator before the baseline snapshot (gotcha 15): model prep just
+    # dropped the pre-cast parameter tree and LoRA-injection temporaries, and their
+    # release is deferred -- an unsettled read here under-reads the marginal peak.
+    mx.synchronize()
+    mx.clear_cache()
     active_before = mx.get_active_memory()
     mx.reset_peak_memory()
     step_reports = _run_train_steps(

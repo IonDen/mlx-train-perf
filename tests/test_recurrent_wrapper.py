@@ -1,11 +1,11 @@
-"""`enable_gated_delta_training` selection + refusal matrix (no forward yet).
+"""`enable_gated_delta_training` selection, refusal matrix, and proxy forward gates.
 
 Layer selection is structural (`layer.is_linear` + a class check on `layer.linear_attn`,
 cross-checked against the raw `text_config.layer_types`, when present) -- see
-`recurrent/wrapper.py`'s module docstring for the verified mlx-lm facts this rests on. The
-proxy's forward pass lands in a later change; here it only needs to refuse a cache before
-raising `NotImplementedError`.
-"""
+`recurrent/wrapper.py`'s module docstring for the verified mlx-lm facts this rests on.
+Alongside the refusal matrix (cache/family/MoE/sharding/double-enable), this file gates
+the proxy's forward: routing (poison test), freeze/LoRA ordering, eval mode, and dtype
+order."""
 from typing import Any
 from unittest import mock
 

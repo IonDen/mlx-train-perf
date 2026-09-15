@@ -1,11 +1,10 @@
 """Recurrent / GatedDelta blocked solver core.
 
 Blocked forward-substitution for (I - A)x = b where A is strictly-lower-triangular
-(nilpotent). Used by the GatedDelta chunk kernel to solve recurrent states without
-materializing high-rank intermediate products.
+(nilpotent). `chunked_gated_delta` in this module chains it per chunk to solve
+recurrent states without materializing high-rank intermediate products.
 
-Computation follows the Qwen 3.5 GDN block structure (hidden x linear keys/values);
-a later task chains this solver with the chunk kernel.
+Computation follows the Qwen 3.5 GDN block structure (hidden x linear keys/values).
 
 **Dtype protocol:** computations inherit the input dtype (float32 or bfloat16).
 Accumulation error growth is bounded by sub-blocking (SUB_BLOCK=16) within each chunk.

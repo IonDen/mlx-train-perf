@@ -2,7 +2,7 @@
 
 ## Released
 
-### 0.7.0 - 2026-08-31
+### 0.7.0 - 2026-09-15
 - GatedDelta training for Qwen 3.5. `enable_gated_delta_training` gives the family's
   GatedDeltaNet (linear-attention) layers, the ones the flash-attention wrapper can't reach, a
   training path through an in-tree chunk-parallel implementation of the same recurrence, and

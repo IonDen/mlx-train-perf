@@ -161,10 +161,12 @@ out, state = chunked_gated_delta(q, k, v, g, beta, state, mask=mask)
 
 At masked positions, `chunked_gated_delta`'s `y` is unspecified and differs from `gated_delta_ops`'s own output there — the two agree on `state` and on every valid position's `y`, but not on what a masked position's output looks like. Mask your own loss the same way `mlx_train_perf`'s adapter does, and don't rely on `y` at those positions.
 
-`head` is a `DenseHead`, a `QuantizedHead`, or a tied embedding via `tied_head(...)`. `q`/`k`/`v`
-are `(B, H, N, D)` with `head_dim` in {64, 96, 128} and grouped-query heads mapped contiguously,
-matching `mx.fast.scaled_dot_product_attention`'s own convention. Pass `segments=PackedMask(...)`
-for block-diagonal packing.
+`head` is a `DenseHead`, a `QuantizedHead`, or a tied embedding via `tied_head(...)`. For
+`flash_attention`, `q`/`k`/`v` are `(B, H, N, D)` with `head_dim` in {64, 96, 128} and
+grouped-query heads mapped contiguously, matching `mx.fast.scaled_dot_product_attention`'s own
+convention; pass `segments=PackedMask(...)` for block-diagonal packing. `chunked_gated_delta`
+follows mlx-lm's own `gated_delta_ops` convention instead: `(B, T, H, D)` with the sequence
+axis second, and whatever key/value head dims the checkpoint carries.
 
 What you are signing up for, stated plainly:
 
@@ -324,7 +326,7 @@ enable_gated_delta_training(model, impl="chunked")
 loss = make_loss_fn(model, impl="auto")
 ```
 
-Call it in place, on a loaded model, before you build the loss and call `train`, the same order `enable_flash_attention` uses. Every structurally linear-attention layer's `GatedDeltaNet` gets replaced by a proxy that routes through the chunk-parallel op; the model's full-attention layers are untouched and keep running on stock attention. Right-padded batches work as you'd expect: the recurrence and its depthwise convolution are both causal, so a padded position can only influence positions after it, and with right padding those are all padding too. The loss already masks out padded targets, so nothing downstream ever depends on what a pad position's own output was.
+Call it in place, on a loaded model, before you build the loss and call `train`, the same order `enable_flash_attention` uses. Every structurally linear-attention layer's `GatedDeltaNet` gets replaced by a proxy that routes through the chunk-parallel op; the model's full-attention layers are untouched and keep running on stock attention. One throughput note: each distinct padded sequence length traces its own compute graph (the chunk loop unrolls at trace time), so a fixed `max_seq_length` or fixed-length rows keep the trace count at one, while a ragged dataset pays a small per-new-length retrace cost. Right-padded batches work as you'd expect: the recurrence and its depthwise convolution are both causal, so a padded position can only influence positions after it, and with right padding those are all padding too. The loss already masks out padded targets, so nothing downstream ever depends on what a pad position's own output was.
 
 What this release covers, and what it does not:
 
