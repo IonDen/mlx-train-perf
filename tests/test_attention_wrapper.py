@@ -194,6 +194,17 @@ def test_enable_refuses_unknown_family() -> None:
         enable_flash_attention(nn.Linear(4, 4))
 
 
+def test_enable_refuses_qwen35_naming_gated_delta_training() -> None:
+    """qwen3_5's attention block is structurally different (head_dim 256, a gated output,
+    partial RoPE) and stays unsupported by the flash kernel -- but the refusal message
+    must name `enable_gated_delta_training` so a user who tries flash on this family
+    learns what IS supported, not just what isn't. Bug this catches: today the message
+    only lists the supported-family tuple, with no mention of the qwen3_5 training path."""
+    fake_qwen35 = type("FakeQwen35Model", (), {"__module__": "mlx_lm.models.qwen3_5"})()
+    with pytest.raises(UnsupportedAttentionError, match="enable_gated_delta_training"):
+        enable_flash_attention(fake_qwen35)
+
+
 def test_enable_refuses_head_dim_outside_supported_set() -> None:
     """`_tiny_llama` is head_dim=16 (64 hidden / 4 heads) -- below the kernel's {64,96,128}.
     The gate refuses it regardless of impl (a training wrapper whose reason to exist is the

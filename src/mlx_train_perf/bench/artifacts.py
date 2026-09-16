@@ -74,6 +74,14 @@ CODE_SHA_DEPS: tuple[Path, ...] = tuple(
         # invalidate a prior packed_train artifact.
         "data/packing.py",
         "attention/segments.py",
+        # The chunked GatedDelta recurrent path's measured-path files. `families.py`
+        # supplies the qwen3_5 model-tree navigation `recurrent/wrapper.py`'s
+        # `enable_gated_delta_training` depends on to select and wrap the linear-attention
+        # layers a measured recurrent condition would run through.
+        "recurrent/ops.py",
+        "recurrent/reference.py",
+        "recurrent/wrapper.py",
+        "families.py",
     )
 )
 

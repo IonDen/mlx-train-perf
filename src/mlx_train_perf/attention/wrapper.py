@@ -56,6 +56,7 @@ from mlx import nn
 from mlx_train_perf.attention.api import flash_attention
 from mlx_train_perf.attention.segments import PackedMask
 from mlx_train_perf.errors import AttentionInputError, UnsupportedAttentionError
+from mlx_train_perf.families import is_qwen35
 
 _Impl = Literal["auto", "kernel", "reference"]
 
@@ -246,6 +247,15 @@ def enable_flash_attention(
     module_name = type(model).__module__
     if module_name not in _SUPPORTED_FAMILIES:
         supported = ", ".join(_SUPPORTED_FAMILIES)
+        if is_qwen35(model):
+            raise UnsupportedAttentionError(
+                f"unsupported model architecture (module {module_name!r}); "
+                f"enable_flash_attention supports: {supported}. qwen3_5's attention "
+                "block is structurally different (a gated output, partial RoPE, "
+                "head_dim 256 outside this kernel's supported {64, 96, 128}) and its "
+                "linear-attention layers have no full-attention block at all -- see "
+                "enable_gated_delta_training for the qwen3_5 training path instead"
+            )
         raise UnsupportedAttentionError(
             f"unsupported model architecture (module {module_name!r}); "
             f"enable_flash_attention supports: {supported}"

@@ -91,6 +91,80 @@ def test_from_config_defaults_kv_heads_and_reads_quantization_block() -> None:
     assert s.quant_group == 64
 
 
+def test_from_config_refuses_nested_hybrid_config() -> None:
+    """A qwen3_5-style config nests every model-shape field under `text_config`, so the
+    top level has none of `num_attention_heads`/`hidden_size`/etc. Bug this catches: today
+    `from_config` raises a bare `KeyError` on `config["num_attention_heads"]` -- an
+    untyped traceback -- instead of a typed, actionable `PlanInputError`."""
+    config = {
+        "model_type": "qwen3_5",
+        "text_config": {
+            "hidden_size": 1024, "intermediate_size": 3584, "num_hidden_layers": 24,
+            "num_attention_heads": 8, "num_key_value_heads": 2, "vocab_size": 248320,
+            "full_attention_interval": 4,
+            "layer_types": ["linear_attention"] * 18 + ["full_attention"] * 6,
+            "tie_word_embeddings": True,
+        },
+    }
+    with pytest.raises(PlanInputError, match="hybrid"):
+        ModelShape.from_config(config)
+
+
+def test_from_config_refuses_flattened_hybrid_config() -> None:
+    """A hypothetical "flattened" qwen3.5 config -- `text_config`'s fields hoisted to the
+    top level -- carries every key `from_config` reads, so today it SUCCEEDS and returns a
+    badly wrong estimate: `param_count()` assumes a uniform llama-shaped attention stack,
+    but 3/4 of this family's layers (18 of 24, `full_attention_interval=4`) have no
+    attention block at all. The refusal must key on a positive hybrid marker
+    (`full_attention_interval` / `linear_attention` layer_types entries), not on a missing
+    key, so a flattened config still gets caught."""
+    config = {
+        "hidden_size": 1024, "intermediate_size": 3584, "num_hidden_layers": 24,
+        "num_attention_heads": 8, "num_key_value_heads": 2, "vocab_size": 248320,
+        "full_attention_interval": 4,
+        "layer_types": ["linear_attention"] * 18 + ["full_attention"] * 6,
+        "tie_word_embeddings": True,
+    }
+    with pytest.raises(PlanInputError, match="hybrid"):
+        ModelShape.from_config(config)
+
+
+def test_from_config_hybrid_refusal_names_the_merely_nested_case() -> None:
+    """The `text_config` marker also fires on a config that is NOT hybrid at all -- a
+    plain VLM wrapping a uniform full-attention text model, with every field nested one
+    level down under `text_config` and no `full_attention_interval` or
+    `linear_attention` layer_types entry anywhere. Bug this catches: the refusal message
+    calling this "a hybrid attention/recurrent config" is a misdiagnosis for this case --
+    it must also name the merely-nested possibility, since `from_config` cannot actually
+    tell the two apart from the top-level keys alone."""
+    config = {
+        "model_type": "some_vlm",
+        "text_config": {
+            "hidden_size": 1024, "intermediate_size": 3584, "num_hidden_layers": 24,
+            "num_attention_heads": 8, "num_key_value_heads": 8, "vocab_size": 32000,
+            "tie_word_embeddings": True,
+        },
+    }
+    with pytest.raises(PlanInputError, match="nested"):
+        ModelShape.from_config(config)
+
+
+def test_from_config_null_layer_types_does_not_raise_type_error() -> None:
+    """`layer_types` present with an explicit `None` value (no other hybrid marker
+    present) must not crash the marker check with a bare `TypeError`. Bug this catches:
+    `config.get("layer_types", [])` returns `None` (not `[]`) when the key is PRESENT
+    with a null value -- the default only applies when the key is ABSENT -- so
+    `"linear_attention" in None` raises `TypeError: argument of type 'NoneType' is not
+    iterable`. With no other marker present, this config is not flagged hybrid and
+    `from_config` must proceed normally."""
+    config = {
+        "vocab_size": 1000, "hidden_size": 64, "num_hidden_layers": 2,
+        "intermediate_size": 128, "num_attention_heads": 4, "num_key_value_heads": 2,
+        "tie_word_embeddings": False, "layer_types": None,
+    }
+    assert ModelShape.from_config(config) == _shape()
+
+
 def test_unknown_dtype_raises_plan_input_error() -> None:
     s = _shape()
     calib = load_calibration()

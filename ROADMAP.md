@@ -2,6 +2,14 @@
 
 ## Released
 
+### 0.7.0 - 2026-09-15
+- GatedDelta training for Qwen 3.5. `enable_gated_delta_training` gives the family's
+  GatedDeltaNet (linear-attention) layers, the ones the flash-attention wrapper can't reach, a
+  training path through an in-tree chunk-parallel implementation of the same recurrence, and
+  `make_loss_fn` now covers the family too. The full-attention layers stay on stock attention,
+  sequence packing and the RAM-fit planner don't cover this family yet, and generating text
+  needs a fresh, KV-cache-capable reload of the model.
+
 ### 0.6.0 - 2026-08-26
 - Per-loss-implementation flash memory coefficients in the planner. `plan --attention
   flash` with the fused loss no longer carries the stock-loss arm's worst-case margin:
@@ -88,6 +96,16 @@
 - mlx-lm training adapter, RAM-fit planner, and benchmark harness.
 
 ## Planned
+
+### Flash attention for Qwen 3.5's full-attention layers
+The flash kernels don't cover this family's attention block — a different head dimension
+and a differently shaped block. Those layers stay on stock attention until the kernels
+grow that coverage.
+
+### Sequence packing for Qwen 3.5
+Packing threads its segment mask through the flash-attention wrapper, which doesn't wrap
+GatedDelta layers. Extending packing to this family needs a segment carrier the recurrent
+training path understands too.
 
 ### Faster dK/dV backward kernels
 The dK/dV backward is the slowest part of the flash path. A register-scheduling change to its
