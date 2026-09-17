@@ -57,6 +57,7 @@ Every number here has a committed script under `scripts/` that reproduces it, al
 ```bash
 pip install mlx-train-perf            # the loss kernel + planner
 pip install "mlx-train-perf[mlx-lm]"  # plus the mlx-lm training adapter
+pip install "mlx-train-perf[guard]"   # plus external supervision for benchmark runs
 ```
 
 Apple Silicon only. Requires mlx >=0.32.0,<0.33, the version the kernels' JIT contract is verified against. The mlx-lm adapter and the flash-attention wrapper need the optional `mlx-lm` extra.
@@ -447,6 +448,43 @@ The guard sets an active-memory ceiling from the machine's own RAM. It is anchor
 The guard is rank-local: every input it reads is this node's own RAM, availability, and process memory. On a multi-node `mx.distributed` job each rank sizes its own ceiling and flags its own crowding, and a breach hard-exits that rank — so run distributed training under a launcher (`mpirun` or `mlx.launch`) that propagates a rank failure to the whole job.
 
 The incident that motivated this guard, and what the watchdog does and does not cover, is documented in [When an MLX memory cap is not a safety boundary](https://ineshin.space/papers/when-an-mlx-memory-cap-is-not-a-safety-boundary/).
+
+### Optional external supervision
+
+The guard above lives inside the worker, so it sees what MLX reports: active memory. It cannot see what macOS charges the process as a whole, which also includes MLX's retained buffer cache and everything the interpreter allocates outside MLX, and nothing outside the worker owns its process group. [mlx-guard](https://github.com/IonDen/mlx-guard) covers that side. It is a small native supervisor that launches the worker, samples its OS-accounted footprint from outside, and stops the whole process group against a limit you set. The benchmark runner can put every condition under it:
+
+```bash
+pip install "mlx-train-perf[guard]"
+```
+
+```python
+from mlx_train_perf.bench.runner import ExternalGuardConfig, run_conditions
+
+paths = run_conditions(
+    conditions,
+    out_dir,
+    session_id=session_id,
+    guard=ExternalGuardConfig(
+        max_footprint_bytes=28 * 1024**3,  # sized for a 32 GB Mac; scale it to your RAM
+        wall_time_ms=60 * 60 * 1000,
+        checkpoint_timeout_ms=10_000,
+    ),
+)
+```
+
+Supervision is off unless you pass `guard=`, and nothing in the package imports mlx-guard until you do. For now it is a Python API on `run_conditions`; the `scripts/bench_*.py` drivers and the `mlx-train-perf` CLI do not expose it yet. The footprint limit is yours to choose. It counts more than MLX's active memory, so set it at or above the in-process ceiling for your machine, not below it, and well under physical RAM.
+
+When a limit trips, the supervisor first asks the worker to checkpoint, then sends TERM. The worker can only answer between repetitions or training steps, so `checkpoint_timeout_ms` should cover one full step. The supervisor's default is one second, which a multi-second training step will always miss, and the most it accepts is 60 seconds. A condition whose steps run longer than that cannot checkpoint in time and will always end as an abort. A worker that answers in time writes and syncs a `checkpointed_partial` artifact with its progress before it acknowledges. When the intervention ends without a completed checkpoint, because the worker never reached a safe point, answered too late, or could not write, the condition is recorded as `aborted_external_guard`. Either way the condition counts as unfinished, and the next run retries it from the start.
+
+Each launch writes its own supervisor report under `out_dir/_mlx_guard/`, next to a small `supervision` record that says how the run ended, whether a checkpoint was acknowledged, and how the worker itself exited. Reports are never deleted or reused, because the supervisor keeps a journal beside each one and refuses a path it has already written to. The directory grows by one report per launch, and clearing it out is up to you. The runner refuses to start if `_mlx_guard` is a symlink or belongs to another user.
+
+The runner falls back to a direct, unsupervised launch in one situation only: the supervisor could not be brought up. That covers mlx-guard not being installed, a broken install, a binary that fails its version or integrity check, and a version check that times out on a busy machine. Each fallback is written as a `guard_fallback` record and announced on stderr, because the condition's own artifact looks the same with or without a supervisor. Once a supervisor has started, the condition is never launched a second time, whatever goes wrong afterwards. A failure in the client is written to a `guard_client_error` record, and any artifact the worker produced is kept. If the client never learned how the worker ended and there is no artifact, the condition is recorded as an `error` of type `GuardClientError`. A failure the supervisor reports about itself or the launch becomes an `error` of type `SupervisorReportedFailure`.
+
+A runner that dies takes its supervised worker down with it, unless the runner was started under `nohup`, which turns the supervisor's parent watch off. Pass `on_parent_exit="detach"` if a condition should outlive the runner on purpose. A later sweep cannot see a detached worker that is still running, so it would launch that condition again.
+
+The wired limit, the memory ceiling watchdog and the wall-time backstop described above stay on inside a supervised worker. The two layers watch different numbers, and either one can stop a run. If both fire at once, the watchdog's breach record wins: the checkpoint stands down, and a result that finishes during a breach does not replace the record.
+
+The extra pins `mlx-guard==0.2.0` exactly. mlx-guard is pre-1.0, where a minor release may change behavior a consumer can see, and its reports can only be read back by the version that wrote them. To roll back, drop `guard=` or uninstall the extra: runs return to the unsupervised path with nothing else to change.
 
 ## Research
 

@@ -424,9 +424,13 @@ def test_worker_main_threads_config_attention_impl_into_identity_and_run(
     captured: dict[str, object] = {}
 
     def _fake_run(
-        _params: dict[str, object], *, attention_impl: str | None = None,
+        _params: dict[str, object],
+        *,
+        attention_impl: str | None = None,
+        checkpoint: object,
     ) -> dict[str, object]:
         captured["attention_impl"] = attention_impl
+        captured["checkpoint"] = checkpoint
         return {"loss_all": [1.0, 1.0]}
 
     monkeypatch.setattr(worker, "run_train_step", _fake_run)
@@ -454,9 +458,13 @@ def test_worker_main_train_step_without_attention_impl_omits_it_from_identity(
     captured: dict[str, object] = {}
 
     def _fake_run(
-        _params: dict[str, object], *, attention_impl: str | None = None,
+        _params: dict[str, object],
+        *,
+        attention_impl: str | None = None,
+        checkpoint: object,
     ) -> dict[str, object]:
         captured["attention_impl"] = attention_impl
+        captured["checkpoint"] = checkpoint
         return {"loss_all": [1.0, 1.0]}
 
     monkeypatch.setattr(worker, "run_train_step", _fake_run)
@@ -483,7 +491,10 @@ def test_worker_main_train_step_wired_cap_regression_is_not_caught_and_writes_no
     _stub_load(monkeypatch)
 
     def _raise(
-        _params: dict[str, object], *, attention_impl: str | None = None,  # noqa: ARG001
+        _params: dict[str, object],
+        *,
+        attention_impl: str | None = None,  # noqa: ARG001
+        checkpoint: object,  # noqa: ARG001
     ) -> dict[str, object]:
         raise WiredCapRegressionError("wired limit regressed")
 

@@ -4,6 +4,52 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] - 2026-09-17
+
+Benchmark runs can now put every condition worker under [mlx-guard](https://github.com/IonDen/mlx-guard),
+an external supervisor that measures what macOS charges the process rather than what MLX
+reports, owns the worker's process group, and stops it against a limit you set. It is opt-in,
+and the in-process memory guard stays on in both modes.
+
+### Added
+- `run_conditions(..., guard=ExternalGuardConfig(...))` supervises each worker with an
+  OS-accounted footprint limit, an optional wall-time limit, and a checkpoint acknowledgement
+  timeout (`checkpoint_timeout_ms`, at most 60 s; size it to one full step, because the worker
+  can only answer between steps). Install with `pip install "mlx-train-perf[guard]"`, which
+  pins `mlx-guard==0.2.0` exactly. Nothing imports mlx-guard unless `guard=` is passed. The
+  bench scripts and the CLI do not expose it yet.
+- Workers answer a checkpoint request between repetitions or training steps by writing and
+  syncing a `checkpointed_partial` artifact before they acknowledge. A failed checkpoint write
+  is reported on stderr and never acknowledged as completed; the worker stays up so the
+  supervisor can stop it cleanly. If the memory watchdog is already recording a breach, the
+  checkpoint stands down and the breach record is kept.
+- New condition statuses, all retried by the next run: `checkpointed_partial`,
+  `aborted_external_guard` (an intervention that ended without a completed checkpoint), and
+  `error` with `GuardClientError` or `SupervisorReportedFailure` when the fault was on the
+  supervision side rather than in the condition.
+- Supervisor reports and a per-condition `supervision` record land in `out_dir/_mlx_guard/`,
+  one report per launch attempt. The runner refuses a `_mlx_guard` that is a symlink or is
+  owned by another user.
+- The runner launches a worker directly only when the supervisor cannot be brought up:
+  mlx-guard missing, a broken install, a binary that fails its version or integrity check, or
+  a version check that times out. Each fallback is recorded as `guard_fallback` and announced
+  on stderr before the worker starts. After a supervisor has started, a condition is never
+  launched twice, and an interrupted run cancels the supervisor and gives it a moment to shut
+  down instead of leaving it behind.
+
+### Changed
+- The worker and its new checkpoint module are both inputs to the code hash in a benchmark
+  artifact's identity, so artifacts written by earlier releases no longer count as fresh. A
+  resumed sweep measures them again.
+
+### Fixed
+- Two writers of one benchmark artifact could collide on a shared temporary file and lose or
+  tear the artifact. The memory watchdog's breach record could race the worker's own final
+  write this way; temporary names are now unique per write.
+- A result that finished while the memory watchdog was recording a breach could replace the
+  breach record just before the process exited, and would then have counted as a clean, fresh
+  measurement. The worker's final write now stands down once a breach is being recorded.
+
 ## [0.7.0] - 2026-09-15
 
 Adds Qwen 3.5 to the supported model list. The family mixes full-attention layers with
@@ -358,6 +404,7 @@ Silicon, with an mlx-lm adapter, a RAM-fit planner, and a benchmark harness.
   `ROADMAP.md`).
 - Architectures: Llama and Qwen3 only. Training: LoRA / QLoRA. Apple Silicon only.
 
+[0.8.0]: https://github.com/IonDen/mlx-train-perf/releases/tag/v0.8.0
 [0.7.0]: https://github.com/IonDen/mlx-train-perf/releases/tag/v0.7.0
 [0.6.0]: https://github.com/IonDen/mlx-train-perf/releases/tag/v0.6.0
 [0.5.1]: https://github.com/IonDen/mlx-train-perf/releases/tag/v0.5.1

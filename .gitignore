@@ -27,3 +27,5 @@ _artifacts/attention_bwd_rungs/buffer_packing_probe/
 # The contribution kit's intermediate per-condition artifacts; only the single
 # community-benchmarks/<chip>-<ram>gb-<date>.json is meant to be committed.
 /community-benchmarks/_work/
+# per-write temporary artifact files (a crashed write can leave one behind)
+*.tmp

@@ -8,6 +8,7 @@ at a tiny synthetic shape with `impl="naive"`/`"chunked"` -- fast, no Metal JIT,
 import json
 import subprocess
 import sys
+import threading
 from collections.abc import Callable
 from importlib.metadata import PackageNotFoundError
 from pathlib import Path
@@ -347,7 +348,79 @@ def test_write_result_is_atomic_no_tmp_file_left_behind(tmp_path: Path) -> None:
     p = tmp_path / "r.json"
     write_result(p, ident, "ok", wall_s=1.0)
     assert p.exists()
-    assert not p.with_suffix(".tmp").exists()
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
+def test_unlocked_writers_of_one_artifact_never_tear_it_or_lose_a_rename(
+    tmp_path: Path,
+) -> None:
+    # Catches: a temp name derived from the TARGET. Aimed at the unlocked writer on purpose:
+    # the lock would hide this bug, and the lock is exactly what the breach path gives up
+    # when it times out. With one shared `<name>.tmp`, one writer renames the other's file
+    # away (FileNotFoundError) or the artifact lands half-written.
+    ident = run_identity(model="m", session_id="s1")
+    p = tmp_path / "r.json"
+    failures: list[BaseException] = []
+
+    def hammer(status: str) -> None:
+        try:
+            for _ in range(400):
+                artifacts._write_atomically(p, ident, status, {"payload": "x" * 2048})
+        except BaseException as error:  # the failure IS the observation
+            failures.append(error)
+
+    threads = [threading.Thread(target=hammer, args=(s,)) for s in ("a", "b")]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert failures == []
+    assert json.loads(p.read_text())["status"] in ("a", "b")
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
+def test_a_breach_write_lands_even_while_another_writer_holds_the_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Catches: a blocking `with _WRITE_LOCK:` in `write_result`. The watchdog writes its
+    # breach record from a paging storm and must never wait on a stalled main thread.
+    monkeypatch.setattr(artifacts, "_WRITE_LOCK_TIMEOUT_S", 0.05)
+    out = tmp_path / "r.json"
+    ident = run_identity(model="m", session_id="s1")
+    done = threading.Event()
+
+    def breach_writer() -> None:
+        write_result(out, ident, "aborted_memory_ceiling")
+        done.set()
+
+    with artifacts._WRITE_LOCK:  # a main thread stalled mid-write
+        thread = threading.Thread(target=breach_writer)
+        thread.start()
+        landed = done.wait(timeout=5.0)
+    thread.join()
+
+    assert landed
+    assert json.loads(out.read_text())["status"] == "aborted_memory_ceiling"
+
+
+def test_a_breach_in_progress_outranks_a_later_checkpoint_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Catches: last-rename-wins. The breach artifact is the durable record the memory-safety
+    # story rests on; a checkpoint write landing after it would replace
+    # `aborted_memory_ceiling` with the milder `checkpointed_partial`.
+    monkeypatch.setattr(artifacts, "_BREACH", threading.Event())
+    out = tmp_path / "r.json"
+    ident = run_identity(model="m", session_id="s1")
+
+    assert artifacts.write_result_unless_breached(out, ident, "checkpointed_partial") is True
+    make_watchdog_on_breach(out, ident, 28 * _GIB, exit_fn=lambda _code: None)(
+        "memory_ceiling", {"active_bytes": 32 * _GIB, "elapsed_s": 1.0},
+    )
+    assert artifacts.write_result_unless_breached(out, ident, "checkpointed_partial") is False
+
+    assert json.loads(out.read_text())["status"] == "aborted_memory_ceiling"
 
 
 # --- report(): same-session ratio computed when identities otherwise match --------
@@ -591,7 +664,9 @@ def test_worker_main_records_refusal_not_a_crash(
         "out": str(out),
     }))
 
-    def _refuse(_params: dict[str, object]) -> dict[str, object]:
+    def _refuse(
+        _params: dict[str, object], *, checkpoint: object,  # noqa: ARG001
+    ) -> dict[str, object]:
         raise LaunchBudgetError("projected dispatch exceeds the watchdog budget")
 
     monkeypatch.setattr(worker, "run_loss_layer", _refuse)
@@ -652,7 +727,11 @@ def test_worker_main_installs_guardrails_first(
     }))
     calls: list[str] = []
     monkeypatch.setattr(worker, "install_guardrails", lambda: calls.append("guardrails"))
-    monkeypatch.setattr(worker, "run_loss_layer", lambda _params: calls.append("run") or {})  # type: ignore[func-returns-value]
+    monkeypatch.setattr(
+        worker,
+        "run_loss_layer",
+        lambda _params, *, checkpoint: calls.append("run") or {},  # noqa: ARG005
+    )
     worker.main(["--config", str(cfg)])
     assert calls == ["guardrails", "run"]
 
