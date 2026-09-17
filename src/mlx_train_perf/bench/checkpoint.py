@@ -1,7 +1,5 @@
 """Optional mlx-guard checkpoint integration for benchmark workers."""
 
-from __future__ import annotations
-
 import importlib
 import os
 from collections.abc import Callable
@@ -75,7 +73,7 @@ class _ExternalCheckpointSession:
     def poll(self) -> object | None:
         if self._worker is None:
             return None
-        return cast("object | None", self._worker.poll())
+        return cast(object | None, self._worker.poll())
 
     def close(self) -> None:
         if self._worker is not None:
