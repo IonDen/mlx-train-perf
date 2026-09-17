@@ -2,6 +2,13 @@
 
 ## Released
 
+### 0.8.0 - 2026-09-17
+- Optional external supervision for benchmark runs. `run_conditions(..., guard=...)` places each
+  condition worker under [mlx-guard](https://github.com/IonDen/mlx-guard): an OS-accounted
+  footprint limit, process-group ownership, and a cooperative checkpoint before the worker is
+  stopped. The in-process memory guard stays on either way, and the runner falls back to a
+  direct launch only when the supervisor cannot be found.
+
 ### 0.7.0 - 2026-09-15
 - GatedDelta training for Qwen 3.5. `enable_gated_delta_training` gives the family's
   GatedDeltaNet (linear-attention) layers, the ones the flash-attention wrapper can't reach, a

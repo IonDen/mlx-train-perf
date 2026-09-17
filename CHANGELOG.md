@@ -4,6 +4,32 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] - 2026-09-17
+
+Benchmark runs can now put every condition worker under [mlx-guard](https://github.com/IonDen/mlx-guard),
+an external supervisor that measures what macOS charges the process rather than what MLX
+reports, owns the worker's process group, and stops it against a limit you set. It is opt-in,
+and the in-process memory guard stays on in both modes.
+
+### Added
+- `run_conditions(..., guard=ExternalGuardConfig(...))` supervises each worker with an
+  OS-accounted footprint limit, an optional wall-time limit, and a checkpoint acknowledgement
+  timeout (`checkpoint_timeout_ms`; size it to one full step, because the worker can only
+  answer between steps). Install with `pip install "mlx-train-perf[guard]"`, which pins
+  `mlx-guard==0.2.0` exactly. Nothing imports mlx-guard unless `guard=` is passed.
+- Workers answer a checkpoint request between repetitions or training steps by writing and
+  syncing a `checkpointed_partial` artifact before they acknowledge. A failed checkpoint write
+  is reported on stderr and never acknowledged as completed; the worker stays up so the
+  supervisor can stop it cleanly.
+- New condition statuses, all retried by the next run: `checkpointed_partial`,
+  `aborted_external_guard` (a limit tripped before the worker reached a safe point), and
+  `error` with `GuardClientError` or `SupervisorReportedFailure` when the fault was on the
+  supervision side rather than in the condition.
+- Supervisor reports and a per-condition `supervision` record land in `out_dir/_mlx_guard/`,
+  one report per launch attempt.
+- If mlx-guard or its binary is unavailable, the runner records a `guard_fallback` and launches
+  the worker directly. After a supervisor has started, a condition is never launched twice.
+
 ## [0.7.0] - 2026-09-15
 
 Adds Qwen 3.5 to the supported model list. The family mixes full-attention layers with
@@ -358,6 +384,7 @@ Silicon, with an mlx-lm adapter, a RAM-fit planner, and a benchmark harness.
   `ROADMAP.md`).
 - Architectures: Llama and Qwen3 only. Training: LoRA / QLoRA. Apple Silicon only.
 
+[0.8.0]: https://github.com/IonDen/mlx-train-perf/releases/tag/v0.8.0
 [0.7.0]: https://github.com/IonDen/mlx-train-perf/releases/tag/v0.7.0
 [0.6.0]: https://github.com/IonDen/mlx-train-perf/releases/tag/v0.6.0
 [0.5.1]: https://github.com/IonDen/mlx-train-perf/releases/tag/v0.5.1
