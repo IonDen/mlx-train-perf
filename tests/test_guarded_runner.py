@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+from importlib.metadata import PackageNotFoundError
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -25,11 +26,47 @@ class _FakeRunConfig:
         self.__dict__.update(fields)
 
 
-def _fake_module(run: Any) -> object:
+class _ConfigError(ValueError):
+    pass
+
+
+def _fake_module(
+    run: Any,
+    *,
+    start_error: BaseException | None = None,
+    run_config: Any = _FakeRunConfig,
+) -> object:
+    """A stand-in for the `mlx_guard` package (a true external boundary: a native binary).
+    `run` plays `GuardProcess.wait()`: it executes only AFTER `start()` returned, i.e. only
+    once a supervisor -- and so possibly a worker -- exists."""
+
+    def start(config: object, *, capture_output: bool) -> object:
+        if start_error is not None:
+            raise start_error
+        return SimpleNamespace(wait=lambda: run(config, capture_output=capture_output))
+
     return SimpleNamespace(
-        RunConfig=_FakeRunConfig,
-        run=run,
+        RunConfig=run_config,
+        start=start,
         SupervisorDiscoveryError=_DiscoveryError,
+    )
+
+
+def _result(
+    *, returncode: int = 0, kind: str = "child_exited",
+    checkpoint: dict[str, object] | None = None, child_status: object = None,
+) -> object:
+    outcome: dict[str, object] = {"kind": kind}
+    if child_status is not None:
+        outcome["child_status"] = child_status
+    payload: dict[str, object] = {"outcome": outcome}
+    if checkpoint is not None:
+        payload["checkpoint"] = checkpoint
+    return SimpleNamespace(
+        returncode=returncode, stdout=b"", stderr=b"",
+        report=SimpleNamespace(
+            outcome=SimpleNamespace(kind=SimpleNamespace(value=kind)), payload=payload,
+        ),
     )
 
 
@@ -42,6 +79,45 @@ def test_guard_config_rejects_invalid_limits() -> None:
         ExternalGuardConfig(max_footprint_bytes=1024, wall_time_ms=0)
 
 
+@pytest.mark.parametrize("bad", [9, 60_001, 1.5, True])
+def test_guard_config_rejects_checkpoint_timeout_outside_10ms_to_60s(bad: Any) -> None:
+    # Catches: forwarding an out-of-range timeout, which the supervisor would refuse only
+    # AFTER the runner had already cleared the stale condition artifact.
+    with pytest.raises(ValueError, match="checkpoint_timeout_ms"):
+        ExternalGuardConfig(max_footprint_bytes=1 << 30, checkpoint_timeout_ms=bad)
+
+
+def test_guard_config_rejects_unknown_on_parent_exit() -> None:
+    with pytest.raises(ValueError, match="on_parent_exit"):
+        ExternalGuardConfig(max_footprint_bytes=1 << 30, on_parent_exit="orphan")
+
+
+def test_checkpoint_timeout_and_parent_exit_reach_run_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Catches: the knob is accepted and silently dropped, so a multi-second training step
+    # always loses its checkpoint to the supervisor's 1 s default.
+    captured: dict[str, Any] = {}
+
+    def fake_run(config: object, *, capture_output: bool) -> object:  # noqa: ARG001
+        captured["config"] = config
+        return _result()
+
+    monkeypatch.setattr(
+        runner.importlib, "import_module", lambda _name: _fake_module(fake_run),
+    )
+    config_path = tmp_path / "condition.json"
+    config_path.write_text("{}")
+    policy = ExternalGuardConfig(
+        max_footprint_bytes=1 << 30, checkpoint_timeout_ms=5_000, on_parent_exit="detach",
+    )
+
+    runner._spawn_guarded_worker(config_path, tmp_path / "guard.json", policy)
+
+    assert captured["config"].checkpoint_timeout_ms == 5_000
+    assert captured["config"].on_parent_exit == "detach"
+
+
 def test_guarded_spawn_passes_literal_worker_command_and_policy(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -50,7 +126,7 @@ def test_guarded_spawn_passes_literal_worker_command_and_policy(
     def fake_run(config: object, *, capture_output: bool) -> object:
         captured["config"] = config
         captured["capture_output"] = capture_output
-        return SimpleNamespace(returncode=75, stdout=b"worker out", stderr=b"worker err")
+        return _result(returncode=75, kind="policy_intervention")
 
     monkeypatch.setattr(
         runner.importlib, "import_module", lambda _name: _fake_module(fake_run),
@@ -113,47 +189,300 @@ def test_missing_package_falls_back_before_any_supervisor_start(
     assert result.client_error is None
 
 
-def test_discovery_failure_falls_back_but_report_failure_never_reruns(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    direct_calls: list[Path] = []
+def _direct_launch_spy(monkeypatch: pytest.MonkeyPatch) -> list[Path]:
+    calls: list[Path] = []
     monkeypatch.setattr(
         runner,
         "_spawn_worker",
-        lambda path: direct_calls.append(path)
-        or subprocess.CompletedProcess([], 0, "direct", ""),
+        lambda path: calls.append(path) or subprocess.CompletedProcess([], 0, "direct", ""),
+    )
+    return calls
+
+
+def _raising(error: BaseException) -> Any:
+    def wait(_config: object, *, capture_output: bool) -> object:  # noqa: ARG001
+        raise error
+
+    return wait
+
+
+def test_broken_install_metadata_falls_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Catches: `import mlx_guard` reads its own distribution metadata at import; on a broken
+    # install that raises PackageNotFoundError, a ModuleNotFoundError whose `.name` is the
+    # DISTRIBUTION name "mlx-guard" -- re-raising it would abort the whole sweep for a case
+    # that must fall back.
+    direct_calls = _direct_launch_spy(monkeypatch)
+    monkeypatch.setattr(
+        runner.importlib,
+        "import_module",
+        lambda _name: (_ for _ in ()).throw(PackageNotFoundError("mlx-guard")),
     )
     config_path = tmp_path / "condition.json"
     config_path.write_text("{}")
-    policy = ExternalGuardConfig(max_footprint_bytes=512 << 20)
 
+    result = runner._spawn_guarded_worker(
+        config_path, tmp_path / "guard.json", ExternalGuardConfig(max_footprint_bytes=1 << 30),
+    )
+
+    assert direct_calls == [config_path]
+    assert result.fallback_reason == "mlx-guard package is unavailable"
+
+
+def test_discovery_failure_before_the_supervisor_starts_falls_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    direct_calls = _direct_launch_spy(monkeypatch)
     monkeypatch.setattr(
         runner.importlib,
         "import_module",
         lambda _name: _fake_module(
-            lambda _config, *, capture_output: (_ for _ in ()).throw(  # noqa: ARG005
-                _DiscoveryError("version mismatch")
-            )
+            _raising(AssertionError("wait() must not run when start() failed")),
+            start_error=_DiscoveryError("version mismatch"),
         ),
     )
-    discovery = runner._spawn_guarded_worker(config_path, tmp_path / "a.json", policy)
-    assert discovery.fallback_reason == "mlx-guard supervisor discovery failed"
-    assert direct_calls == [config_path]
+    config_path = tmp_path / "condition.json"
+    config_path.write_text("{}")
 
+    result = runner._spawn_guarded_worker(
+        config_path, tmp_path / "a.json", ExternalGuardConfig(max_footprint_bytes=1 << 30),
+    )
+
+    assert direct_calls == [config_path]
+    assert result.fallback_reason == "mlx-guard supervisor discovery failed"
+    assert result.client_error is None
+
+
+def test_discovery_failure_after_the_worker_ran_never_relaunches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Catches: deciding fallback by exception TYPE. The guard re-verifies its binary while
+    # loading the final report, so the very same SupervisorDiscoveryError can surface AFTER
+    # the supervised worker already ran (a slow `--version` probe on a stressed machine).
+    # Relaunching there runs the condition twice and clobbers the first artifact.
+    direct_calls = _direct_launch_spy(monkeypatch)
+    monkeypatch.setattr(
+        runner.importlib,
+        "import_module",
+        lambda _name: _fake_module(_raising(_DiscoveryError("version probe timed out"))),
+    )
+    config_path = tmp_path / "condition.json"
+    config_path.write_text("{}")
+
+    result = runner._spawn_guarded_worker(
+        config_path, tmp_path / "a.json", ExternalGuardConfig(max_footprint_bytes=1 << 30),
+    )
+
+    assert direct_calls == []
+    assert result.fallback_reason is None
+    assert result.client_error == "guard client failed after launch: _DiscoveryError"
+    assert result.process is None
+
+
+def test_report_failure_never_relaunches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    direct_calls = _direct_launch_spy(monkeypatch)
+    monkeypatch.setattr(
+        runner.importlib,
+        "import_module",
+        lambda _name: _fake_module(_raising(_ReportError("report write failed"))),
+    )
+    config_path = tmp_path / "condition.json"
+    config_path.write_text("{}")
+
+    result = runner._spawn_guarded_worker(
+        config_path, tmp_path / "b.json", ExternalGuardConfig(max_footprint_bytes=1 << 30),
+    )
+
+    assert direct_calls == []
+    assert result.client_error == "guard client failed after launch: _ReportError"
+
+
+def test_rejected_configuration_is_recorded_not_raised(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Catches: RunConfig validation living outside the try, where one refused policy
+    # aborts every remaining condition of the sweep.
+    def refusing_config(**_fields: object) -> object:
+        raise _ConfigError("cwd must be absolute")
+
+    direct_calls = _direct_launch_spy(monkeypatch)
     monkeypatch.setattr(
         runner.importlib,
         "import_module",
         lambda _name: _fake_module(
-            lambda _config, *, capture_output: (_ for _ in ()).throw(  # noqa: ARG005
-                _ReportError("report write failed")
-            )
+            _raising(AssertionError("unreachable")), run_config=refusing_config,
         ),
     )
-    report_failure = runner._spawn_guarded_worker(config_path, tmp_path / "b.json", policy)
-    assert direct_calls == [config_path]
-    assert report_failure.fallback_reason is None
-    assert report_failure.client_error == "guard client failed after launch: _ReportError"
-    assert report_failure.process.returncode != 0
+    config_path = tmp_path / "condition.json"
+    config_path.write_text("{}")
+
+    result = runner._spawn_guarded_worker(
+        config_path, tmp_path / "c.json", ExternalGuardConfig(max_footprint_bytes=1 << 30),
+    )
+
+    assert direct_calls == []
+    assert result.client_error == "guard client could not start the supervisor: _ConfigError"
+
+
+def test_guard_outcome_keeps_how_the_command_ended_and_what_was_saved() -> None:
+    result = _result(
+        returncode=75, kind="policy_intervention", child_status={"signal": 15},
+        checkpoint={
+            "status": "acknowledged_unverified_durability", "request_id": 7,
+            "reason": "wall_time", "artifact": {"kind": "file", "size_bytes": 641},
+        },
+    )
+    assert runner._guard_outcome(result) == {
+        "kind": "policy_intervention",
+        "returncode": 75,
+        "child_status": {"signal": 15},
+        "checkpoint_status": "acknowledged_unverified_durability",
+        "checkpoint_request_id": 7,
+        "checkpoint_reason": "wall_time",
+        "checkpoint_artifact": {"kind": "file", "size_bytes": 641},
+    }
+
+
+def test_guard_outcome_tolerates_a_report_without_a_checkpoint_section() -> None:
+    assert runner._guard_outcome(_result())["checkpoint_status"] is None
+
+
+def _guarded_condition() -> runner.Condition:
+    return runner.Condition(
+        name="guarded", kind="loss_layer", params={"n": 8, "d": 4, "v": 16, "impl": "naive"},
+    )
+
+
+def test_each_attempt_gets_its_own_report_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Catches: reusing `<condition>.json`. The guard retains `.<name>.journal` beside every
+    # report and refuses a path whose journal exists, so the resume retry of a condition
+    # would never run under supervision again.
+    reports: list[Path] = []
+
+    def fake_spawn(
+        _config_path: Path, report_path: Path, _policy: ExternalGuardConfig,
+    ) -> runner.GuardedWorkerResult:
+        reports.append(report_path)
+        return runner.GuardedWorkerResult(
+            process=subprocess.CompletedProcess([], 75, "", ""),
+            fallback_reason=None, client_error=None,
+            outcome={"kind": "policy_intervention", "returncode": 75},
+        )
+
+    monkeypatch.setattr(runner, "_spawn_guarded_worker", fake_spawn)
+    policy = ExternalGuardConfig(max_footprint_bytes=1 << 30)
+    runner.run_conditions([_guarded_condition()], tmp_path, session_id="s1", guard=policy)
+    runner.run_conditions([_guarded_condition()], tmp_path, session_id="s1", guard=policy)
+
+    assert len(reports) == 2
+    assert reports[0] != reports[1]
+    assert {r.parent for r in reports} == {tmp_path / "_mlx_guard"}
+    assert all(r.name.startswith("guarded.") and r.suffix == ".json" for r in reports)
+
+
+def test_intervention_without_an_artifact_is_an_external_abort_not_a_crash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Catches: recording a deliberate policy intervention as WorkerCrashed -- the sweep
+    # would report a bug where the guard did its job.
+    outcome: dict[str, object] = {"kind": "policy_intervention", "returncode": 75}
+    monkeypatch.setattr(
+        runner,
+        "_spawn_guarded_worker",
+        lambda _c, _r, _p: runner.GuardedWorkerResult(
+            process=subprocess.CompletedProcess([], 75, "", ""),
+            fallback_reason=None, client_error=None, outcome=outcome,
+        ),
+    )
+    paths = runner.run_conditions(
+        [_guarded_condition()], tmp_path, session_id="s1",
+        guard=ExternalGuardConfig(max_footprint_bytes=1 << 30),
+    )
+
+    data = json.loads(paths[0].read_text())
+    assert data["status"] == "aborted_external_guard"
+    assert data["guard_outcome"] == outcome
+    record = json.loads((tmp_path / "_mlx_guard" / "guarded.supervision.json").read_text())
+    assert record["status"] == "guard_supervised"
+    assert record["outcome"] == outcome
+    assert record["report"].startswith("guarded.")
+
+
+@pytest.mark.parametrize("kind", ["supervisor_failure", "launch_not_found"])
+def test_supervisor_side_failure_is_not_blamed_on_the_worker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str,
+) -> None:
+    # Catches: labelling a supervisor-side failure `WorkerCrashed` -- whoever debugs the
+    # sweep would go looking for a bug in the condition instead of in the launch.
+    outcome: dict[str, object] = {"kind": kind, "returncode": 70}
+    monkeypatch.setattr(
+        runner,
+        "_spawn_guarded_worker",
+        lambda _c, _r, _p: runner.GuardedWorkerResult(
+            process=subprocess.CompletedProcess([], 70, "", ""),
+            fallback_reason=None, client_error=None, outcome=outcome,
+        ),
+    )
+    paths = runner.run_conditions(
+        [_guarded_condition()], tmp_path, session_id="s1",
+        guard=ExternalGuardConfig(max_footprint_bytes=1 << 30),
+    )
+
+    data = json.loads(paths[0].read_text())
+    assert data["status"] == "error"
+    assert data["error_type"] == "SupervisedLaunchFailed"
+    assert data["guard_outcome"] == outcome
+
+
+def test_a_supervised_worker_crash_is_still_a_worker_crash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    outcome: dict[str, object] = {"kind": "child_exited", "returncode": 1}
+    monkeypatch.setattr(
+        runner,
+        "_spawn_guarded_worker",
+        lambda _c, _r, _p: runner.GuardedWorkerResult(
+            process=subprocess.CompletedProcess([], 1, "", "Traceback: boom"),
+            fallback_reason=None, client_error=None, outcome=outcome,
+        ),
+    )
+    paths = runner.run_conditions(
+        [_guarded_condition()], tmp_path, session_id="s1",
+        guard=ExternalGuardConfig(max_footprint_bytes=1 << 30),
+    )
+
+    data = json.loads(paths[0].read_text())
+    assert data["error_type"] == "WorkerCrashed"
+    assert data["error_msg"] == "Traceback: boom"
+
+
+def test_client_failure_without_an_artifact_is_named_as_such(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Catches: fabricating exit code 70 for a client-side failure -- the same number the
+    # in-process watchdog and the supervisor's own failure outcome already use.
+    monkeypatch.setattr(
+        runner,
+        "_spawn_guarded_worker",
+        lambda _c, _r, _p: runner.GuardedWorkerResult(
+            process=None, fallback_reason=None,
+            client_error="guard client failed after launch: _ReportError",
+        ),
+    )
+    paths = runner.run_conditions(
+        [_guarded_condition()], tmp_path, session_id="s1",
+        guard=ExternalGuardConfig(max_footprint_bytes=1 << 30),
+    )
+
+    data = json.loads(paths[0].read_text())
+    assert data["status"] == "error"
+    assert data["error_type"] == "GuardClientError"
+    assert "returncode" not in data
 
 
 def test_run_conditions_records_guard_metadata_separately(

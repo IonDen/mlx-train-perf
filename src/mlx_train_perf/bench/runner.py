@@ -12,14 +12,20 @@ import json
 import subprocess
 import sys
 import tempfile
+import time
+import uuid
 from collections import defaultdict
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 from mlx_train_perf.bench.artifacts import condition_identity, result_is_fresh, write_result
 
 _STDERR_TAIL_CHARS = 4000  # enough to see the failing assertion/traceback, not a full dump
+# Supervisor outcome kinds that describe how the WORKER ended (every other kind describes
+# the supervisor, the launch, or a policy decision).
+_CHILD_OUTCOMES = frozenset({"child_exited", "child_signaled"})
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -53,6 +59,14 @@ class ExternalGuardConfig:
     max_footprint_bytes: int
     sample_interval_ms: int = 50
     wall_time_ms: int | None = None
+    # How long the supervisor waits for the worker's checkpoint acknowledgement before it
+    # escalates (`None` -> the supervisor's own 1 s default). The worker can only answer
+    # at its next poll, i.e. after the repetition or training step in flight, so size this
+    # to the step time: a multi-second step under the default always loses its checkpoint.
+    checkpoint_timeout_ms: int | None = None
+    # `None` defers to the supervisor default ("terminate": a runner that dies takes its
+    # worker down). "detach" lets a condition outlive the runner.
+    on_parent_exit: str | None = None
 
     def __post_init__(self) -> None:
         limit = self.max_footprint_bytes
@@ -70,15 +84,25 @@ class ExternalGuardConfig:
             type(wall_time) is not int or not 1 <= wall_time <= 30 * 24 * 60 * 60 * 1000
         ):
             raise ValueError("wall_time_ms must be within 1ms..=30d")
+        timeout = self.checkpoint_timeout_ms
+        if timeout is not None and (
+            type(timeout) is not int or not 10 <= timeout <= 60_000
+        ):
+            raise ValueError("checkpoint_timeout_ms must be within 10ms..=60s")
+        if self.on_parent_exit not in (None, "terminate", "detach"):
+            raise ValueError("on_parent_exit must be 'terminate', 'detach', or None")
 
 
 @dataclass(frozen=True, slots=True)
 class GuardedWorkerResult:
-    """Worker process result plus launch-boundary supervision metadata."""
+    """Worker process result plus launch-boundary supervision metadata. `process` is
+    `None` when the guard client failed before it could report how the worker ended --
+    nothing is fabricated in its place."""
 
-    process: subprocess.CompletedProcess[str]
+    process: subprocess.CompletedProcess[str] | None
     fallback_reason: str | None
     client_error: str | None
+    outcome: dict[str, object] | None = None
 
 
 def _spawn_worker(config_path: Path) -> subprocess.CompletedProcess[str]:
@@ -88,16 +112,47 @@ def _spawn_worker(config_path: Path) -> subprocess.CompletedProcess[str]:
     )
 
 
+def _new_attempt_id() -> str:
+    return f"{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-{uuid.uuid4().hex[:8]}"
+
+
+def _guard_outcome(result: Any) -> dict[str, object]:
+    """What the supervisor's report says happened, in the runner's own record. Read from
+    the outcome KIND, never from exit-code numerics: 70 is shared by the in-process
+    watchdog's breach exit and the supervisor's own failure outcome, and the supervisor
+    ranks its codes (failure over intervention over the command's status)."""
+    payload = result.report.payload
+    checkpoint = payload.get("checkpoint") or {}
+    artifact = checkpoint.get("artifact")
+    child_status = (payload.get("outcome") or {}).get("child_status")
+    return {
+        "kind": str(result.report.outcome.kind.value),
+        "returncode": int(result.returncode),
+        "child_status": dict(child_status) if isinstance(child_status, Mapping) else child_status,
+        "checkpoint_status": checkpoint.get("status"),
+        "checkpoint_request_id": checkpoint.get("request_id"),
+        "checkpoint_reason": checkpoint.get("reason"),
+        "checkpoint_artifact": dict(artifact) if isinstance(artifact, Mapping) else None,
+    }
+
+
 def _spawn_guarded_worker(
     config_path: Path,
     report_path: Path,
     policy: ExternalGuardConfig,
 ) -> GuardedWorkerResult:
-    """Supervise one worker, falling back only on pre-launch discovery failures."""
+    """Supervise one worker. Direct launch is a fallback ONLY while no supervisor exists:
+    the boundary is the call site, not the exception type. `start()` returns once the
+    native supervisor is up, so anything it raises about discovery happened before a
+    worker could exist. `wait()` re-verifies the binary while loading the final report, so
+    the same discovery error there means the worker already ran -- never relaunch."""
     try:
         mlx_guard = importlib.import_module("mlx_guard")
     except ModuleNotFoundError as error:
-        if error.name not in (None, "mlx_guard"):
+        # "mlx-guard" (the distribution name) is what a broken install raises: the package
+        # reads its own metadata at import, and PackageNotFoundError is a
+        # ModuleNotFoundError. Any other missing module is a real bug -- let it surface.
+        if error.name not in (None, "mlx_guard", "mlx-guard"):
             raise
         return GuardedWorkerResult(
             process=_spawn_worker(config_path),
@@ -112,15 +167,17 @@ def _spawn_guarded_worker(
         "--config",
         str(config_path),
     )
-    config = mlx_guard.RunConfig(
-        command=command,
-        report=report_path,
-        max_footprint_bytes=policy.max_footprint_bytes,
-        sample_interval_ms=policy.sample_interval_ms,
-        wall_time_ms=policy.wall_time_ms,
-    )
     try:
-        result = mlx_guard.run(config, capture_output=True)
+        config = mlx_guard.RunConfig(
+            command=command,
+            report=report_path,
+            max_footprint_bytes=policy.max_footprint_bytes,
+            sample_interval_ms=policy.sample_interval_ms,
+            wall_time_ms=policy.wall_time_ms,
+            checkpoint_timeout_ms=policy.checkpoint_timeout_ms,
+            on_parent_exit=policy.on_parent_exit,
+        )
+        supervised = mlx_guard.start(config, capture_output=True)
     except mlx_guard.SupervisorDiscoveryError:
         return GuardedWorkerResult(
             process=_spawn_worker(config_path),
@@ -128,8 +185,21 @@ def _spawn_guarded_worker(
             client_error=None,
         )
     except Exception as error:
+        # A refused configuration is strictly pre-launch, but it means the caller's policy
+        # is wrong -- running unsupervised instead would hide that. A start error is NOT
+        # provably pre-launch (the readiness handshake can fail after the worker exists).
         return GuardedWorkerResult(
-            process=subprocess.CompletedProcess(command, 70, "", ""),
+            process=None,
+            fallback_reason=None,
+            client_error=(
+                f"guard client could not start the supervisor: {type(error).__name__}"
+            ),
+        )
+    try:
+        result = supervised.wait()
+    except Exception as error:
+        return GuardedWorkerResult(
+            process=None,
             fallback_reason=None,
             client_error=f"guard client failed after launch: {type(error).__name__}",
         )
@@ -142,6 +212,7 @@ def _spawn_guarded_worker(
         ),
         fallback_reason=None,
         client_error=None,
+        outcome=_guard_outcome(result),
     )
 
 
@@ -149,6 +220,65 @@ def _text_output(value: object) -> str:
     if isinstance(value, bytes):
         return value.decode("utf-8", errors="replace")
     return value if isinstance(value, str) else ""
+
+
+def _launch_under_guard(
+    config_path: Path,
+    out_path: Path,
+    ident: dict[str, object],
+    name: str,
+    guard_dir: Path,
+    guard: ExternalGuardConfig,
+) -> subprocess.CompletedProcess[str] | None:
+    """One supervised launch plus its records under `_mlx_guard/`. Returns the worker's
+    process result, or `None` when the guard client failed (already recorded here)."""
+    # A fresh report path per launch attempt: the supervisor retains `.<report>.journal`
+    # beside every report and refuses a path whose journal exists, so a fixed name would
+    # block the resume retry of any condition. Reports and journals are evidence -- never
+    # deleted here.
+    guard_report = guard_dir / f"{name}.{_new_attempt_id()}.json"
+    records = {
+        kind: guard_dir / f"{name}.{kind}.json" for kind in ("launch", "client", "supervision")
+    }
+    for record in records.values():
+        record.unlink(missing_ok=True)
+    guarded = _spawn_guarded_worker(config_path, guard_report, guard)
+    if guarded.fallback_reason is not None:
+        write_result(
+            records["launch"], ident, "guard_fallback", reason=guarded.fallback_reason,
+        )
+    if guarded.client_error is not None:
+        write_result(
+            records["client"], ident, "guard_client_error",
+            error=guarded.client_error, report=guard_report.name,
+        )
+    if guarded.outcome is not None:
+        write_result(
+            records["supervision"], ident, "guard_supervised",
+            outcome=guarded.outcome, report=guard_report.name,
+        )
+    if not out_path.exists():
+        # No worker artifact to respect, and the supervision layer knows why.
+        if guarded.client_error is not None:
+            write_result(
+                out_path, ident, "error", error_type="GuardClientError",
+                error_msg=guarded.client_error,
+            )
+        elif guarded.outcome is not None and guarded.outcome["kind"] == "policy_intervention":
+            # The guard did its job before the worker reached a poll: an honest abort, the
+            # external twin of `aborted_memory_ceiling`.
+            write_result(
+                out_path, ident, "aborted_external_guard",
+                guard_outcome=guarded.outcome, report=guard_report.name,
+            )
+        elif guarded.outcome is not None and guarded.outcome["kind"] not in _CHILD_OUTCOMES:
+            # The supervisor or the launch failed, not the condition. A `child_*` outcome
+            # falls through to the caller's ordinary worker-crash envelope instead.
+            write_result(
+                out_path, ident, "error", error_type="SupervisedLaunchFailed",
+                guard_outcome=guarded.outcome, report=guard_report.name,
+            )
+    return guarded.process
 
 
 def run_conditions(
@@ -196,32 +326,16 @@ def run_conditions(
             json.dump(config, f)
             config_path = Path(f.name)
         try:
+            proc: subprocess.CompletedProcess[str] | None
             if guard is None:
                 proc = _spawn_worker(config_path)
             else:
-                guard_report = guard_dir / f"{condition.name}.json"
-                fallback_record = guard_dir / f"{condition.name}.launch.json"
-                client_record = guard_dir / f"{condition.name}.client.json"
-                guard_report.unlink(missing_ok=True)
-                fallback_record.unlink(missing_ok=True)
-                client_record.unlink(missing_ok=True)
-                guarded = _spawn_guarded_worker(config_path, guard_report, guard)
-                proc = guarded.process
-                if guarded.fallback_reason is not None:
-                    write_result(
-                        fallback_record,
-                        ident,
-                        "guard_fallback",
-                        reason=guarded.fallback_reason,
-                    )
-                if guarded.client_error is not None:
-                    write_result(
-                        client_record,
-                        ident,
-                        "guard_client_error",
-                        error=guarded.client_error,
-                    )
-            if proc.returncode != 0 and not out_path.exists():
+                proc = _launch_under_guard(
+                    config_path, out_path, ident, condition.name, guard_dir, guard,
+                )
+            if proc is None:
+                pass  # recorded above; a client failure never fabricates a worker status
+            elif proc.returncode != 0 and not out_path.exists():
                 # A nonzero exit that left NO artifact: the worker crashed before/without
                 # reaching any `write_result`. THIS is the sweep-level failure envelope,
                 # keyed by the SAME identity the worker would have used, so a later resume
