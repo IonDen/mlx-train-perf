@@ -5,7 +5,7 @@ import pytest
 
 from mlx_train_perf.core.guards import install_guardrails
 
-_GATED = ("metal", "smoke", "benchmark", "network")
+_GATED = ("metal", "smoke", "benchmark", "network", "guard")
 
 
 def _markers_to_skip(run_flags: dict[str, bool]) -> set[str]:

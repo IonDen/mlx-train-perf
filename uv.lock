@@ -598,6 +598,14 @@ wheels = [
 ]
 
 [[package]]
+name = "mlx-guard"
+version = "0.2.0"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/d5/0b/126a17f199509049c4c9baa31b002a73530a74919d02dd69fc757d35db6f/mlx_guard-0.2.0-py3-none-macosx_11_0_arm64.whl", hash = "sha256:d938e6ca490364cb792c0f6ca84dd6f52b38b870750da48e61f63dbd0e2b8860", size = 706494, upload-time = "2026-09-12T09:00:19.667Z" },
+]
+
+[[package]]
 name = "mlx-lm"
 version = "0.31.3"
 source = { registry = "https://pypi.org/simple" }
@@ -634,6 +642,9 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+guard = [
+    { name = "mlx-guard" },
+]
 mlx-lm = [
     { name = "mlx-lm" },
     { name = "transformers" },
@@ -646,6 +657,7 @@ probe = [
 dev = [
     { name = "basedpyright" },
     { name = "hypothesis" },
+    { name = "mlx-guard" },
     { name = "mlx-lm" },
     { name = "mypy" },
     { name = "pyobjc-framework-metal" },
@@ -658,16 +670,18 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "mlx", specifier = ">=0.32.0,<0.33" },
+    { name = "mlx-guard", marker = "extra == 'guard'", specifier = "==0.2.0" },
     { name = "mlx-lm", marker = "extra == 'mlx-lm'", specifier = ">=0.31.3,<0.32" },
     { name = "pyobjc-framework-metal", marker = "extra == 'probe'" },
     { name = "transformers", marker = "extra == 'mlx-lm'", specifier = ">=5.0,<5.13" },
 ]
-provides-extras = ["mlx-lm", "probe"]
+provides-extras = ["guard", "mlx-lm", "probe"]
 
 [package.metadata.requires-dev]
 dev = [
     { name = "basedpyright" },
     { name = "hypothesis" },
+    { name = "mlx-guard", specifier = "==0.2.0" },
     { name = "mlx-lm", specifier = ">=0.31.3,<0.32" },
     { name = "mypy" },
     { name = "pyobjc-framework-metal" },

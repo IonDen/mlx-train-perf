@@ -2,16 +2,20 @@ from conftest import _machine_supports_comparative_peaks, _markers_to_skip
 
 
 def test_no_flags_skips_all_gated() -> None:
-    assert _markers_to_skip({}) == {"metal", "smoke", "benchmark", "network"}
+    assert _markers_to_skip({}) == {"metal", "smoke", "benchmark", "network", "guard"}
 
 
 def test_run_metal_unlocks_metal_only() -> None:
-    assert _markers_to_skip({"metal": True}) == {"smoke", "benchmark", "network"}
+    assert _markers_to_skip({"metal": True}) == {"smoke", "benchmark", "network", "guard"}
 
 
 def test_all_flags_skip_nothing() -> None:
-    flags = {"metal": True, "smoke": True, "benchmark": True, "network": True}
+    flags = {"metal": True, "smoke": True, "benchmark": True, "network": True, "guard": True}
     assert _markers_to_skip(flags) == set()
+
+
+def test_run_guard_unlocks_the_real_supervisor_lane_only() -> None:
+    assert _markers_to_skip({"guard": True}) == {"metal", "smoke", "benchmark", "network"}
 
 
 def test_comparative_peaks_unsupported_on_ci_runner_class() -> None:

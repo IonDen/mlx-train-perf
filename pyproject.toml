@@ -38,6 +38,12 @@ Issues = "https://github.com/IonDen/mlx-train-perf/issues"
 # 5.0.0/5.4.0/5.8.0/5.11.0/5.12.0; verified broken on 5.13.0.
 mlx-lm = ["mlx-lm>=0.31.3,<0.32", "transformers>=5.0,<5.13"]
 probe = ["pyobjc-framework-Metal"]
+# Optional external supervision for bench workers (`run_conditions(..., guard=...)`).
+# Pinned exactly: mlx-guard is pre-1.0, where a minor release may change a consumer-visible
+# contract, and the supervisor reports a run leaves behind are only readable by the package
+# version that wrote them. Apple Silicon wheels only; no marker here on purpose, so
+# installing the extra anywhere else fails loudly instead of silently doing nothing.
+guard = ["mlx-guard==0.2.0"]
 
 [project.scripts]
 mlx-train-perf = "mlx_train_perf.cli:main"
@@ -83,6 +89,8 @@ dev = [
     # verified-broken/verified-clean version detail); pinned here too since dev installs
     # both groups.
     "mlx-lm>=0.31.3,<0.32", "transformers>=5.0,<5.13", "pyobjc-framework-Metal",
+    # The real-supervisor test lane (`--run-guard`); same exact pin as the `guard` extra.
+    "mlx-guard==0.2.0",
 ]
 
 [tool.ruff]
@@ -151,6 +159,7 @@ markers = [
     "smoke: loads a real model (collection-gated: --run-smoke)",
     "benchmark: timing runs (collection-gated: --run-benchmark)",
     "network: touches the network (collection-gated: --run-network)",
+    "guard: runs the real mlx-guard supervisor (collection-gated: --run-guard)",
 ]
 
 [tool.coverage.report]
