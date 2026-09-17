@@ -7,6 +7,7 @@ condition whose artifact is already fresh is skipped entirely, never spawned; a 
 that exits nonzero (crashes) gets its failure recorded as a `status="error"` result here,
 on the CALLER's side, so one bad condition never aborts the rest of the sweep.
 """
+import contextlib
 import importlib
 import json
 import os
@@ -29,6 +30,9 @@ _STDERR_TAIL_CHARS = 4000  # enough to see the failing assertion/traceback, not 
 # Supervisor outcome kinds that describe how the WORKER ended (every other kind describes
 # the supervisor, the launch, or a policy decision).
 _CHILD_OUTCOMES = frozenset({"child_exited", "child_signaled"})
+# How long an interrupted runner waits for a cancelled supervisor to finish its own
+# shutdown before re-raising (see `_spawn_guarded_worker`).
+_CANCEL_WAIT_S = 10.0
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -139,10 +143,21 @@ def _guard_outcome(result: Any) -> dict[str, object]:
     }
 
 
+def _spawn_unsupervised(config_path: Path, label: str, reason: str) -> GuardedWorkerResult:
+    # Announced BEFORE the worker runs: the condition's own artifact looks the same with or
+    # without a supervisor, and a warning that arrives after an hour-long condition is late.
+    print(f"mlx-train-perf: {label}: running UNSUPERVISED ({reason})", file=sys.stderr)
+    return GuardedWorkerResult(
+        process=_spawn_worker(config_path), fallback_reason=reason, client_error=None,
+    )
+
+
 def _spawn_guarded_worker(
     config_path: Path,
     report_path: Path,
     policy: ExternalGuardConfig,
+    *,
+    label: str = "condition",
 ) -> GuardedWorkerResult:
     """Supervise one worker. Direct launch is a fallback ONLY while no supervisor exists:
     the boundary is the call site, not the exception type. `start()` returns once the
@@ -157,11 +172,7 @@ def _spawn_guarded_worker(
         # ModuleNotFoundError. Any other missing module is a real bug -- let it surface.
         if error.name not in (None, "mlx_guard", "mlx-guard"):
             raise
-        return GuardedWorkerResult(
-            process=_spawn_worker(config_path),
-            fallback_reason="mlx-guard package is unavailable",
-            client_error=None,
-        )
+        return _spawn_unsupervised(config_path, label, "mlx-guard package is unavailable")
 
     command = (
         sys.executable,
@@ -182,10 +193,8 @@ def _spawn_guarded_worker(
         )
         supervised = mlx_guard.start(config, capture_output=True)
     except mlx_guard.SupervisorDiscoveryError:
-        return GuardedWorkerResult(
-            process=_spawn_worker(config_path),
-            fallback_reason="mlx-guard supervisor discovery failed",
-            client_error=None,
+        return _spawn_unsupervised(
+            config_path, label, "mlx-guard supervisor discovery failed",
         )
     except Exception as error:
         # A refused configuration is strictly pre-launch, but it means the caller's policy
@@ -209,8 +218,13 @@ def _spawn_guarded_worker(
     except BaseException:
         # Ctrl-C or an exit request while a condition runs. `subprocess.run` kills its
         # child on any exception; a supervised launch has to ask the supervisor, which
-        # then stops the worker's whole process group.
+        # then stops the worker's whole process group. Then give it a bounded moment to
+        # finish: a runner that exits at once races the supervisor's own parent-exit
+        # handling, and about half of such runs were reported as a supervisor failure
+        # (measured on mlx-guard 0.2.0). A second interrupt during the wait still gets out.
         supervised.cancel()
+        with contextlib.suppress(Exception):
+            supervised.wait(timeout=_CANCEL_WAIT_S)
         raise
     process = subprocess.CompletedProcess(
         command, result.returncode, _text_output(result.stdout), _text_output(result.stderr),
@@ -241,13 +255,18 @@ def _prepare_guard_dir(guard_dir: Path) -> None:
     supervisor demands exactly that (owner-only, no symlink) for its own report; the
     runner's records sit beside it and get the same care, so a pre-planted `_mlx_guard`
     in a shared output directory cannot redirect them."""
-    guard_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        guard_dir.mkdir(parents=True, exist_ok=True)
+    except FileExistsError:  # a dangling link, or a plain file in the way
+        raise BenchInputError(
+            f"{guard_dir} (_mlx_guard) must be a real directory, not a link",
+        ) from None
     info = guard_dir.lstat()
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
         raise BenchInputError(f"{guard_dir} (_mlx_guard) must be a real directory, not a link")
     if info.st_uid != os.geteuid():
         raise BenchInputError(f"{guard_dir} (_mlx_guard) is owned by another user")
-    guard_dir.chmod(0o700)
+    guard_dir.chmod(0o700, follow_symlinks=False)
 
 
 def _launch_under_guard(
@@ -270,15 +289,10 @@ def _launch_under_guard(
     }
     for record in records.values():
         record.unlink(missing_ok=True)
-    guarded = _spawn_guarded_worker(config_path, guard_report, guard)
+    guarded = _spawn_guarded_worker(config_path, guard_report, guard, label=name)
     if guarded.fallback_reason is not None:
         write_result(
             records["launch"], ident, "guard_fallback", reason=guarded.fallback_reason,
-        )
-        # The condition's own artifact looks the same either way, so say it out loud too.
-        print(
-            f"mlx-train-perf: {name}: ran UNSUPERVISED ({guarded.fallback_reason})",
-            file=sys.stderr,
         )
     if guarded.client_error is not None:
         write_result(

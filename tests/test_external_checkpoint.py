@@ -9,7 +9,7 @@ from typing import Any
 
 import pytest
 
-from mlx_train_perf.bench import checkpoint, worker
+from mlx_train_perf.bench import artifacts, checkpoint, worker
 from mlx_train_perf.core.guards import EffectiveCeiling
 
 
@@ -372,3 +372,39 @@ def test_worker_main_owns_and_closes_external_checkpoint_session(
     assert captured["out"] == out
     assert captured["session"] is session
     assert session.closed is True
+
+
+def test_a_result_computed_during_a_breach_never_replaces_the_breach_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Catches: the worker's final `ok` landing after the watchdog recorded a breach but before
+    # its hard exit. That `ok` would count as fresh forever: a measurement taken past the
+    # memory ceiling, served as a clean result, with the breach record gone.
+    monkeypatch.setattr(
+        worker, "connect_external_checkpoint", lambda _out, _identity: _RecordingSession(),
+    )
+    monkeypatch.setattr(
+        worker, "effective_memory_ceiling",
+        lambda: EffectiveCeiling(ceiling_bytes=64 << 30, warning=None),
+    )
+    monkeypatch.setattr(worker, "install_memory_watchdog", lambda **_kwargs: _FakeWatchdog())
+    out = tmp_path / "result.json"
+
+    def run_while_the_watchdog_fires(
+        _params: dict[str, object], *, checkpoint: checkpoint.CheckpointSession,  # noqa: ARG001
+    ) -> dict[str, object]:
+        on_breach = artifacts.make_watchdog_on_breach(
+            out, {"session_id": "s1"}, 1 << 30, exit_fn=lambda _code: None,
+        )
+        on_breach("memory_ceiling", {"active_bytes": 2 << 30, "elapsed_s": 1.0})
+        return {"wall_s": 0.1}
+
+    monkeypatch.setattr(worker, "run_loss_layer", run_while_the_watchdog_fires)
+    config = tmp_path / "config.json"
+    config.write_text(json.dumps({
+        "kind": "loss_layer", "params": {}, "session_id": "s1", "out": str(out),
+    }))
+
+    worker.main(["--config", str(config)])
+
+    assert json.loads(out.read_text())["status"] == "aborted_memory_ceiling"

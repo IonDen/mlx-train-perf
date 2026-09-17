@@ -238,7 +238,9 @@ def write_result_unless_breached(
     checkpoint callback). Returns False, writing nothing, once the watchdog has started
     recording a breach. The check and the write share the lock, so the order is total:
     either this write lands first and the breach record then replaces it, or the breach
-    came first and this write does not happen."""
+    came first and this write does not happen. (The one exception is a breach write that
+    timed out on the lock while this writer stalled for seconds mid-write; both outcomes are
+    non-ok and retried, so that window only costs the abort reason.)"""
     with _WRITE_LOCK:
         if _BREACH.is_set():
             return False

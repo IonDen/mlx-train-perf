@@ -42,6 +42,7 @@ from mlx_train_perf.bench.artifacts import (
     condition_identity,
     make_watchdog_on_breach,
     write_result,
+    write_result_unless_breached,
 )
 from mlx_train_perf.bench.checkpoint import CheckpointSession, connect_external_checkpoint
 from mlx_train_perf.core.guards import (
@@ -885,9 +886,12 @@ def main(argv: list[str] | None = None) -> int:
             # WiredCapRegressionError is a DIFFERENT, more serious failure (a condition
             # that measured under an uncapped run) and is deliberately NOT caught here --
             # it propagates the same way an unsupported kind does.
-            write_result(out, ident, "refused", error=str(exc), **warning_field)
+            write_result_unless_breached(out, ident, "refused", error=str(exc), **warning_field)
             return 0
-        write_result(out, ident, "ok", **fields, **warning_field)
+        # Breach-aware: if the watchdog started recording a breach while this result was
+        # being computed, its record stands -- an `ok` landing before the hard exit would
+        # count as fresh forever.
+        write_result_unless_breached(out, ident, "ok", **fields, **warning_field)
         return 0
     finally:
         if checkpoint_session is not None:

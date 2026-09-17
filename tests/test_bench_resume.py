@@ -348,15 +348,16 @@ def test_write_result_is_atomic_no_tmp_file_left_behind(tmp_path: Path) -> None:
     p = tmp_path / "r.json"
     write_result(p, ident, "ok", wall_s=1.0)
     assert p.exists()
-    assert not p.with_suffix(".tmp").exists()
+    assert list(tmp_path.glob("*.tmp")) == []
 
 
-def test_two_writers_of_one_artifact_never_tear_it_or_lose_a_rename(tmp_path: Path) -> None:
-    # Catches: a temp name derived from the TARGET. A supervised worker has two writers of
-    # its artifact on two threads (the checkpoint callback and the memory watchdog), and
-    # they fire together by construction -- both watch the same memory event. With one
-    # shared `<name>.tmp`, one writer renames the other's file away (FileNotFoundError) or
-    # the artifact lands half-written.
+def test_unlocked_writers_of_one_artifact_never_tear_it_or_lose_a_rename(
+    tmp_path: Path,
+) -> None:
+    # Catches: a temp name derived from the TARGET. Aimed at the unlocked writer on purpose:
+    # the lock would hide this bug, and the lock is exactly what the breach path gives up
+    # when it times out. With one shared `<name>.tmp`, one writer renames the other's file
+    # away (FileNotFoundError) or the artifact lands half-written.
     ident = run_identity(model="m", session_id="s1")
     p = tmp_path / "r.json"
     failures: list[BaseException] = []
@@ -364,7 +365,7 @@ def test_two_writers_of_one_artifact_never_tear_it_or_lose_a_rename(tmp_path: Pa
     def hammer(status: str) -> None:
         try:
             for _ in range(400):
-                write_result(p, ident, status, payload="x" * 2048)
+                artifacts._write_atomically(p, ident, status, {"payload": "x" * 2048})
         except BaseException as error:  # the failure IS the observation
             failures.append(error)
 
@@ -377,6 +378,30 @@ def test_two_writers_of_one_artifact_never_tear_it_or_lose_a_rename(tmp_path: Pa
     assert failures == []
     assert json.loads(p.read_text())["status"] in ("a", "b")
     assert list(tmp_path.glob("*.tmp")) == []
+
+
+def test_a_breach_write_lands_even_while_another_writer_holds_the_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Catches: a blocking `with _WRITE_LOCK:` in `write_result`. The watchdog writes its
+    # breach record from a paging storm and must never wait on a stalled main thread.
+    monkeypatch.setattr(artifacts, "_WRITE_LOCK_TIMEOUT_S", 0.05)
+    out = tmp_path / "r.json"
+    ident = run_identity(model="m", session_id="s1")
+    done = threading.Event()
+
+    def breach_writer() -> None:
+        write_result(out, ident, "aborted_memory_ceiling")
+        done.set()
+
+    with artifacts._WRITE_LOCK:  # a main thread stalled mid-write
+        thread = threading.Thread(target=breach_writer)
+        thread.start()
+        landed = done.wait(timeout=5.0)
+    thread.join()
+
+    assert landed
+    assert json.loads(out.read_text())["status"] == "aborted_memory_ceiling"
 
 
 def test_a_breach_in_progress_outranks_a_later_checkpoint_write(

@@ -328,20 +328,25 @@ def test_rejected_configuration_is_recorded_not_raised(
     assert result.client_error == "guard client could not start the supervisor: _ConfigError"
 
 
-def test_an_interrupted_wait_cancels_the_supervisor_before_propagating(
+def test_an_interrupted_wait_cancels_the_supervisor_and_lets_it_finish(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Catches: Ctrl-C during a supervised condition leaving the native supervisor and its
-    # worker running. The unsupervised path gets this for free (`subprocess.run` kills its
-    # child on any exception); the supervised one has to ask. `cancel()` is the external
-    # boundary's only stop signal, so the call itself is the observable effect.
-    cancelled: list[bool] = []
+    # Catches two bugs. Without `cancel()`, Ctrl-C can leave the native supervisor and its
+    # worker running (under nohup the supervisor has no parent watch to fall back on). With
+    # `cancel()` but no wait, the runner exits at once and races the supervisor's own
+    # parent-exit handling: measured on mlx-guard 0.2.0, about half of such runs were then
+    # reported as `supervisor_failure`. `cancel()`/`wait()` are the external boundary's only
+    # stop signals, so the call sequence itself is the observable effect.
+    calls: list[object] = []
 
     def start(_config: object, *, capture_output: bool) -> object:  # noqa: ARG001
-        def wait() -> object:
-            raise KeyboardInterrupt
+        def wait(timeout: float | None = None) -> object:
+            calls.append(("wait", timeout))
+            if timeout is None:
+                raise KeyboardInterrupt
+            return _result(returncode=130, kind="child_signaled")
 
-        return SimpleNamespace(wait=wait, cancel=lambda: cancelled.append(True))
+        return SimpleNamespace(wait=wait, cancel=lambda: calls.append("cancel"))
 
     module = SimpleNamespace(
         RunConfig=_FakeRunConfig, start=start, SupervisorDiscoveryError=_DiscoveryError,
@@ -354,7 +359,35 @@ def test_an_interrupted_wait_cancels_the_supervisor_before_propagating(
         runner._spawn_guarded_worker(
             config_path, tmp_path / "a.json", ExternalGuardConfig(max_footprint_bytes=1 << 30),
         )
-    assert cancelled == [True]
+    assert calls == [("wait", None), "cancel", ("wait", runner._CANCEL_WAIT_S)]
+
+
+def test_a_fallback_is_announced_before_the_unsupervised_worker_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    # Catches: announcing the fallback after the worker finished -- for an hour-long
+    # condition the warning would arrive an hour late.
+    seen_at_launch: list[str] = []
+
+    def direct(_path: Path) -> subprocess.CompletedProcess[str]:
+        seen_at_launch.append(capsys.readouterr().err)
+        return subprocess.CompletedProcess([], 0, "", "")
+
+    monkeypatch.setattr(runner, "_spawn_worker", direct)
+    monkeypatch.setattr(
+        runner.importlib, "import_module",
+        lambda _name: (_ for _ in ()).throw(ModuleNotFoundError("mlx_guard")),
+    )
+    config_path = tmp_path / "condition.json"
+    config_path.write_text("{}")
+
+    runner._spawn_guarded_worker(
+        config_path, tmp_path / "a.json", ExternalGuardConfig(max_footprint_bytes=1 << 30),
+        label="tiny",
+    )
+
+    assert "tiny" in seen_at_launch[0]
+    assert "UNSUPERVISED" in seen_at_launch[0]
 
 
 def test_an_unreadable_report_shape_fails_one_condition_not_the_sweep(
@@ -418,7 +451,7 @@ def test_each_attempt_gets_its_own_report_path(
     reports: list[Path] = []
 
     def fake_spawn(
-        _config_path: Path, report_path: Path, _policy: ExternalGuardConfig,
+        _config_path: Path, report_path: Path, _policy: ExternalGuardConfig, **_kw: object,
     ) -> runner.GuardedWorkerResult:
         reports.append(report_path)
         return runner.GuardedWorkerResult(
@@ -447,7 +480,7 @@ def test_intervention_without_an_artifact_is_an_external_abort_not_a_crash(
     monkeypatch.setattr(
         runner,
         "_spawn_guarded_worker",
-        lambda _c, _r, _p: runner.GuardedWorkerResult(
+        lambda _c, _r, _p, **_kw: runner.GuardedWorkerResult(
             process=subprocess.CompletedProcess([], 75, "", ""),
             fallback_reason=None, client_error=None, outcome=outcome,
         ),
@@ -477,7 +510,7 @@ def test_supervisor_side_failure_is_not_blamed_on_the_worker(
     monkeypatch.setattr(
         runner,
         "_spawn_guarded_worker",
-        lambda _c, _r, _p: runner.GuardedWorkerResult(
+        lambda _c, _r, _p, **_kw: runner.GuardedWorkerResult(
             process=subprocess.CompletedProcess([], returncode, "", ""),
             fallback_reason=None, client_error=None, outcome=outcome,
         ),
@@ -500,7 +533,7 @@ def test_a_supervised_worker_crash_is_still_a_worker_crash(
     monkeypatch.setattr(
         runner,
         "_spawn_guarded_worker",
-        lambda _c, _r, _p: runner.GuardedWorkerResult(
+        lambda _c, _r, _p, **_kw: runner.GuardedWorkerResult(
             process=subprocess.CompletedProcess([], 1, "", "Traceback: boom"),
             fallback_reason=None, client_error=None, outcome=outcome,
         ),
@@ -515,14 +548,14 @@ def test_a_supervised_worker_crash_is_still_a_worker_crash(
     assert data["error_msg"] == "Traceback: boom"
 
 
-def test_a_fallback_is_recorded_and_announced(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+def test_a_fallback_is_recorded_and_stale_records_are_cleared(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Catches: a silent fallback. The condition's own artifact looks identical whether or not
-    # a supervisor watched it, so this record and this stderr line are the only trace that a
-    # sweep which asked for supervision ran without it.
+    # Catches: a fallback that leaves no record. The condition's own artifact looks identical
+    # whether or not a supervisor watched it, so this record is the durable trace that a
+    # sweep which asked for supervision ran without it (the stderr line is the live one).
     def fake_spawn(
-        config_path: Path, _report: Path, _policy: ExternalGuardConfig,
+        config_path: Path, _report: Path, _policy: ExternalGuardConfig, **_kw: object,
     ) -> runner.GuardedWorkerResult:
         config = json.loads(config_path.read_text())
         identity = runner.condition_identity(
@@ -549,9 +582,52 @@ def test_a_fallback_is_recorded_and_announced(
     assert record["status"] == "guard_fallback"
     assert record["reason"] == "mlx-guard supervisor discovery failed"
     assert not (guard_dir / "guarded.client.json").exists()
-    err = capsys.readouterr().err
-    assert "guarded" in err
-    assert "UNSUPERVISED" in err
+
+
+def test_an_unsummarized_report_keeps_the_ordinary_worker_envelope(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Catches: labelling this corner `GuardClientError`. The client DID learn how the worker
+    # ended (exit 1, nothing written); only the report summary failed. The worker-crash
+    # envelope is the true record, and the client record carries the rest.
+    monkeypatch.setattr(
+        runner,
+        "_spawn_guarded_worker",
+        lambda _c, _r, _p, **_kw: runner.GuardedWorkerResult(
+            process=subprocess.CompletedProcess([], 1, "", "Traceback: boom"),
+            fallback_reason=None,
+            client_error="guard report could not be summarized: AttributeError",
+        ),
+    )
+    paths = runner.run_conditions(
+        [_guarded_condition()], tmp_path, session_id="s1",
+        guard=ExternalGuardConfig(max_footprint_bytes=1 << 30),
+    )
+
+    assert json.loads(paths[0].read_text())["error_type"] == "WorkerCrashed"
+    assert (tmp_path / "_mlx_guard" / "guarded.client.json").exists()
+
+
+def test_a_guard_directory_owned_by_someone_else_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(runner.os, "geteuid", lambda: runner.os.getuid() + 1)
+    with pytest.raises(BenchInputError, match="another user"):
+        runner.run_conditions(
+            [_guarded_condition()], tmp_path, session_id="s1",
+            guard=ExternalGuardConfig(max_footprint_bytes=1 << 30),
+        )
+
+
+def test_a_dangling_guard_directory_link_is_refused_with_the_same_error(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "_mlx_guard").symlink_to(tmp_path / "nowhere", target_is_directory=True)
+    with pytest.raises(BenchInputError, match="_mlx_guard"):
+        runner.run_conditions(
+            [_guarded_condition()], tmp_path, session_id="s1",
+            guard=ExternalGuardConfig(max_footprint_bytes=1 << 30),
+        )
 
 
 def test_a_guard_directory_that_is_a_symlink_is_refused_before_any_launch(
@@ -563,7 +639,7 @@ def test_a_guard_directory_that_is_a_symlink_is_refused_before_any_launch(
     launches: list[Path] = []
     monkeypatch.setattr(
         runner, "_spawn_guarded_worker",
-        lambda config_path, _r, _p: launches.append(config_path),
+        lambda config_path, _r, _p, **_kw: launches.append(config_path),
     )
     elsewhere = tmp_path / "elsewhere"
     elsewhere.mkdir()
@@ -588,7 +664,7 @@ def test_client_failure_without_an_artifact_is_named_as_such(
     monkeypatch.setattr(
         runner,
         "_spawn_guarded_worker",
-        lambda _c, _r, _p: runner.GuardedWorkerResult(
+        lambda _c, _r, _p, **_kw: runner.GuardedWorkerResult(
             process=None, fallback_reason=None,
             client_error="guard client failed after launch: _ReportError",
         ),
@@ -608,7 +684,7 @@ def test_run_conditions_records_guard_metadata_separately(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     def fake_spawn(
-        config_path: Path, _report_path: Path, _policy: ExternalGuardConfig,
+        config_path: Path, _report_path: Path, _policy: ExternalGuardConfig, **_kw: object,
     ) -> runner.GuardedWorkerResult:
         config = json.loads(config_path.read_text())
         identity = runner.condition_identity(
