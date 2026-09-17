@@ -275,7 +275,7 @@ def _launch_under_guard(
             # The supervisor or the launch failed, not the condition. A `child_*` outcome
             # falls through to the caller's ordinary worker-crash envelope instead.
             write_result(
-                out_path, ident, "error", error_type="SupervisedLaunchFailed",
+                out_path, ident, "error", error_type="SupervisorReportedFailure",
                 guard_outcome=guarded.outcome, report=guard_report.name,
             )
     return guarded.process

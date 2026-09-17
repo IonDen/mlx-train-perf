@@ -435,7 +435,7 @@ def test_supervisor_side_failure_is_not_blamed_on_the_worker(
 
     data = json.loads(paths[0].read_text())
     assert data["status"] == "error"
-    assert data["error_type"] == "SupervisedLaunchFailed"
+    assert data["error_type"] == "SupervisorReportedFailure"
     assert data["guard_outcome"] == outcome
 
 
