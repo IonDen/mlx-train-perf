@@ -11,6 +11,7 @@ import pytest
 
 from mlx_train_perf.bench import runner
 from mlx_train_perf.bench.runner import ExternalGuardConfig
+from mlx_train_perf.errors import BenchInputError
 
 
 class _DiscoveryError(RuntimeError):
@@ -327,6 +328,58 @@ def test_rejected_configuration_is_recorded_not_raised(
     assert result.client_error == "guard client could not start the supervisor: _ConfigError"
 
 
+def test_an_interrupted_wait_cancels_the_supervisor_before_propagating(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Catches: Ctrl-C during a supervised condition leaving the native supervisor and its
+    # worker running. The unsupervised path gets this for free (`subprocess.run` kills its
+    # child on any exception); the supervised one has to ask. `cancel()` is the external
+    # boundary's only stop signal, so the call itself is the observable effect.
+    cancelled: list[bool] = []
+
+    def start(_config: object, *, capture_output: bool) -> object:  # noqa: ARG001
+        def wait() -> object:
+            raise KeyboardInterrupt
+
+        return SimpleNamespace(wait=wait, cancel=lambda: cancelled.append(True))
+
+    module = SimpleNamespace(
+        RunConfig=_FakeRunConfig, start=start, SupervisorDiscoveryError=_DiscoveryError,
+    )
+    monkeypatch.setattr(runner.importlib, "import_module", lambda _name: module)
+    config_path = tmp_path / "condition.json"
+    config_path.write_text("{}")
+
+    with pytest.raises(KeyboardInterrupt):
+        runner._spawn_guarded_worker(
+            config_path, tmp_path / "a.json", ExternalGuardConfig(max_footprint_bytes=1 << 30),
+        )
+    assert cancelled == [True]
+
+
+def test_an_unreadable_report_shape_fails_one_condition_not_the_sweep(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Catches: outcome extraction outside any `try`. The worker has already run; a report
+    # shape this version does not expect must cost one record, not the rest of the sweep.
+    broken = SimpleNamespace(returncode=0, stdout=b"", stderr=b"", report=None)
+    monkeypatch.setattr(
+        runner.importlib, "import_module",
+        lambda _name: _fake_module(lambda _config, *, capture_output: broken),  # noqa: ARG005
+    )
+    config_path = tmp_path / "condition.json"
+    config_path.write_text("{}")
+
+    result = runner._spawn_guarded_worker(
+        config_path, tmp_path / "a.json", ExternalGuardConfig(max_footprint_bytes=1 << 30),
+    )
+
+    assert result.outcome is None
+    assert result.client_error == "guard report could not be summarized: AttributeError"
+    assert result.process is not None
+    assert result.process.returncode == 0
+
+
 def test_guard_outcome_keeps_how_the_command_ended_and_what_was_saved() -> None:
     result = _result(
         returncode=75, kind="policy_intervention", child_status={"signal": 15},
@@ -419,12 +472,13 @@ def test_supervisor_side_failure_is_not_blamed_on_the_worker(
 ) -> None:
     # Catches: labelling a supervisor-side failure `WorkerCrashed` -- whoever debugs the
     # sweep would go looking for a bug in the condition instead of in the launch.
-    outcome: dict[str, object] = {"kind": kind, "returncode": 70}
+    returncode = {"supervisor_failure": 70, "launch_not_found": 127}[kind]
+    outcome: dict[str, object] = {"kind": kind, "returncode": returncode}
     monkeypatch.setattr(
         runner,
         "_spawn_guarded_worker",
         lambda _c, _r, _p: runner.GuardedWorkerResult(
-            process=subprocess.CompletedProcess([], 70, "", ""),
+            process=subprocess.CompletedProcess([], returncode, "", ""),
             fallback_reason=None, client_error=None, outcome=outcome,
         ),
     )
@@ -459,6 +513,71 @@ def test_a_supervised_worker_crash_is_still_a_worker_crash(
     data = json.loads(paths[0].read_text())
     assert data["error_type"] == "WorkerCrashed"
     assert data["error_msg"] == "Traceback: boom"
+
+
+def test_a_fallback_is_recorded_and_announced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    # Catches: a silent fallback. The condition's own artifact looks identical whether or not
+    # a supervisor watched it, so this record and this stderr line are the only trace that a
+    # sweep which asked for supervision ran without it.
+    def fake_spawn(
+        config_path: Path, _report: Path, _policy: ExternalGuardConfig,
+    ) -> runner.GuardedWorkerResult:
+        config = json.loads(config_path.read_text())
+        identity = runner.condition_identity(
+            kind=config["kind"], session_id=config["session_id"], params=config["params"],
+            attention_impl=config["attention_impl"],
+        )
+        runner.write_result(Path(config["out"]), identity, "ok", wall_s=1.0)
+        return runner.GuardedWorkerResult(
+            process=subprocess.CompletedProcess([], 0, "", ""),
+            fallback_reason="mlx-guard supervisor discovery failed", client_error=None,
+        )
+
+    monkeypatch.setattr(runner, "_spawn_guarded_worker", fake_spawn)
+    guard_dir = tmp_path / "_mlx_guard"
+    guard_dir.mkdir(mode=0o700)
+    (guard_dir / "guarded.client.json").write_text("{}")  # a previous attempt's record
+
+    runner.run_conditions(
+        [_guarded_condition()], tmp_path, session_id="s1",
+        guard=ExternalGuardConfig(max_footprint_bytes=1 << 30),
+    )
+
+    record = json.loads((guard_dir / "guarded.launch.json").read_text())
+    assert record["status"] == "guard_fallback"
+    assert record["reason"] == "mlx-guard supervisor discovery failed"
+    assert not (guard_dir / "guarded.client.json").exists()
+    err = capsys.readouterr().err
+    assert "guarded" in err
+    assert "UNSUPERVISED" in err
+
+
+def test_a_guard_directory_that_is_a_symlink_is_refused_before_any_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Catches: following a pre-planted `_mlx_guard` symlink in a shared output directory and
+    # writing the runner's records wherever it points. The native supervisor refuses such a
+    # directory for its own report; the runner's records deserve the same care.
+    launches: list[Path] = []
+    monkeypatch.setattr(
+        runner, "_spawn_guarded_worker",
+        lambda config_path, _r, _p: launches.append(config_path),
+    )
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    (out_dir / "_mlx_guard").symlink_to(elsewhere, target_is_directory=True)
+
+    with pytest.raises(BenchInputError, match="_mlx_guard"):
+        runner.run_conditions(
+            [_guarded_condition()], out_dir, session_id="s1",
+            guard=ExternalGuardConfig(max_footprint_bytes=1 << 30),
+        )
+    assert launches == []
+    assert list(elsewhere.iterdir()) == []
 
 
 def test_client_failure_without_an_artifact_is_named_as_such(

@@ -9,6 +9,8 @@ on the CALLER's side, so one bad condition never aborts the rest of the sweep.
 """
 import importlib
 import json
+import os
+import stat
 import subprocess
 import sys
 import tempfile
@@ -21,6 +23,7 @@ from pathlib import Path
 from typing import Any, cast
 
 from mlx_train_perf.bench.artifacts import condition_identity, result_is_fresh, write_result
+from mlx_train_perf.errors import BenchInputError
 
 _STDERR_TAIL_CHARS = 4000  # enough to see the failing assertion/traceback, not a full dump
 # Supervisor outcome kinds that describe how the WORKER ended (every other kind describes
@@ -203,16 +206,27 @@ def _spawn_guarded_worker(
             fallback_reason=None,
             client_error=f"guard client failed after launch: {type(error).__name__}",
         )
+    except BaseException:
+        # Ctrl-C or an exit request while a condition runs. `subprocess.run` kills its
+        # child on any exception; a supervised launch has to ask the supervisor, which
+        # then stops the worker's whole process group.
+        supervised.cancel()
+        raise
+    process = subprocess.CompletedProcess(
+        command, result.returncode, _text_output(result.stdout), _text_output(result.stderr),
+    )
+    try:
+        outcome = _guard_outcome(result)
+    except Exception as error:
+        # The worker has already run and its artifact stands. A report this version
+        # cannot summarize costs one record, never the rest of the sweep.
+        return GuardedWorkerResult(
+            process=process,
+            fallback_reason=None,
+            client_error=f"guard report could not be summarized: {type(error).__name__}",
+        )
     return GuardedWorkerResult(
-        process=subprocess.CompletedProcess(
-            command,
-            result.returncode,
-            _text_output(result.stdout),
-            _text_output(result.stderr),
-        ),
-        fallback_reason=None,
-        client_error=None,
-        outcome=_guard_outcome(result),
+        process=process, fallback_reason=None, client_error=None, outcome=outcome,
     )
 
 
@@ -220,6 +234,20 @@ def _text_output(value: object) -> str:
     if isinstance(value, bytes):
         return value.decode("utf-8", errors="replace")
     return value if isinstance(value, str) else ""
+
+
+def _prepare_guard_dir(guard_dir: Path) -> None:
+    """A private directory this user owns, or a refusal before anything launches. The native
+    supervisor demands exactly that (owner-only, no symlink) for its own report; the
+    runner's records sit beside it and get the same care, so a pre-planted `_mlx_guard`
+    in a shared output directory cannot redirect them."""
+    guard_dir.mkdir(parents=True, exist_ok=True)
+    info = guard_dir.lstat()
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise BenchInputError(f"{guard_dir} (_mlx_guard) must be a real directory, not a link")
+    if info.st_uid != os.geteuid():
+        raise BenchInputError(f"{guard_dir} (_mlx_guard) is owned by another user")
+    guard_dir.chmod(0o700)
 
 
 def _launch_under_guard(
@@ -247,6 +275,11 @@ def _launch_under_guard(
         write_result(
             records["launch"], ident, "guard_fallback", reason=guarded.fallback_reason,
         )
+        # The condition's own artifact looks the same either way, so say it out loud too.
+        print(
+            f"mlx-train-perf: {name}: ran UNSUPERVISED ({guarded.fallback_reason})",
+            file=sys.stderr,
+        )
     if guarded.client_error is not None:
         write_result(
             records["client"], ident, "guard_client_error",
@@ -259,7 +292,7 @@ def _launch_under_guard(
         )
     if not out_path.exists():
         # No worker artifact to respect, and the supervision layer knows why.
-        if guarded.client_error is not None:
+        if guarded.client_error is not None and guarded.process is None:
             write_result(
                 out_path, ident, "error", error_type="GuardClientError",
                 error_msg=guarded.client_error,
@@ -291,8 +324,7 @@ def run_conditions(
     out_dir.mkdir(parents=True, exist_ok=True)
     guard_dir = out_dir / "_mlx_guard"
     if guard is not None:
-        guard_dir.mkdir(parents=True, exist_ok=True)
-        guard_dir.chmod(0o700)
+        _prepare_guard_dir(guard_dir)
     paths: list[Path] = []
     for condition in conditions:
         out_path = out_dir / f"{condition.name}.json"

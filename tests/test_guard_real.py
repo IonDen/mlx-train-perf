@@ -173,8 +173,9 @@ def test_a_failed_checkpoint_write_is_never_acknowledged_as_completed(
     assert "artifact" not in checkpoint
     assert not out.exists()
     # And the worker outlived its failed checkpoint long enough to be stopped cleanly. A
-    # worker that dies first is gone before the TERM lands, and the supervisor records
-    # `supervisor_failure` (exit 70) instead -- measured on mlx-guard 0.2.0.
+    # slow-exiting worker that dies first can be gone before the TERM lands, and the
+    # supervisor then records `supervisor_failure` (exit 70) instead -- observed with this
+    # worker on mlx-guard 0.2.0; it is a race, so only the safe outcome is pinned here.
     assert result.report.outcome.kind.value == "policy_intervention"
     assert dict(result.report.payload["outcome"]["child_status"]) == {
         "status": "signaled", "signal": 15,
