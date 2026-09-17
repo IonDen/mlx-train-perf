@@ -110,11 +110,20 @@ def connect_external_checkpoint(
     try:
         module = import_module("mlx_guard")
     except ModuleNotFoundError as error:
-        if error.name not in (None, "mlx_guard"):
+        # "mlx-guard" is the DISTRIBUTION name a broken install raises (the package reads
+        # its own metadata at import); any other missing module is a real bug.
+        if error.name not in (None, "mlx_guard", "mlx-guard"):
             raise
         return _NullCheckpointSession()
     session = _ExternalCheckpointSession(out, identity, module, result_writer)
-    if not session.connect():
+    try:
+        connected = session.connect()
+    except module.CheckpointError:
+        # A failed handshake costs only the cooperative checkpoint: the supervisor keeps
+        # enforcing its limits and reports the channel as not negotiated. Killing the
+        # condition over it would turn a lost courtesy into a lost measurement.
+        return _NullCheckpointSession()
+    if not connected:
         return _NullCheckpointSession()
     return session
 

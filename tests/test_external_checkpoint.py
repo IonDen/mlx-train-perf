@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from importlib.metadata import PackageNotFoundError
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -90,6 +91,50 @@ def test_missing_optional_dependency_leaves_supervisor_to_apply_its_timeout(
     )
     assert session.poll() is None
     session.close()
+
+
+class _FakeCheckpointError(RuntimeError):
+    pass
+
+
+def test_failed_handshake_degrades_to_an_unsupervised_checkpoint_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Catches: letting a checkpoint-channel hiccup (a bad descriptor, a hello that misses
+    # the channel's 1 s timeout) kill the whole condition. Without a negotiated channel the
+    # supervisor still enforces its limits; only the cooperative checkpoint is lost, and
+    # its report says so (`not_negotiated`).
+    monkeypatch.setenv("MLX_GUARD_CHECKPOINT_FD", "9")
+
+    class _RefusingWorker:
+        @classmethod
+        def connect(cls, _callback: Any) -> object:
+            raise _FakeCheckpointError("checkpoint descriptor is invalid")
+
+    module = SimpleNamespace(CheckpointWorker=_RefusingWorker, CheckpointError=_FakeCheckpointError)
+    session = checkpoint.connect_external_checkpoint(
+        tmp_path / "result.json", {"session_id": "s1"}, import_module=lambda _name: module,
+    )
+
+    session.mark(stage="loss_layer", completed=1, total=3)
+    assert session.poll() is None
+    assert not (tmp_path / "result.json").exists()
+
+
+def test_broken_install_metadata_inside_the_supervisor_degrades_too(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Catches: comparing only against the import name. A broken install raises
+    # PackageNotFoundError, whose `.name` is the distribution name "mlx-guard".
+    monkeypatch.setenv("MLX_GUARD_CHECKPOINT_FD", "9")
+
+    def broken_import(_name: str) -> object:
+        raise PackageNotFoundError("mlx-guard")
+
+    session = checkpoint.connect_external_checkpoint(
+        tmp_path / "result.json", {"session_id": "s1"}, import_module=broken_import,
+    )
+    assert session.poll() is None
 
 
 def test_checkpoint_writes_and_syncs_partial_artifact_before_acknowledging(
