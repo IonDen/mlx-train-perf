@@ -14,21 +14,37 @@ and the in-process memory guard stays on in both modes.
 ### Added
 - `run_conditions(..., guard=ExternalGuardConfig(...))` supervises each worker with an
   OS-accounted footprint limit, an optional wall-time limit, and a checkpoint acknowledgement
-  timeout (`checkpoint_timeout_ms`; size it to one full step, because the worker can only
-  answer between steps). Install with `pip install "mlx-train-perf[guard]"`, which pins
-  `mlx-guard==0.2.0` exactly. Nothing imports mlx-guard unless `guard=` is passed.
+  timeout (`checkpoint_timeout_ms`, at most 60 s; size it to one full step, because the worker
+  can only answer between steps). Install with `pip install "mlx-train-perf[guard]"`, which
+  pins `mlx-guard==0.2.0` exactly. Nothing imports mlx-guard unless `guard=` is passed. The
+  bench scripts and the CLI do not expose it yet.
 - Workers answer a checkpoint request between repetitions or training steps by writing and
   syncing a `checkpointed_partial` artifact before they acknowledge. A failed checkpoint write
   is reported on stderr and never acknowledged as completed; the worker stays up so the
-  supervisor can stop it cleanly.
+  supervisor can stop it cleanly. If the memory watchdog is already recording a breach, the
+  checkpoint stands down and the breach record is kept.
 - New condition statuses, all retried by the next run: `checkpointed_partial`,
-  `aborted_external_guard` (a limit tripped before the worker reached a safe point), and
+  `aborted_external_guard` (an intervention that ended without a completed checkpoint), and
   `error` with `GuardClientError` or `SupervisorReportedFailure` when the fault was on the
   supervision side rather than in the condition.
 - Supervisor reports and a per-condition `supervision` record land in `out_dir/_mlx_guard/`,
-  one report per launch attempt.
-- If mlx-guard or its binary is unavailable, the runner records a `guard_fallback` and launches
-  the worker directly. After a supervisor has started, a condition is never launched twice.
+  one report per launch attempt. The runner refuses a `_mlx_guard` that is a symlink or is
+  owned by another user.
+- The runner launches a worker directly only when the supervisor cannot be brought up:
+  mlx-guard missing, a broken install, a binary that fails its version or integrity check, or
+  a version check that times out. Each fallback is recorded as `guard_fallback` and announced
+  on stderr. After a supervisor has started, a condition is never launched twice, and an
+  interrupted run cancels the supervisor instead of leaving it behind.
+
+### Changed
+- The worker and its new checkpoint module are both inputs to the code hash in a benchmark
+  artifact's identity, so artifacts written by earlier releases no longer count as fresh. A
+  resumed sweep measures them again.
+
+### Fixed
+- Two writers of one benchmark artifact could collide on a shared temporary file and lose or
+  tear the artifact. The memory watchdog's breach record could race the worker's own final
+  write this way; temporary names are now unique per write.
 
 ## [0.7.0] - 2026-09-15
 

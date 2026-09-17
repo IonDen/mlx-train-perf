@@ -65,3 +65,16 @@ jobs:
       - uses: astral-sh/setup-uv@v5
       - run: uv sync --all-extras
       - run: uv run pytest tests/ --run-metal --cov=mlx_train_perf
+
+  # The real mlx-guard supervisor, driving real workers (synthetic conditions, no model).
+  # Advisory for now: supervision timing on small shared runners is unproven, so a red run
+  # here is evidence to look at, not a gate on the PR.
+  guard-tests:
+    runs-on: macos-15
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --all-extras
+      - run: uv run pytest tests/test_guard_real.py --run-guard -v
