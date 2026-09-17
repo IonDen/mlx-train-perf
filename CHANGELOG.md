@@ -33,8 +33,9 @@ and the in-process memory guard stays on in both modes.
 - The runner launches a worker directly only when the supervisor cannot be brought up:
   mlx-guard missing, a broken install, a binary that fails its version or integrity check, or
   a version check that times out. Each fallback is recorded as `guard_fallback` and announced
-  on stderr. After a supervisor has started, a condition is never launched twice, and an
-  interrupted run cancels the supervisor instead of leaving it behind.
+  on stderr before the worker starts. After a supervisor has started, a condition is never
+  launched twice, and an interrupted run cancels the supervisor and gives it a moment to shut
+  down instead of leaving it behind.
 
 ### Changed
 - The worker and its new checkpoint module are both inputs to the code hash in a benchmark
@@ -45,6 +46,9 @@ and the in-process memory guard stays on in both modes.
 - Two writers of one benchmark artifact could collide on a shared temporary file and lose or
   tear the artifact. The memory watchdog's breach record could race the worker's own final
   write this way; temporary names are now unique per write.
+- A result that finished while the memory watchdog was recording a breach could replace the
+  breach record just before the process exited, and would then have counted as a clean, fresh
+  measurement. The worker's final write now stands down once a breach is being recorded.
 
 ## [0.7.0] - 2026-09-15
 
