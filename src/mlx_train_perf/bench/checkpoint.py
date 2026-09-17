@@ -7,19 +7,22 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Protocol, cast
 
-from mlx_train_perf.bench.artifacts import write_result
+from mlx_train_perf.bench.artifacts import write_result_unless_breached
 
 _CHECKPOINT_FD_ENV = "MLX_GUARD_CHECKPOINT_FD"
 
 
 class ResultWriter(Protocol):
+    """Writes the partial artifact. Returning False means it deliberately wrote nothing
+    (the memory watchdog is already recording a breach, whose record must survive)."""
+
     def __call__(
         self,
         path: Path,
         identity: dict[str, object],
         status: str,
         **fields: object,
-    ) -> None: ...
+    ) -> bool | None: ...
 
 
 class CheckpointSession(Protocol):
@@ -77,10 +80,12 @@ class _ExternalCheckpointSession:
         try:
             return cast(object | None, self._worker.poll())
         except self._module.CheckpointError as error:
-            # The helper has already told the supervisor the checkpoint failed; it will
-            # stop this process. Dying here instead races that TERM, and the supervisor
-            # then records its own failure rather than the intervention it was carrying
-            # out. Stay alive, say why on stderr, and stop using the channel.
+            # After a failed callback the helper has already sent a failed acknowledgement;
+            # after a protocol error the channel is simply unusable. Either way the
+            # supervisor is about to stop this process. Dying first can race its TERM: a
+            # slow-exiting MLX worker was then recorded as a supervisor failure instead of
+            # the intervention under way (observed with mlx-guard 0.2.0; a race, not a
+            # rule). Stay alive, say why on stderr, and stop using the channel.
             print(f"mlx-train-perf: external checkpoint failed: {error}", file=sys.stderr)
             self.close()
             return None
@@ -91,7 +96,7 @@ class _ExternalCheckpointSession:
             self._worker = None
 
     def _checkpoint(self, request: Any) -> object:
-        self._result_writer(
+        written = self._result_writer(
             self._out,
             self._identity,
             "checkpointed_partial",
@@ -99,6 +104,8 @@ class _ExternalCheckpointSession:
             supervisor_deadline_ns=request.supervisor_deadline_ns,
             progress=dict(self._progress),
         )
+        if written is False:
+            return self._module.CheckpointResponse.cancelled()
         _sync_file_and_parent(self._out)
         artifact = self._module.CheckpointArtifact(
             kind=self._module.CheckpointArtifactKind.FILE,
@@ -112,7 +119,7 @@ def connect_external_checkpoint(
     identity: dict[str, object],
     *,
     import_module: Callable[[str], Any] = importlib.import_module,
-    result_writer: ResultWriter = write_result,
+    result_writer: ResultWriter = write_result_unless_breached,
 ) -> CheckpointSession:
     """Connect only inside mlx-guard, with no required dependency for direct runs."""
     if _CHECKPOINT_FD_ENV not in os.environ:

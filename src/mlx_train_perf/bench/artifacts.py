@@ -21,6 +21,7 @@ import json
 import os
 import platform
 import sys
+import threading
 import uuid
 from collections.abc import Callable
 from importlib.metadata import PackageNotFoundError, version
@@ -45,6 +46,9 @@ _PACKAGE_ROOT = Path(__file__).resolve().parent.parent  # .../src/mlx_train_perf
 # actually measures -- the bench worker itself, plus everything on the loss-computation
 # path it calls into. Deliberately explicit rather than "every .py in the repo": a
 # docs-only or CLI-only edit must NOT invalidate every bench artifact.
+# `bench/checkpoint.py` is here for a second reason: it cannot change a measured value (its
+# poll sites sit outside every timed window), but it WRITES a condition's artifact, and an
+# artifact should name the code that can produce it.
 CODE_SHA_DEPS: tuple[Path, ...] = tuple(
     _PACKAGE_ROOT / rel for rel in (
         "bench/worker.py",
@@ -193,14 +197,53 @@ def condition_identity(
     return run_identity(kind=kind, session_id=session_id, **attention_fields, **params)
 
 
+# A worker can have two writers of ONE artifact on two threads: the main thread (its final
+# result, or a checkpoint callback under external supervision) and the memory watchdog's
+# breach record. They are correlated by construction -- both react to the same memory
+# event -- so their ordering is made explicit instead of left to the scheduler.
+_WRITE_LOCK = threading.Lock()
+_WRITE_LOCK_TIMEOUT_S = 2.0
+_BREACH = threading.Event()
+
+
+def _write_atomically(
+    path: Path, identity: dict[str, object], status: str, fields: dict[str, object],
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Unique per WRITE, not per target: two writers sharing `<name>.tmp` rename each
+    # other's file away or land a half-written artifact.
+    tmp = path.with_name(f"{path.stem}.{os.getpid()}.{threading.get_ident()}.tmp")
+    tmp.write_text(json.dumps({"identity": identity, "status": status, **fields}, indent=2))
+    tmp.rename(path)
+
+
 def write_result(path: Path, identity: dict[str, object], status: str, **fields: object) -> None:
     """Atomic write (tmp + rename) -- an interrupted worker leaves either the PRIOR
     artifact or nothing at `path`, never a half-written JSON `result_is_fresh` could
-    misparse as fresh."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps({"identity": identity, "status": status, **fields}, indent=2))
-    tmp.rename(path)
+    misparse as fresh. Writers of one artifact are serialized by a short lock; the lock is
+    only ordering (the unique temp name is what keeps a write whole), so a writer that
+    cannot get it in time -- the breach path under a paging storm -- proceeds anyway."""
+    acquired = _WRITE_LOCK.acquire(timeout=_WRITE_LOCK_TIMEOUT_S)
+    try:
+        _write_atomically(path, identity, status, fields)
+    finally:
+        if acquired:
+            _WRITE_LOCK.release()
+
+
+def write_result_unless_breached(
+    path: Path, identity: dict[str, object], status: str, **fields: object,
+) -> bool:
+    """`write_result` for a writer that must never replace a breach record (the external
+    checkpoint callback). Returns False, writing nothing, once the watchdog has started
+    recording a breach. The check and the write share the lock, so the order is total:
+    either this write lands first and the breach record then replaces it, or the breach
+    came first and this write does not happen."""
+    with _WRITE_LOCK:
+        if _BREACH.is_set():
+            return False
+        _write_atomically(path, identity, status, fields)
+        return True
 
 
 def make_watchdog_on_breach(
@@ -235,6 +278,7 @@ def make_watchdog_on_breach(
     missing artifact after rc 70 -- see `bench/runner.py`); not dying is not."""
 
     def on_breach(reason: str, details: dict[str, object]) -> None:
+        _BREACH.set()  # before the write: from here on, no checkpoint may replace it
         try:
             active_bytes = int(cast(int, details.get("active_bytes", 0)))
             elapsed_s = float(cast(float, details.get("elapsed_s", 0.0)))

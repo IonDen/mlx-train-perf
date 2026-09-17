@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import json
 from importlib.metadata import PackageNotFoundError
 from pathlib import Path
@@ -49,6 +50,10 @@ class _FakeResponse:
     @classmethod
     def completed(cls, artifact: object) -> object:
         return SimpleNamespace(status="completed", artifact=artifact)
+
+    @classmethod
+    def cancelled(cls) -> object:
+        return SimpleNamespace(status="cancelled", artifact=None)
 
 
 def _fake_mlx_guard() -> object:
@@ -196,6 +201,35 @@ def test_checkpoint_writes_and_syncs_partial_artifact_before_acknowledging(
     assert response.artifact.kind == _FakeArtifactKind.FILE
     assert response.artifact.size_bytes == out.stat().st_size
     assert not hasattr(response.artifact, "path")
+
+
+def test_checkpoint_stands_down_when_a_breach_is_already_being_recorded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Catches: the checkpoint replacing the watchdog's breach record. Both layers react to
+    # the same memory event, so the callback can run while `aborted_memory_ceiling` is
+    # being written; it must write nothing and tell the supervisor so.
+    monkeypatch.setenv("MLX_GUARD_CHECKPOINT_FD", "9")
+    out = tmp_path / "result.json"
+    session = checkpoint.connect_external_checkpoint(
+        out, {"session_id": "s1"}, import_module=lambda _name: _fake_mlx_guard(),
+        result_writer=lambda *_args, **_fields: False,  # what the breach-aware writer returns
+    )
+
+    response = _FakeCheckpointWorker.callback(
+        SimpleNamespace(request_id=7, supervisor_deadline_ns=1),
+    )
+
+    assert response.status == "cancelled"
+    assert not out.exists()
+    session.close()
+
+
+def test_the_default_checkpoint_writer_is_the_breach_aware_one() -> None:
+    default = inspect.signature(checkpoint.connect_external_checkpoint).parameters[
+        "result_writer"
+    ].default
+    assert default is checkpoint.write_result_unless_breached
 
 
 def test_checkpoint_session_delegates_poll_and_close(

@@ -1,8 +1,10 @@
 import warnings
+from collections.abc import Iterator
 
 import mlx.core as mx
 import pytest
 
+from mlx_train_perf.bench import artifacts
 from mlx_train_perf.core.guards import install_guardrails
 
 _GATED = ("metal", "smoke", "benchmark", "network", "guard")
@@ -48,6 +50,15 @@ needs_long_context_room = pytest.mark.skipif(
     int(mx.device_info()["memory_size"]) < 24 * 1024**3,
     reason="oracle backward at long T needs >= 24 GiB device memory",
 )
+
+
+@pytest.fixture(autouse=True)
+def _breach_flag_is_per_test() -> Iterator[None]:
+    """A breach is process-final in production (the watchdog hard-exits right after
+    recording it), so the flag is process-global. Tests that fire `on_breach` with an
+    injected `exit_fn` survive it -- clear the flag so it cannot leak into the next test."""
+    yield
+    artifacts._BREACH.clear()
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:

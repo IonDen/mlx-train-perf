@@ -8,6 +8,7 @@ at a tiny synthetic shape with `impl="naive"`/`"chunked"` -- fast, no Metal JIT,
 import json
 import subprocess
 import sys
+import threading
 from collections.abc import Callable
 from importlib.metadata import PackageNotFoundError
 from pathlib import Path
@@ -348,6 +349,53 @@ def test_write_result_is_atomic_no_tmp_file_left_behind(tmp_path: Path) -> None:
     write_result(p, ident, "ok", wall_s=1.0)
     assert p.exists()
     assert not p.with_suffix(".tmp").exists()
+
+
+def test_two_writers_of_one_artifact_never_tear_it_or_lose_a_rename(tmp_path: Path) -> None:
+    # Catches: a temp name derived from the TARGET. A supervised worker has two writers of
+    # its artifact on two threads (the checkpoint callback and the memory watchdog), and
+    # they fire together by construction -- both watch the same memory event. With one
+    # shared `<name>.tmp`, one writer renames the other's file away (FileNotFoundError) or
+    # the artifact lands half-written.
+    ident = run_identity(model="m", session_id="s1")
+    p = tmp_path / "r.json"
+    failures: list[BaseException] = []
+
+    def hammer(status: str) -> None:
+        try:
+            for _ in range(400):
+                write_result(p, ident, status, payload="x" * 2048)
+        except BaseException as error:  # the failure IS the observation
+            failures.append(error)
+
+    threads = [threading.Thread(target=hammer, args=(s,)) for s in ("a", "b")]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert failures == []
+    assert json.loads(p.read_text())["status"] in ("a", "b")
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
+def test_a_breach_in_progress_outranks_a_later_checkpoint_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Catches: last-rename-wins. The breach artifact is the durable record the memory-safety
+    # story rests on; a checkpoint write landing after it would replace
+    # `aborted_memory_ceiling` with the milder `checkpointed_partial`.
+    monkeypatch.setattr(artifacts, "_BREACH", threading.Event())
+    out = tmp_path / "r.json"
+    ident = run_identity(model="m", session_id="s1")
+
+    assert artifacts.write_result_unless_breached(out, ident, "checkpointed_partial") is True
+    make_watchdog_on_breach(out, ident, 28 * _GIB, exit_fn=lambda _code: None)(
+        "memory_ceiling", {"active_bytes": 32 * _GIB, "elapsed_s": 1.0},
+    )
+    assert artifacts.write_result_unless_breached(out, ident, "checkpointed_partial") is False
+
+    assert json.loads(out.read_text())["status"] == "aborted_memory_ceiling"
 
 
 # --- report(): same-session ratio computed when identities otherwise match --------
