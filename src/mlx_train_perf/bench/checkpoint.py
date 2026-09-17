@@ -2,6 +2,7 @@
 
 import importlib
 import os
+import sys
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Protocol, cast
@@ -73,7 +74,16 @@ class _ExternalCheckpointSession:
     def poll(self) -> object | None:
         if self._worker is None:
             return None
-        return cast(object | None, self._worker.poll())
+        try:
+            return cast(object | None, self._worker.poll())
+        except self._module.CheckpointError as error:
+            # The helper has already told the supervisor the checkpoint failed; it will
+            # stop this process. Dying here instead races that TERM, and the supervisor
+            # then records its own failure rather than the intervention it was carrying
+            # out. Stay alive, say why on stderr, and stop using the channel.
+            print(f"mlx-train-perf: external checkpoint failed: {error}", file=sys.stderr)
+            self.close()
+            return None
 
     def close(self) -> None:
         if self._worker is not None:

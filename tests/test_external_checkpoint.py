@@ -121,6 +121,38 @@ def test_failed_handshake_degrades_to_an_unsupervised_checkpoint_session(
     assert not (tmp_path / "result.json").exists()
 
 
+def test_a_failed_checkpoint_does_not_crash_the_worker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    # Catches: letting the helper's post-failure exception kill the worker. Measured against
+    # the real supervisor (mlx-guard 0.2.0): a worker that exits right after a failed
+    # acknowledgement is gone before the supervisor's TERM arrives, and the run is recorded
+    # as `supervisor_failure` instead of the policy intervention it was. The failed
+    # acknowledgement has already been sent; the worker's job is to stay alive for the TERM.
+    monkeypatch.setenv("MLX_GUARD_CHECKPOINT_FD", "9")
+
+    class _FailedCallbackWorker:
+        def poll(self) -> object:
+            raise _FakeCheckpointError("checkpoint callback failed")
+
+        def close(self) -> None:
+            return None
+
+    class _Connecting:
+        @classmethod
+        def connect(cls, _callback: Any) -> object:
+            return _FailedCallbackWorker()
+
+    module = SimpleNamespace(CheckpointWorker=_Connecting, CheckpointError=_FakeCheckpointError)
+    session = checkpoint.connect_external_checkpoint(
+        tmp_path / "result.json", {"session_id": "s1"}, import_module=lambda _name: module,
+    )
+
+    assert session.poll() is None
+    assert session.poll() is None  # and it stops asking the dead channel
+    assert "checkpoint" in capsys.readouterr().err
+
+
 def test_broken_install_metadata_inside_the_supervisor_degrades_too(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
