@@ -401,6 +401,24 @@ mlx-train-perf plan --config path/to/config.json --seq-len 8192 --lora-rank 8 --
 
 `--max-seq` searches for the largest `--seq-len` and still needs `--batch`; `--max-batch` searches for the largest `--batch` and still needs `--seq-len`. A budget that nothing fits, even at the smallest value searched, is refused with a typed error.
 
+### Memory planning for your own pipeline
+
+`mlx_train_perf.memfit` is a small toolkit for any pipeline with phases of its own, such as encode, denoise and decode. You write each phase as named byte counts, and it returns the predicted peak, the phase that sets it, and the largest setting that fits a budget. It also reads and writes calibration files, fits coefficients from your measurements, and scores predictions against hold-out runs. It does not load MLX, and `fit_linear` needs the `fit` extra: `pip install "mlx-train-perf[fit]"`.
+
+```python
+from mlx_train_perf.memfit import MemoryModel, Phase, estimate, max_int_within_budget
+
+GIB = 1024**3
+model = MemoryModel(phases=(
+    Phase(name="decode", terms={"weights": lambda side: 6 * GIB,
+                                "activations": lambda side: side**2 * 3000}),
+))
+print(estimate(model, 1024).peak_bytes / GIB)
+print(max_int_within_budget(model, lambda k: 64 * k, lo=1, hi=64, budget_bytes=12 * GIB) * 64)
+```
+
+[docs/memory-model.md](https://github.com/IonDen/mlx-train-perf/blob/main/docs/memory-model.md) walks through multi-phase models, calibration files, fitting and hold-out scoring. `mlx_train_perf.machine.detect_machine()` reports the chip, RAM and the working set Metal recommends. That figure is an upper bound, not a budget: subtract a reserve and your validated hold-out band, and remember that an active-memory estimate leaves out MLX's retained cache, so bound it with `mx.set_cache_limit(...)` or size the reserve to cover it. Never pass the working set to `mx.set_wired_limit` as it is; a wired cap has to sit strictly below it.
+
 ## Supported models
 
 - Architectures: Llama, Qwen2 (the Qwen2.5 family), and Qwen3, for both the loss adapter and the flash-attention wrapper. Qwen 3.5 is supported by the loss adapter and by its own [GatedDelta training path](https://github.com/IonDen/mlx-train-perf#gateddelta-training-for-qwen-35); its full-attention layers are not on the flash-attention wrapper yet, and sequence packing and the RAM-fit planner don't cover it. The adapter's model splitter handles all of these; other families raise a typed error.
