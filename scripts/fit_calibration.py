@@ -45,7 +45,13 @@ from datetime import date
 from pathlib import Path
 
 from mlx_train_perf._compat import _installed_mlx_version
-from mlx_train_perf.plan.calibration import Calibration, load_calibration
+from mlx_train_perf.memfit.calibration import (
+    MLX_ACTIVE_MARGINAL,
+    CalibrationFile,
+    dump_calibration_file,
+    load_calibration_file,
+)
+from mlx_train_perf.plan.calibration import Calibration, calibration_from_file
 from mlx_train_perf.plan.estimate import (
     FitPoint,
     ModelShape,
@@ -181,7 +187,7 @@ def build_updated_calibration_data(
     gc-aware linear + O(N^2) stock attention + both O(N) flash arms) +
     `optimizer_bytes_per_param` (analytic) + `provenance`.
 
-    `provenance` keeps the four keys `load_calibration`'s own tests require truthy
+    `provenance` keeps the four keys that identify the measuring run, all kept truthy
     (`machine`, `macos`, `mlx_version`, `measured_date`), plus `flash_fit`
     (`"ols"|"envelope"`, added in 0.5.0) naming which flash-coefficient fit `main()`
     selected -- `"ols"` unless the one-sidedness check (`_flash_fit_is_one_sided`)
@@ -235,30 +241,9 @@ def main(argv: list[str] | None = None) -> int:
 
     manifest_path = Path(args.manifest)
     calibration_path = Path(args.calibration_data)
-    existing = json.loads(calibration_path.read_text())
-    calib = load_calibration() if calibration_path == DEFAULT_CALIBRATION_DATA else None
-    if calib is None:
-        # A non-default --calibration-data path (e.g. a test's temp file) can't go
-        # through load_calibration (which always reads the INSTALLED package data file) --
-        # build a stand-in Calibration from `existing` instead. `fit_memory_coeffs` reads
-        # calib only for the analytic small terms it subtracts (optimizer + naive loss,
-        # the latter only for impl="naive" points, which this script never builds).
-        calib = Calibration(
-            base_transient_bytes=float(existing["base_transient_bytes"]),
-            act_bytes_per_token_hidden_layer_ckpt=float(
-                existing["act_bytes_per_token_hidden_layer_ckpt"]),
-            act_bytes_per_token_hidden_layer_full=float(
-                existing["act_bytes_per_token_hidden_layer_full"]),
-            attn_bytes_per_head_token2=float(existing["attn_bytes_per_head_token2"]),
-            attn_bytes_per_head_token_flash_kernel=float(
-                existing["attn_bytes_per_head_token_flash_kernel"]),
-            attn_bytes_per_head_token_flash_stock=float(
-                existing["attn_bytes_per_head_token_flash_stock"]),
-            optimizer_bytes_per_param=float(existing["optimizer_bytes_per_param"]),
-            overhead_frac=float(existing["overhead_frac"]),
-            naive_loss_bytes_per_nv=float(existing["naive_loss_bytes_per_nv"]),
-            provenance=dict(existing["provenance"]),
-        )
+    existing_file = load_calibration_file(calibration_path, expect_quantity=MLX_ACTIVE_MARGINAL)
+    existing = {**existing_file.coefficients, "provenance": dict(existing_file.provenance)}
+    calib = calibration_from_file(existing_file)
 
     points = load_fit_points(manifest_path)
     coeffs = fit_memory_coeffs(points, calib=calib, flash_fit="ols")
@@ -281,7 +266,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.dry_run:
         print(f"--dry-run: {calibration_path} NOT written")
         return 0
-    calibration_path.write_text(json.dumps(updated, indent=2) + "\n")
+    dump_calibration_file(CalibrationFile(
+        measured_quantity=MLX_ACTIVE_MARGINAL,
+        coefficients={k: float(v) for k, v in updated.items() if k != "provenance"},
+        provenance=dict(updated["provenance"]),
+        terms=existing_file.terms,
+        # An old hold-out score describes the old coefficients; refitting invalidates it.
+        holdout=None,
+    ), calibration_path)
     print(f"wrote {calibration_path}")
     return 0
 

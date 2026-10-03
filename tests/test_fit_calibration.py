@@ -61,6 +61,22 @@ _EXISTING_CALIBRATION = {
 }
 
 
+def _write_existing_calibration(path: Path, existing: dict | None = None) -> None:
+    flat = dict(_EXISTING_CALIBRATION if existing is None else existing)
+    provenance = flat.pop("provenance")
+    path.write_text(json.dumps({
+        "format": "mlx-train-perf.calibration", "schema_version": 1,
+        "measured_quantity": "mlx_active_marginal", "coefficients": flat,
+        "provenance": provenance, "holdout": None,
+    }))
+
+
+def _read_written_calibration(path: Path) -> dict[str, object]:
+    """The written file as the flat view these tests were written against."""
+    doc = json.loads(path.read_text())
+    return {**doc["coefficients"], "provenance": doc["provenance"]}
+
+
 def _write_artifact(
     path: Path, *, status: str = "ok", marginal_peak_gb: float = 1.0, impl: str = "kernel",
     attention_impl: str = "stock", stock: bool = False,
@@ -288,7 +304,7 @@ def test_main_dry_run_does_not_write_the_calibration_file(tmp_path: Path) -> Non
     config_path = tmp_path / "config.json"
     config_path.write_text(json.dumps(_CONFIG))
     calibration_path = tmp_path / "calibration_data.json"
-    calibration_path.write_text(json.dumps(_EXISTING_CALIBRATION))
+    _write_existing_calibration(calibration_path)
     manifest_path = _write_gc_true_manifest(tmp_path, config_path)
     original_text = calibration_path.read_text()
 
@@ -304,14 +320,14 @@ def test_main_writes_the_updated_calibration_file_without_dry_run(tmp_path: Path
     config_path = tmp_path / "config.json"
     config_path.write_text(json.dumps(_CONFIG))
     calibration_path = tmp_path / "calibration_data.json"
-    calibration_path.write_text(json.dumps(_EXISTING_CALIBRATION))
+    _write_existing_calibration(calibration_path)
     manifest_path = _write_gc_true_manifest(tmp_path, config_path)
 
     rc = fit_calibration.main([
         "--manifest", str(manifest_path), "--calibration-data", str(calibration_path),
     ])
     assert rc == 0
-    updated = json.loads(calibration_path.read_text())
+    updated = _read_written_calibration(calibration_path)
     # the fit replaced the memory coefficients (base moved off its placeholder 1.0):
     assert updated["base_transient_bytes"] != _EXISTING_CALIBRATION["base_transient_bytes"]
     assert "attn_bytes_per_head_token2" in updated
@@ -407,13 +423,13 @@ def test_main_selects_envelope_flash_fit_when_ols_under_predicts_an_anchor(
     manifest_path = tmp_path / "manifest.json"
     _write_manifest(manifest_path, [small_seq_huge_a_flash, big_seq_tiny_a_flash])
     calibration_path = tmp_path / "calibration_data.json"
-    calibration_path.write_text(json.dumps(_EXISTING_CALIBRATION))
+    _write_existing_calibration(calibration_path)
 
     rc = fit_calibration.main([
         "--manifest", str(manifest_path), "--calibration-data", str(calibration_path),
     ])
     assert rc == 0
-    updated = json.loads(calibration_path.read_text())
+    updated = _read_written_calibration(calibration_path)
     assert updated["provenance"]["flash_fit"] == "envelope"
     # the envelope recovers the under-predicted anchor's own true coefficient, not the
     # OLS weighted average (which lands far below it -- see the docstring above).
@@ -437,13 +453,13 @@ def test_main_selects_ols_flash_fit_for_benign_points(tmp_path: Path) -> None:
     manifest_path = tmp_path / "manifest.json"
     _write_manifest(manifest_path, [a, b])
     calibration_path = tmp_path / "calibration_data.json"
-    calibration_path.write_text(json.dumps(_EXISTING_CALIBRATION))
+    _write_existing_calibration(calibration_path)
 
     rc = fit_calibration.main([
         "--manifest", str(manifest_path), "--calibration-data", str(calibration_path),
     ])
     assert rc == 0
-    updated = json.loads(calibration_path.read_text())
+    updated = _read_written_calibration(calibration_path)
     assert updated["provenance"]["flash_fit"] == "ols"
     assert updated["attn_bytes_per_head_token_flash_kernel"] == pytest.approx(
         500.0, rel=1e-6)
@@ -474,13 +490,13 @@ def test_main_fits_each_flash_arm_separately_and_routes_the_one_sided_check(
     manifest_path = tmp_path / "manifest.json"
     _write_manifest(manifest_path, [ours, stock_arm])
     calibration_path = tmp_path / "calibration_data.json"
-    calibration_path.write_text(json.dumps(_EXISTING_CALIBRATION))
+    _write_existing_calibration(calibration_path)
 
     rc = fit_calibration.main([
         "--manifest", str(manifest_path), "--calibration-data", str(calibration_path),
     ])
     assert rc == 0
-    updated = json.loads(calibration_path.read_text())
+    updated = _read_written_calibration(calibration_path)
     assert updated["attn_bytes_per_head_token_flash_kernel"] == pytest.approx(
         500.0, rel=1e-6)
     assert updated["attn_bytes_per_head_token_flash_stock"] == pytest.approx(
@@ -517,13 +533,13 @@ def test_main_one_sided_check_runs_uncushioned(tmp_path: Path) -> None:
     manifest_path = tmp_path / "manifest.json"
     _write_manifest(manifest_path, [small, big])
     calibration_path = tmp_path / "calibration_data.json"
-    calibration_path.write_text(json.dumps(_EXISTING_CALIBRATION))
+    _write_existing_calibration(calibration_path)
 
     rc = fit_calibration.main([
         "--manifest", str(manifest_path), "--calibration-data", str(calibration_path),
     ])
     assert rc == 0
-    updated = json.loads(calibration_path.read_text())
+    updated = _read_written_calibration(calibration_path)
     assert updated["provenance"]["flash_fit"] == "envelope"
     assert updated["attn_bytes_per_head_token_flash_kernel"] == pytest.approx(
         530.0, rel=1e-6)
@@ -560,7 +576,7 @@ def test_main_detects_under_prediction_from_a_mixed_stock_flash_manifest(
     existing = dict(_EXISTING_CALIBRATION)
     existing["base_transient_bytes"] = 5_000_000_000.0
     existing["act_bytes_per_token_hidden_layer_ckpt"] = 50.0
-    calibration_path.write_text(json.dumps(existing))
+    _write_existing_calibration(calibration_path, existing)
     calib = Calibration(
         base_transient_bytes=float(existing["base_transient_bytes"]),
         act_bytes_per_token_hidden_layer_ckpt=float(
@@ -608,7 +624,7 @@ def test_main_detects_under_prediction_from_a_mixed_stock_flash_manifest(
         "--manifest", str(manifest_path), "--calibration-data", str(calibration_path),
     ])
     assert rc == 0
-    updated = json.loads(calibration_path.read_text())
+    updated = _read_written_calibration(calibration_path)
     assert updated["provenance"]["flash_fit"] == "envelope"
 
 
