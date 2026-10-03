@@ -637,7 +637,9 @@ def test_contribute_help_documents_the_tiers(capsys: pytest.CaptureFixture[str])
 
 def _machine_info() -> MachineInfo:
     return MachineInfo(chip="Apple M1 Max", ram_gib=32, ram_bytes=34359738368,
-                       macos="15.5", mlx_version="0.32.0", package_version="0.2.0")
+                       recommended_working_set_bytes=26800603136,
+                       gpu_architecture="applegpu_g13s", macos="15.5",
+                       mlx_version="0.32.0", package_version="0.2.0")
 
 
 def _ok_preflight(warnings: tuple[str, ...] = ()) -> Preflight:

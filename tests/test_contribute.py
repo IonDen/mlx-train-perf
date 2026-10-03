@@ -12,7 +12,6 @@ The real quick-tier run (a heavy GPU job) is the controller's `--run-smoke` step
 this suite.
 """
 import json
-import subprocess
 from pathlib import Path
 
 import pytest
@@ -22,68 +21,30 @@ from mlx_train_perf.contribute import (
     COMMUNITY_SCHEMA_VERSION,
     ContributionResult,
     MachineInfo,
-    Preflight,
     artifact_filename,
     benches_for_tier,
     build_community_artifact,
-    classify_memory_pressure,
     collect_memory_warnings,
-    detect_machine,
     eta_minutes_for_tier,
-    evaluate_preflight,
     format_eta,
-    machine_slug,
-    parse_chip,
     pr_body,
     pr_title,
     ram_class_for,
-    ram_gib_from_bytes,
     run_contribution,
     run_preflight,
     shapes_for_ram,
     summarize_artifact_file,
 )
 from mlx_train_perf.core.guards import EffectiveCeiling
-from mlx_train_perf.errors import BenchInputError, MachineDetectionError, MemoryBudgetError
+from mlx_train_perf.errors import BenchInputError, MemoryBudgetError
+from mlx_train_perf.machine import Preflight
 
-# --- machine detection: pure parsing --------------------------------------------------
-
-
-def test_parse_chip_strips_the_sysctl_brand_string() -> None:
-    assert parse_chip("Apple M1 Max\n") == "Apple M1 Max"
-
-
-def test_parse_chip_collapses_internal_whitespace() -> None:
-    assert parse_chip("  Apple  M2   Ultra  ") == "Apple M2 Ultra"
-
-
-def test_ram_gib_from_bytes_rounds_to_the_nearest_gib() -> None:
-    assert ram_gib_from_bytes(34359738368) == 32     # exactly 32 GiB
-    assert ram_gib_from_bytes(68719476736) == 64
-    assert ram_gib_from_bytes(17179869184) == 16
-
-
-def test_machine_slug_is_filesystem_safe_and_carries_ram() -> None:
-    assert machine_slug(chip="Apple M1 Max", ram_gib=32) == "apple-m1-max-32gb"
+# --- artifact filename ---------------------------------------------------------------
 
 
 def test_artifact_filename_matches_the_spec_convention() -> None:
     assert artifact_filename(chip="Apple M1 Max", ram_gib=32, date="2026-07-12") == (
         "apple-m1-max-32gb-2026-07-12.json"
-    )
-
-
-def test_detect_machine_assembles_from_injected_readers() -> None:
-    info = detect_machine(
-        chip_reader=lambda: "Apple M2 Ultra\n",
-        ram_bytes_reader=lambda: 68719476736,
-        macos_reader=lambda: "15.5",
-        mlx_version_reader=lambda: "0.32.0",
-        package_version_reader=lambda: "0.2.0",
-    )
-    assert info == MachineInfo(
-        chip="Apple M2 Ultra", ram_gib=64, ram_bytes=68719476736, macos="15.5",
-        mlx_version="0.32.0", package_version="0.2.0",
     )
 
 
@@ -181,52 +142,6 @@ def test_format_eta_mentions_the_tier_and_a_range() -> None:
     assert "quick" in text
     assert "1" in text
     assert "5" in text
-
-
-# --- pre-flight decision (pure) -------------------------------------------------------
-
-
-def test_classify_memory_pressure_reads_the_free_percentage_line() -> None:
-    assert classify_memory_pressure("System-wide memory free percentage: 91%") == "normal"
-    assert classify_memory_pressure("System-wide memory free percentage: 20%") == "warn"
-    assert classify_memory_pressure("System-wide memory free percentage: 4%") == "red"
-
-
-def test_classify_memory_pressure_degrades_to_normal_when_unparseable() -> None:
-    """A missing free-percentage line must NOT read as red (the real panic guard is the
-    effective-ceiling refusal, not this coarse gate) -- it degrades to normal."""
-    assert classify_memory_pressure("garbage with no percentage line") == "normal"
-
-
-def test_evaluate_preflight_refuses_on_red_memory() -> None:
-    pf = evaluate_preflight(
-        memory_pressure_state="red", on_ac_power=True,
-        ceiling=EffectiveCeiling(ceiling_bytes=1, warning=None),
-    )
-    assert pf.ok is False
-    assert pf.refusal is not None
-    assert "memory" in pf.refusal.lower()
-
-
-def test_evaluate_preflight_warns_on_battery_but_proceeds() -> None:
-    pf = evaluate_preflight(
-        memory_pressure_state="normal", on_ac_power=False,
-        ceiling=EffectiveCeiling(ceiling_bytes=1, warning=None),
-    )
-    assert pf.ok is True
-    assert pf.refusal is None
-    assert any("AC" in w or "battery" in w.lower() for w in pf.warnings)
-
-
-def test_evaluate_preflight_surfaces_the_divergence_warning_prominently() -> None:
-    """The 0021 memory-divergence warning ('expected ~58 GB free, measured 20 GB') is
-    exactly the kit's audience -- someone on a crowded machine must see it up front."""
-    ceiling = EffectiveCeiling(
-        ceiling_bytes=1, warning="measured available 20 GB is far below 58 GB",
-    )
-    pf = evaluate_preflight(memory_pressure_state="normal", on_ac_power=True, ceiling=ceiling)
-    assert pf.ok is True
-    assert any("20 GB" in w for w in pf.warnings)
 
 
 # --- run_preflight: the standalone, pre-confirmation seam (finding A) -----------------
@@ -364,7 +279,9 @@ def test_summarize_artifact_file_missing_reads_as_error(tmp_path: Path) -> None:
 
 def _machine() -> MachineInfo:
     return MachineInfo(chip="Apple M1 Max", ram_gib=32, ram_bytes=34359738368,
-                       macos="15.5", mlx_version="0.32.0", package_version="0.2.0")
+                       recommended_working_set_bytes=26800603136,
+                       gpu_architecture="applegpu_g13s", macos="15.5", mlx_version="0.32.0",
+                       package_version="0.2.0")
 
 
 def test_build_community_artifact_has_all_required_keys(tmp_path: Path) -> None:
@@ -766,7 +683,9 @@ def test_contribute_session_id_changes_with_the_shape_grid() -> None:
 
 def test_contribute_session_id_changes_with_the_machine() -> None:
     other_machine = MachineInfo(chip="Apple M2 Ultra", ram_gib=32, ram_bytes=34359738368,
-                                macos="15.5", mlx_version="0.32.0", package_version="0.2.0")
+                                recommended_working_set_bytes=26800603136,
+                                gpu_architecture="applegpu_g14d", macos="15.5",
+                                mlx_version="0.32.0", package_version="0.2.0")
     grid = shapes_for_ram(32)
     id_a = contribute._contribute_session_id(machine=_machine(), tier="quick", grid=grid)
     id_b = contribute._contribute_session_id(machine=other_machine, tier="quick", grid=grid)
@@ -827,52 +746,12 @@ def test_run_contribution_reuses_the_session_id_and_resumes_across_invocations(
 
 
 def test_real_non_metal_readers_return_plausible_values() -> None:
-    """The subprocess/platform readers (chip, macOS, memory_pressure, AC power, date,
-    package version) run on any macOS without a Metal device -- exercised for real, unlike
-    the Metal `mx.device_info()` RAM reader (pragma'd)."""
-    assert contribute._read_chip()                       # non-empty sysctl brand string
+    """The kit's own subprocess readers (memory_pressure, AC power, date) run on any
+    macOS without a Metal device -- exercised for real. The machine readers are covered
+    in `tests/test_machine.py`."""
     assert isinstance(contribute._read_on_ac_power(), bool)
     assert "percentage" in contribute._read_memory_pressure().lower()
-    assert contribute._read_package_version()
     assert len(contribute._today()) == 10                # YYYY-MM-DD
-    assert isinstance(contribute._read_macos(), str)
-
-
-# --- _read_chip: subprocess failures map to the typed tool-error path (finding E) -----
-
-
-def test_read_chip_wraps_a_called_process_error_in_a_typed_error(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A failing `sysctl` (nonzero exit under `check=True`) must not escape as a raw
-    `CalledProcessError` -- that traceback would bypass `main`'s `MlxTrainPerfError`
-    catch and exit 1 (an uncaught crash) instead of the package's tool-error exit 2."""
-    def _raise(*_a: object, **_kw: object) -> subprocess.CompletedProcess[str]:
-        raise subprocess.CalledProcessError(1, ["sysctl", "-n", "machdep.cpu.brand_string"])
-
-    monkeypatch.setattr(contribute.subprocess, "run", _raise)
-    with pytest.raises(MachineDetectionError, match="sysctl"):
-        contribute._read_chip()
-
-
-def test_read_chip_wraps_a_timeout_in_a_typed_error(monkeypatch: pytest.MonkeyPatch) -> None:
-    def _raise(*_a: object, **_kw: object) -> subprocess.CompletedProcess[str]:
-        raise subprocess.TimeoutExpired(cmd=["sysctl"], timeout=10)
-
-    monkeypatch.setattr(contribute.subprocess, "run", _raise)
-    with pytest.raises(MachineDetectionError):
-        contribute._read_chip()
-
-
-def test_read_chip_wraps_a_missing_binary_in_a_typed_error(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    def _raise(*_a: object, **_kw: object) -> subprocess.CompletedProcess[str]:
-        raise FileNotFoundError("sysctl")
-
-    monkeypatch.setattr(contribute.subprocess, "run", _raise)
-    with pytest.raises(MachineDetectionError):
-        contribute._read_chip()
 
 
 # --- controller's Step 2: the real quick-tier run (gated, NOT run in this suite) -------

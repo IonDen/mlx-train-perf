@@ -234,3 +234,12 @@ def test_main_empty_dir_exits_zero_with_a_note(tmp_path: Path, capsys) -> None: 
     rc = main(["--dir", str(tmp_path)])
     assert rc == 0
     assert "no community" in capsys.readouterr().out.lower()
+
+
+def test_the_committed_schema_1_artifact_still_aggregates() -> None:
+    """The one community file already merged predates schema 2's working-set field; the
+    aggregator must keep reading it."""
+    v1 = _SCRIPTS_DIR.parent / "community-benchmarks" / "apple-m1-max-32gb-2026-07-13.json"
+    assert json.loads(v1.read_text())["schema_version"] == 1
+    rows = [summarize_row(a) for a in load_community_artifacts(v1.parent)]
+    assert [(r.chip, r.ram_gib) for r in rows] == [("Apple M1 Max", 32)]

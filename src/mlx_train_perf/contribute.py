@@ -30,29 +30,35 @@ contributor) owns the stock-attention baseline comparisons.
 import hashlib
 import json
 import os
-import platform
 import subprocess
 import sys
 import time
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from datetime import date
-from importlib.metadata import version
 from pathlib import Path
 from typing import cast
 
-from mlx_train_perf._compat import _installed_mlx_version
 from mlx_train_perf.bench.artifacts import run_identity, write_result
 from mlx_train_perf.bench.runner import Condition, run_conditions
 from mlx_train_perf.core.guards import EffectiveCeiling, effective_memory_ceiling
 from mlx_train_perf.errors import (
     BenchInputError,
-    MachineDetectionError,
     MemoryBudgetError,
     MissingDependencyError,
 )
+from mlx_train_perf.machine import (
+    MachineInfo,
+    Preflight,
+    classify_memory_pressure,
+    detect_machine,
+    evaluate_preflight,
+    machine_slug,
+    parse_chip,  # noqa: F401 -- re-exported: these two were defined here before 0.9.0
+    ram_gib_from_bytes,  # noqa: F401
+)
 
-COMMUNITY_SCHEMA_VERSION = 1
+COMMUNITY_SCHEMA_VERSION = 2  # 2 (0.9.0): machine block gains the working set + GPU arch
 
 # The kit runs the FLASH arm (the library's own path -- that's what community numbers are
 # for). Both attention arms run in the model-free single-op bench (the O(N) vs O(N^2)
@@ -62,97 +68,12 @@ _ATTENTION_IMPLS = ("flash", "stock")
 _LOSS_IMPLS = ("kernel", "chunked", "naive")
 
 
-# --- machine detection ----------------------------------------------------------------
-
-
-@dataclass(frozen=True, slots=True, kw_only=True)
-class MachineInfo:
-    chip: str
-    ram_gib: int
-    ram_bytes: int
-    macos: str
-    mlx_version: str
-    package_version: str
-
-
-def parse_chip(brand_string: str) -> str:
-    """Normalize the `sysctl machdep.cpu.brand_string` output: strip and collapse any
-    internal whitespace run to a single space (`"Apple  M2   Ultra"` -> `"Apple M2
-    Ultra"`)."""
-    return " ".join(brand_string.split())
-
-
-def ram_gib_from_bytes(ram_bytes: int) -> int:
-    """Physical RAM in GiB, rounded to the nearest whole GiB -- `mx.device_info()`'s
-    `memory_size` is exact powers of two on Apple Silicon (32 GiB -> exactly 32)."""
-    return round(ram_bytes / 1024**3)
-
-
-def machine_slug(*, chip: str, ram_gib: int) -> str:
-    """Filesystem-safe machine identifier carrying the RAM class, e.g.
-    `apple-m1-max-32gb` -- the stem of the submitted artifact filename."""
-    return f"{chip.lower().replace(' ', '-')}-{ram_gib}gb"
+# --- machine detection (public API in `mlx_train_perf.machine`) -----------------------
 
 
 def artifact_filename(*, chip: str, ram_gib: int, date: str) -> str:
     """`<chip>-<ram>gb-<yyyy-mm-dd>.json`."""
     return f"{machine_slug(chip=chip, ram_gib=ram_gib)}-{date}.json"
-
-
-def _read_chip() -> str:
-    """The `sysctl` brand-string reader -- unlike `_read_memory_pressure`/
-    `_read_on_ac_power` (which degrade gracefully on failure; a stale-but-safe default is
-    fine there), a chip read failure has no honest default, so `check=True` raises. A
-    subprocess/OS failure (missing binary, nonzero exit, timeout) is mapped to the typed
-    `MachineDetectionError` here, not left to escape as a raw traceback -- `main` only
-    catches `MlxTrainPerfError`, so an unmapped `CalledProcessError` would exit 1 (an
-    uncaught crash) instead of this package's tool-error exit 2."""
-    try:
-        out = subprocess.run(
-            ["sysctl", "-n", "machdep.cpu.brand_string"],
-            capture_output=True, text=True, check=True, timeout=10,
-        ).stdout
-    except (OSError, subprocess.SubprocessError) as exc:
-        raise MachineDetectionError(
-            f"failed to read the CPU brand string via `sysctl`: {exc}"
-        ) from exc
-    return parse_chip(out)
-
-
-def _read_ram_bytes() -> int:  # pragma: no cover -- Metal device query boundary
-    import mlx.core as mx  # noqa: PLC0415
-
-    return int(mx.device_info()["memory_size"])
-
-
-def _read_macos() -> str:
-    return platform.mac_ver()[0]
-
-
-def _read_package_version() -> str:
-    return version("mlx-train-perf")
-
-
-def detect_machine(
-    *,
-    chip_reader: Callable[[], str] = _read_chip,
-    ram_bytes_reader: Callable[[], int] = _read_ram_bytes,
-    macos_reader: Callable[[], str] = _read_macos,
-    mlx_version_reader: Callable[[], str] = _installed_mlx_version,
-    package_version_reader: Callable[[], str] = _read_package_version,
-) -> MachineInfo:
-    """Assemble a `MachineInfo` from injectable readers -- the real ones read `sysctl`,
-    `mx.device_info()`, `platform.mac_ver()`, and installed package versions; tests inject
-    fakes so this is fully GPU-free and subprocess-free under test."""
-    ram_bytes = ram_bytes_reader()
-    return MachineInfo(
-        chip=parse_chip(chip_reader()),
-        ram_gib=ram_gib_from_bytes(ram_bytes),
-        ram_bytes=ram_bytes,
-        macos=macos_reader(),
-        mlx_version=mlx_version_reader(),
-        package_version=package_version_reader(),
-    )
 
 
 # --- RAM -> shape scaling table (pure) ------------------------------------------------
@@ -283,69 +204,7 @@ def format_eta(tier: str) -> str:
     return f"{tier} tier: ~{low:.0f}-{high:.0f} min"
 
 
-# --- pre-flight (pure decision) -------------------------------------------------------
-
-
-@dataclass(frozen=True, slots=True, kw_only=True)
-class Preflight:
-    ok: bool
-    refusal: str | None
-    warnings: tuple[str, ...]
-
-
-_RED_FREE_PCT = 10.0
-_WARN_FREE_PCT = 25.0
-
-
-def classify_memory_pressure(text: str) -> str:
-    """Classify `memory_pressure`'s output as `"normal"`/`"warn"`/`"red"` off its
-    `System-wide memory free percentage: N%` line. A missing/unparseable line degrades to
-    `"normal"` -- the real panic guard is the effective-ceiling refusal (the two-term
-    watchdog each bench installs), not this coarse gate, so a parse hiccup must never
-    falsely block a healthy machine."""
-    import re  # noqa: PLC0415
-
-    match = re.search(r"free percentage:\s*([\d.]+)\s*%", text)
-    if match is None:
-        return "normal"
-    free_pct = float(match.group(1))
-    if free_pct < _RED_FREE_PCT:
-        return "red"
-    if free_pct < _WARN_FREE_PCT:
-        return "warn"
-    return "normal"
-
-
-def evaluate_preflight(
-    *, memory_pressure_state: str, on_ac_power: bool, ceiling: EffectiveCeiling,
-) -> Preflight:
-    """Pure pre-flight decision. REFUSES only on a red memory-pressure state (a
-    genuinely-crowded machine also refuses upstream via `effective_memory_ceiling` raising
-    `MemoryBudgetError`, handled in `run_contribution`). Everything else proceeds with
-    WARNINGS: running on battery (measurements drift under power throttling), an elevated
-    memory-pressure state, and -- surfaced prominently, this is the kit's audience -- the
-    divergence warning (`expected ~N GB free, measured M GB`) the effective ceiling
-    recorded."""
-    warnings: list[str] = []
-    refusal: str | None = None
-    if memory_pressure_state == "red":
-        refusal = (
-            "system memory pressure is critical (red); refusing to start a heavy GPU run "
-            "-- close other applications and retry"
-        )
-    if not on_ac_power:
-        warnings.append(
-            "running on battery power -- plug in AC power for stable measurements "
-            "(power throttling on battery distorts wall-clock timing)"
-        )
-    if ceiling.warning is not None:
-        warnings.append(ceiling.warning)
-    if memory_pressure_state == "warn":
-        warnings.append(
-            "system memory pressure is elevated -- other processes are using memory; "
-            "measurements may be affected"
-        )
-    return Preflight(ok=refusal is None, refusal=refusal, warnings=tuple(warnings))
+# --- pre-flight (pure decision lives in `mlx_train_perf.machine`) -------------------
 
 
 # --- community artifact assembly (pure) -----------------------------------------------
@@ -672,7 +531,8 @@ def run_preflight(
         return Preflight(ok=False, refusal=str(exc), warnings=())
     mp_state = classify_memory_pressure(memory_pressure_reader())
     return evaluate_preflight(
-        memory_pressure_state=mp_state, on_ac_power=ac_power_reader(), ceiling=ceiling,
+        memory_pressure_state=mp_state, on_ac_power=ac_power_reader(),
+        ceiling_warning=ceiling.warning,
     )
 
 

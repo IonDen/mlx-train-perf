@@ -21,7 +21,6 @@ from typing import cast
 from mlx_train_perf.bench.artifacts import new_session_id
 from mlx_train_perf.bench.runner import Condition, report, run_conditions
 from mlx_train_perf.contribute import (
-    detect_machine,
     format_eta,
     run_contribution,
     run_preflight,
@@ -33,6 +32,8 @@ from mlx_train_perf.errors import (
     MlxTrainPerfError,
     PlanInputError,
 )
+from mlx_train_perf.machine import detect_machine
+from mlx_train_perf.memfit.errors import MemfitError
 from mlx_train_perf.plan.estimate import FitReport, ModelShape, TrainConfig, plan_fit
 from mlx_train_perf.plan.inverse import max_batch_for_budget, max_seq_len_for_budget
 
@@ -464,7 +465,7 @@ def main(argv: list[str] | None = None) -> int:
     func = cast(Command, args.func)
     try:
         return func(args)
-    except MlxTrainPerfError as exc:
+    except (MlxTrainPerfError, MemfitError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 2
 
