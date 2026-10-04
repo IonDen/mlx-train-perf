@@ -642,6 +642,10 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+fit = [
+    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
+    { name = "numpy", version = "2.5.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+]
 guard = [
     { name = "mlx-guard" },
 ]
@@ -672,10 +676,11 @@ requires-dist = [
     { name = "mlx", specifier = ">=0.32.0,<0.33" },
     { name = "mlx-guard", marker = "extra == 'guard'", specifier = "==0.2.0" },
     { name = "mlx-lm", marker = "extra == 'mlx-lm'", specifier = ">=0.31.3,<0.32" },
+    { name = "numpy", marker = "extra == 'fit'" },
     { name = "pyobjc-framework-metal", marker = "extra == 'probe'" },
     { name = "transformers", marker = "extra == 'mlx-lm'", specifier = ">=5.0,<5.13" },
 ]
-provides-extras = ["guard", "mlx-lm", "probe"]
+provides-extras = ["fit", "guard", "mlx-lm", "probe"]
 
 [package.metadata.requires-dev]
 dev = [

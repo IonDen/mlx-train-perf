@@ -11,12 +11,16 @@ longer fits, no larger value does either.
 """
 from dataclasses import replace
 
-import mlx.core as mx
-
-from mlx_train_perf.core.guards import clamped_caps
-from mlx_train_perf.errors import DoesNotFitError
+from mlx_train_perf.errors import DoesNotFitError, PlanInputError
+from mlx_train_perf.memfit.model import max_int_within_budget
 from mlx_train_perf.plan.calibration import Calibration, load_calibration
-from mlx_train_perf.plan.estimate import ModelShape, TrainConfig, estimate_peak
+from mlx_train_perf.plan.estimate import (
+    ModelShape,
+    TrainConfig,
+    _resolve_lora_layers,
+    _train_step_model,
+    estimate_peak,
+)
 
 
 def _peak(shape: ModelShape, cfg: TrainConfig, calib: Calibration) -> int:
@@ -39,6 +43,10 @@ def _resolve_budget_bytes(budget_bytes: int | None) -> int:
     for an honest stock-trainer budget rather than relying on this stricter default."""
     if budget_bytes is not None:
         return budget_bytes
+    import mlx.core as mx  # noqa: PLC0415 -- device query only; keeps plan mlx-free
+
+    from mlx_train_perf.core.guards import clamped_caps  # noqa: PLC0415
+
     dev_max = int(mx.device_info()["max_recommended_working_set_size"])
     wired, _ = clamped_caps(dev_max)
     return wired
@@ -54,10 +62,13 @@ def max_seq_len_for_budget(
 
     `budget_bytes` resolution mirrors `plan_fit` exactly -- see `_resolve_budget_bytes`.
 
-    Raises `DoesNotFitError` if the config does not fit even at the floor
-    (`seq_len=1`) -- never silently returns 0. If the config still fits at
-    `seq_ceiling`, returns `seq_ceiling` (documented saturation, not a search failure).
+    Raises `PlanInputError` if `seq_ceiling < 1`, and `DoesNotFitError` if the config
+    does not fit even at the floor (`seq_len=1`) -- never silently returns 0. If the config
+    still fits at `seq_ceiling`, returns `seq_ceiling` (documented saturation, not a
+    search failure).
     """
+    if seq_ceiling < 1:
+        raise PlanInputError(f"seq_ceiling must be >= 1 (got {seq_ceiling})")
     calib = load_calibration()
     budget = _resolve_budget_bytes(budget_bytes)
     floor_peak = _peak(shape, replace(cfg, seq_len=1), calib)
@@ -66,14 +77,11 @@ def max_seq_len_for_budget(
             f"no seq_len >= 1 fits budget_bytes={budget} (predicted peak at seq_len=1 "
             f"is {floor_peak} bytes)"
         )
-    lo, hi = 1, seq_ceiling
-    while lo < hi:
-        mid = (lo + hi + 1) // 2
-        if _peak(shape, replace(cfg, seq_len=mid), calib) <= budget:
-            lo = mid
-        else:
-            hi = mid - 1
-    return lo
+    model = _train_step_model(shape, calib)
+    return max_int_within_budget(
+        model, lambda s: _resolve_lora_layers(replace(cfg, seq_len=s), shape),
+        lo=1, hi=seq_ceiling, budget_bytes=budget,
+    )
 
 
 def max_batch_for_budget(
@@ -90,6 +98,8 @@ def max_batch_for_budget(
     never silently returns 0. If the config still fits at `batch_ceiling`, returns
     `batch_ceiling` (documented saturation, not a search failure).
     """
+    if batch_ceiling < 1:
+        raise PlanInputError(f"batch_ceiling must be >= 1 (got {batch_ceiling})")
     calib = load_calibration()
     budget = _resolve_budget_bytes(budget_bytes)
     floor_peak = _peak(shape, replace(cfg, batch=1), calib)
@@ -98,11 +108,8 @@ def max_batch_for_budget(
             f"no batch >= 1 fits budget_bytes={budget} (predicted peak at batch=1 is "
             f"{floor_peak} bytes)"
         )
-    lo, hi = 1, batch_ceiling
-    while lo < hi:
-        mid = (lo + hi + 1) // 2
-        if _peak(shape, replace(cfg, batch=mid), calib) <= budget:
-            lo = mid
-        else:
-            hi = mid - 1
-    return lo
+    model = _train_step_model(shape, calib)
+    return max_int_within_budget(
+        model, lambda b: _resolve_lora_layers(replace(cfg, batch=b), shape),
+        lo=1, hi=batch_ceiling, budget_bytes=budget,
+    )

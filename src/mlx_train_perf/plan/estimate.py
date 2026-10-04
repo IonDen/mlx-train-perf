@@ -37,10 +37,8 @@ from collections.abc import Callable, Iterator
 from dataclasses import dataclass, replace
 from typing import Any, Literal
 
-import mlx.core as mx
-
-from mlx_train_perf.core.guards import clamped_caps
 from mlx_train_perf.errors import PlanInputError
+from mlx_train_perf.memfit.model import MemoryModel, Phase, estimate
 from mlx_train_perf.plan.calibration import Calibration, load_calibration
 
 _DTYPE_BYTES: dict[str, int] = {"float32": 4, "bfloat16": 2, "float16": 2}
@@ -330,6 +328,48 @@ def _loss_bytes(cfg: TrainConfig, shape: ModelShape, calib: Calibration) -> int:
     return base
 
 
+def _resolve_lora_layers(cfg: TrainConfig, shape: ModelShape) -> TrainConfig:
+    """mlx-lm's `num_layers: -1` means "adapt every layer": price it as `shape.layers`.
+    Any other negative count has no meaning and is refused. Only the estimate path
+    resolves it; `fit_memory_coeffs` keeps the literal arithmetic its shipped
+    coefficients were fitted with (those fits absorbed the old negative terms, which
+    leaves them slightly conservative)."""
+    if cfg.lora_layers == -1:
+        return replace(cfg, lora_layers=shape.layers)
+    if cfg.lora_layers < -1:
+        raise PlanInputError(
+            f"lora_layers must be >= 0, or -1 for every layer (got {cfg.lora_layers})"
+        )
+    return cfg
+
+
+def _validate_cfg(cfg: TrainConfig) -> None:
+    """Refuse values with no meaning before any term runs, so a bad number is a
+    `PlanInputError` naming the field instead of a bare memfit error or a bogus peak.
+    Term-level errors (dtype, attention/impl, loss) are NOT checked here: they raise from
+    their own terms, in term order."""
+    if cfg.batch < 1:
+        raise PlanInputError(f"batch must be >= 1 (got {cfg.batch})")
+    if cfg.seq_len < 1:
+        raise PlanInputError(f"seq_len must be >= 1 (got {cfg.seq_len})")
+    if cfg.lora_rank < 0:
+        raise PlanInputError(f"lora_rank must be >= 0 (got {cfg.lora_rank})")
+
+
+def _train_step_model(shape: ModelShape, calib: Calibration) -> MemoryModel[TrainConfig]:
+    """The LoRA train step as a one-phase memfit model. Term order is the component order
+    AND the error order (dtype, then attention/impl, then loss) -- keep it."""
+    return MemoryModel(phases=(Phase(name="train_step", terms={
+        "weights": lambda cfg: _weights_bytes(shape, _dtype_bytes(cfg.dtype)),
+        "base": lambda _cfg: int(calib.base_transient_bytes),
+        "lora": lambda cfg: _lora_bytes(cfg, shape),
+        "optimizer": lambda cfg: _optimizer_bytes(cfg, shape, calib),
+        "activations": lambda cfg: _activation_bytes(cfg, shape, calib),
+        "attention": lambda cfg: _attention_bytes(cfg, shape, calib),
+        "loss": lambda cfg: _loss_bytes(cfg, shape, calib),
+    }),), overhead_frac=calib.overhead_frac)
+
+
 def estimate_peak(
     shape: ModelShape, cfg: TrainConfig, calib: Calibration
 ) -> tuple[int, dict[str, int]]:
@@ -341,19 +381,9 @@ def estimate_peak(
     allocator's retained cache pool is not included. A caller budgeting full resident
     footprint should bound that pool with `mx.set_cache_limit(...)` in the training
     process."""
-    dtype_size = _dtype_bytes(cfg.dtype)
-    components = {
-        "weights": _weights_bytes(shape, dtype_size),
-        "base": int(calib.base_transient_bytes),
-        "lora": _lora_bytes(cfg, shape),
-        "optimizer": _optimizer_bytes(cfg, shape, calib),
-        "activations": _activation_bytes(cfg, shape, calib),
-        "attention": _attention_bytes(cfg, shape, calib),
-        "loss": _loss_bytes(cfg, shape, calib),
-    }
-    subtotal = sum(components.values())
-    predicted_peak = int(subtotal * (1 + calib.overhead_frac))
-    return predicted_peak, components
+    _validate_cfg(cfg)
+    est = estimate(_train_step_model(shape, calib), _resolve_lora_layers(cfg, shape))
+    return est.peak_bytes, est.components["train_step"]
 
 
 def _suggestion_candidates(cfg: TrainConfig) -> Iterator[TrainConfig]:
@@ -395,6 +425,10 @@ def plan_fit(
     """
     calib = load_calibration()
     if budget_bytes is None:
+        import mlx.core as mx  # noqa: PLC0415 -- device query only; keeps plan mlx-free
+
+        from mlx_train_perf.core.guards import clamped_caps  # noqa: PLC0415
+
         dev_max = int(mx.device_info()["max_recommended_working_set_size"])
         budget_bytes, _ = clamped_caps(dev_max)
     peak, components = estimate_peak(shape, cfg, calib)

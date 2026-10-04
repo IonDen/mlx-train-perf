@@ -1,3 +1,6 @@
+from mlx_train_perf.memfit import errors as _memfit_errors
+
+
 class MlxTrainPerfError(Exception):
     """Root of all mlx-train-perf errors."""
 
@@ -18,11 +21,11 @@ class LossInputError(MlxTrainPerfError):
     """Shape/dtype/target-range validation failure at the loss boundary."""
 
 
-class PlanInputError(MlxTrainPerfError):
+class PlanInputError(MlxTrainPerfError, _memfit_errors.MemfitInputError):
     """Shape/config validation failure in the fit planner (e.g. an unrecognized dtype)."""
 
 
-class DoesNotFitError(MlxTrainPerfError):
+class DoesNotFitError(MlxTrainPerfError, _memfit_errors.DoesNotFitError):
     """Planner verdict: predicted peak exceeds the memory budget."""
 
 

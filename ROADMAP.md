@@ -2,6 +2,21 @@
 
 ## Released
 
+### 0.9.0 - 2026-10-03
+- `mlx_train_perf.memfit`, a memory-fit toolkit that does not need MLX. You describe a
+  workload as phases of named terms, estimate its peak, search for the largest setting that
+  fits a budget, store fitted coefficients in calibration files that record what they
+  measured, fit them with least squares (the new `fit` extra installs numpy), and score
+  predictions against a hold-out before trusting them. The
+  [memory model page](https://github.com/IonDen/mlx-train-perf/blob/main/docs/memory-model.md)
+  walks through it with a worked image-model example.
+- `mlx_train_perf.machine` is public: `detect_machine()` reports the chip, RAM, the
+  recommended GPU working set and the GPU architecture, next to the pre-flight go/no-go
+  decision the benchmark kit already used.
+- The LoRA planner now runs on the same core. Every number it returns is unchanged.
+- The planner counts every layer for `lora_layers=-1` instead of pricing it as a negative
+  adapter cost, and refuses a batch, sequence length or rank that has no meaning.
+
 ### 0.8.0 - 2026-09-17
 - Optional external supervision for benchmark runs. `run_conditions(..., guard=...)` places each
   condition worker under [mlx-guard](https://github.com/IonDen/mlx-guard): an OS-accounted

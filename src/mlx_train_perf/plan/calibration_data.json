@@ -1,13 +1,29 @@
 {
-  "base_transient_bytes": 1600848316.0,
-  "act_bytes_per_token_hidden_layer_ckpt": 1.867,
-  "act_bytes_per_token_hidden_layer_full": 85.12,
-  "attn_bytes_per_head_token2": 8.716,
-  "attn_bytes_per_head_token_flash_kernel": 21145.736137516276,
-  "attn_bytes_per_head_token_flash_stock": 34125.414004182945,
-  "optimizer_bytes_per_param": 8.0,
-  "overhead_frac": 0.1,
-  "naive_loss_bytes_per_nv": 12.0,
+  "format": "mlx-train-perf.calibration",
+  "schema_version": 1,
+  "measured_quantity": "mlx_active_marginal",
+  "coefficients": {
+    "base_transient_bytes": 1600848316.0,
+    "act_bytes_per_token_hidden_layer_ckpt": 1.867,
+    "act_bytes_per_token_hidden_layer_full": 85.12,
+    "attn_bytes_per_head_token2": 8.716,
+    "attn_bytes_per_head_token_flash_kernel": 21145.736137516276,
+    "attn_bytes_per_head_token_flash_stock": 34125.414004182945,
+    "optimizer_bytes_per_param": 8.0,
+    "overhead_frac": 0.1,
+    "naive_loss_bytes_per_nv": 12.0
+  },
+  "terms": {
+    "base_transient_bytes": "constant per run",
+    "act_bytes_per_token_hidden_layer_ckpt": "a * batch*seq*hidden*layers (grad_checkpoint=True)",
+    "act_bytes_per_token_hidden_layer_full": "a * batch*seq*hidden*layers (grad_checkpoint=False)",
+    "attn_bytes_per_head_token2": "a * batch*heads*seq^2 (stock attention, one layer)",
+    "attn_bytes_per_head_token_flash_kernel": "a * batch*heads*seq (flash, fused loss)",
+    "attn_bytes_per_head_token_flash_stock": "a * batch*heads*seq (flash, stock loss)",
+    "optimizer_bytes_per_param": "analytic AdamW, two fp32 moments",
+    "overhead_frac": "fixed safety margin",
+    "naive_loss_bytes_per_nv": "a * rows*vocab (naive loss)"
+  },
   "provenance": {
     "machine": "arm64",
     "macos": "26.5.1-26.5.2",
@@ -17,5 +33,6 @@
     "flash_fit": "envelope",
     "refit_date": "2026-08-26",
     "refit_macos": "26.6.2"
-  }
+  },
+  "holdout": null
 }

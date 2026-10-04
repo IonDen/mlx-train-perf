@@ -31,6 +31,8 @@ Changelog = "https://github.com/IonDen/mlx-train-perf/blob/main/CHANGELOG.md"
 Issues = "https://github.com/IonDen/mlx-train-perf/issues"
 
 [project.optional-dependencies]
+# Least-squares fit over named features (memfit.fit.fit_linear): needed for planner recalibration.
+fit = ["numpy"]
 # transformers>=5.13 breaks `import mlx_lm` outright: mlx_lm/tokenizer_utils.py:505 calls
 # AutoTokenizer.register("NewlineTokenizer", ...) with a string class name, and
 # transformers 5.13's auto_factory.py:680 requires an actual class object there
@@ -53,9 +55,10 @@ source = "vcs"
 
 [tool.hatch.build.targets.sdist]
 # Explicit allowlist: the repo carries gitignored working-state (.superpowers/ SDD
-# ledger, .codegraph/ index, docs/, _artifacts/, CLAUDE.md) that hatchling would
-# otherwise sweep into the sdist. Ship only the source, tests, bench scripts, CI, and
-# the user-facing docs. (The wheel already ships just the `mlx_train_perf` package.)
+# ledger, .codegraph/ index, docs/superpowers/, _artifacts/, CLAUDE.md) and untracked
+# paper drafts (docs/papers/) that hatchling would otherwise sweep into the sdist. Ship
+# only the source, tests, bench scripts, CI, and the user-facing docs. (The wheel already
+# ships just the `mlx_train_perf` package.)
 include = [
     "/src",
     "/tests",
@@ -66,6 +69,7 @@ include = [
     "/CHANGELOG.md",
     "/ROADMAP.md",
     "/LICENSE",
+    "/docs/memory-model.md",
     # The community contribution kit's submission how-to (backlog 0015).
     "/community-benchmarks/README.md",
 ]

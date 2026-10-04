@@ -1124,3 +1124,31 @@ def test_flash_never_under_predicts_fused_loss_anchors_past_8192() -> None:
             f"under-predicted the fused-loss anchor at seq_len={seq_len}: "
             f"predicted={predicted_total} measured_total={measured_total}"
         )
+
+
+# --- lora_layers=-1 means "every layer" (mlx-lm's convention) ------------
+
+
+def _lora_cfg(lora_layers: int) -> TrainConfig:
+    return TrainConfig(batch=1, seq_len=256, dtype="bfloat16", lora_rank=8,
+                       lora_layers=lora_layers, grad_checkpoint=True, impl="kernel")
+
+
+def test_lora_layers_minus_one_prices_every_layer() -> None:
+    """Micro shape: 2 layers x 2 modules x 2 matrices x rank 8 x hidden 64 = 4096 LoRA
+    params -> 8192 bf16 bytes, and AdamW's 8 bytes/param -> 32768. Treating -1 literally
+    gave -8192 / -32768: a peak low by twice the adapter cost."""
+    _, comps = estimate_peak(_shape(), _lora_cfg(-1), load_calibration())
+    assert comps["lora"] == 8192
+    assert comps["optimizer"] == 32768
+
+
+def test_lora_layers_minus_one_equals_the_explicit_layer_count() -> None:
+    calib = load_calibration()
+    assert estimate_peak(_shape(), _lora_cfg(-1), calib) == estimate_peak(
+        _shape(), _lora_cfg(2), calib)
+
+
+def test_lora_layers_below_minus_one_is_refused() -> None:
+    with pytest.raises(PlanInputError, match="lora_layers"):
+        estimate_peak(_shape(), _lora_cfg(-2), load_calibration())

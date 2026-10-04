@@ -4,6 +4,50 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0] - 2026-10-03
+
+Adds `mlx_train_perf.memfit`, a memory-fit toolkit for any pipeline that runs in phases, and makes
+`mlx_train_perf.machine` public. The LoRA planner now runs on the same core, with every number
+unchanged. `machine` and `memfit` follow semantic versioning from this release: while the
+project is below 1.0, a breaking change to either bumps the minor version and is listed under
+Changed.
+
+### Added
+- `mlx_train_perf.memfit`: `MemoryModel` and `Phase` describe a pipeline as named byte terms,
+  `estimate` and `fits` give the predicted peak and the phase that sets it, and
+  `max_int_within_budget` finds the largest integer setting that fits a budget. Calibration
+  files (`load_calibration_file`, `dump_calibration_file`) record what a set of coefficients
+  measured and refuse to load for a different quantity. `fit_linear` fits coefficients from
+  measurements and refuses rank-deficient, non-finite, non-positive or negative-coefficient
+  inputs. `write_holdout_predictions` and `score_holdout` run a predict-then-measure check with
+  an asymmetric band; predictions are written once and never overwritten. Import from
+  `mlx_train_perf.memfit`; the names are not re-exported at the package root. A walkthrough is
+  in `docs/memory-model.md`.
+- `mlx_train_perf.machine` is now a documented public module. `detect_machine()` returns a
+  `MachineInfo` with the chip, RAM, the GPU working set Metal recommends and the GPU
+  architecture, and raises `MachineDetectionError` when either memory figure is missing.
+  `evaluate_preflight` and `classify_memory_pressure` are available alongside it.
+- A new `fit` extra (`pip install "mlx-train-perf[fit]"`) installs numpy for `fit_linear`.
+
+### Changed
+- `import mlx_train_perf`, `mlx_train_perf.memfit` and `mlx_train_perf.machine` no longer load
+  MLX. The loss API at the package root loads on first use.
+- The LoRA planner's calibration file moved to the memfit format. Every coefficient is
+  unchanged, so planner output is the same.
+- Community benchmark artifacts use schema 2: the machine block gains the recommended working
+  set and the GPU architecture. Schema-1 files still aggregate.
+- `evaluate_preflight` takes `ceiling_warning=` (a string or `None`) instead of `ceiling=`.
+- `detect_machine` takes `device_info_reader=` instead of `ram_bytes_reader=`.
+- `max_seq_len_for_budget(..., seq_ceiling=)` and `max_batch_for_budget(..., batch_ceiling=)`
+  now raise `PlanInputError` (which is also a `memfit.MemfitInputError`) when that search
+  limit is below 1. They used to return 1.
+- The planner now refuses `batch < 1`, `seq_len < 1` and `lora_rank < 0` with
+  `PlanInputError`. It used to return a number.
+
+### Fixed
+- The planner priced `lora_layers=-1`, mlx-lm's setting for every layer, as a negative adapter
+  cost. It now counts every layer, and other negative values are refused.
+
 ## [0.8.0] - 2026-09-17
 
 Benchmark runs can now put every condition worker under [mlx-guard](https://github.com/IonDen/mlx-guard),
@@ -404,6 +448,7 @@ Silicon, with an mlx-lm adapter, a RAM-fit planner, and a benchmark harness.
   `ROADMAP.md`).
 - Architectures: Llama and Qwen3 only. Training: LoRA / QLoRA. Apple Silicon only.
 
+[0.9.0]: https://github.com/IonDen/mlx-train-perf/releases/tag/v0.9.0
 [0.8.0]: https://github.com/IonDen/mlx-train-perf/releases/tag/v0.8.0
 [0.7.0]: https://github.com/IonDen/mlx-train-perf/releases/tag/v0.7.0
 [0.6.0]: https://github.com/IonDen/mlx-train-perf/releases/tag/v0.6.0

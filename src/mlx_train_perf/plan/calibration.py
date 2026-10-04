@@ -1,6 +1,6 @@
 """Calibration constants for the fit planner.
 
-Loaded from `calibration_data.json`, a versioned data file that carries its own
+Loaded from `calibration_data.json`, a file in the memfit calibration format that carries its own
 measurement provenance (machine, macOS, mlx version, measured date) so a `FitReport`
 can always show where its non-analytic constants came from. The memory coefficients
 (`base_transient_bytes` and the activation/attention terms) are MEASURED -- fit by
@@ -10,9 +10,15 @@ empirical fit to a persisted benchmark artifact (see its field docstring).
 `optimizer_bytes_per_param` is analytic (AdamW: two fp32 moments) and `overhead_frac`
 is a fixed safety margin -- those two are the only non-measured constants.
 """
-import json
 from dataclasses import dataclass
 from importlib import resources
+
+from mlx_train_perf.errors import PlanInputError
+from mlx_train_perf.memfit.calibration import (
+    MLX_ACTIVE_MARGINAL,
+    CalibrationFile,
+    load_calibration_file,
+)
 
 _PACKAGE = "mlx_train_perf.plan"
 _DATA_FILE = "calibration_data.json"
@@ -80,19 +86,33 @@ class Calibration:
     provenance: dict[str, str]
 
 
-def load_calibration() -> Calibration:
-    raw = json.loads(resources.files(_PACKAGE).joinpath(_DATA_FILE).read_text())
+_FIELDS = ("base_transient_bytes", "act_bytes_per_token_hidden_layer_ckpt",
+           "act_bytes_per_token_hidden_layer_full", "attn_bytes_per_head_token2",
+           "attn_bytes_per_head_token_flash_kernel", "attn_bytes_per_head_token_flash_stock",
+           "optimizer_bytes_per_param", "overhead_frac", "naive_loss_bytes_per_nv")
+
+
+def calibration_from_file(cal: CalibrationFile) -> Calibration:
+    """The LoRA planner's `Calibration` from a memfit calibration file; every one of the
+    nine coefficients is required."""
+    missing = [name for name in _FIELDS if name not in cal.coefficients]
+    if missing:
+        raise PlanInputError(f"calibration file lacks coefficients {missing}")
+    c = cal.coefficients
     return Calibration(
-        base_transient_bytes=float(raw["base_transient_bytes"]),
-        act_bytes_per_token_hidden_layer_ckpt=float(raw["act_bytes_per_token_hidden_layer_ckpt"]),
-        act_bytes_per_token_hidden_layer_full=float(raw["act_bytes_per_token_hidden_layer_full"]),
-        attn_bytes_per_head_token2=float(raw["attn_bytes_per_head_token2"]),
-        attn_bytes_per_head_token_flash_kernel=float(
-            raw["attn_bytes_per_head_token_flash_kernel"]),
-        attn_bytes_per_head_token_flash_stock=float(
-            raw["attn_bytes_per_head_token_flash_stock"]),
-        optimizer_bytes_per_param=float(raw["optimizer_bytes_per_param"]),
-        overhead_frac=float(raw["overhead_frac"]),
-        naive_loss_bytes_per_nv=float(raw["naive_loss_bytes_per_nv"]),
-        provenance=dict(raw["provenance"]),
+        base_transient_bytes=c["base_transient_bytes"],
+        act_bytes_per_token_hidden_layer_ckpt=c["act_bytes_per_token_hidden_layer_ckpt"],
+        act_bytes_per_token_hidden_layer_full=c["act_bytes_per_token_hidden_layer_full"],
+        attn_bytes_per_head_token2=c["attn_bytes_per_head_token2"],
+        attn_bytes_per_head_token_flash_kernel=c["attn_bytes_per_head_token_flash_kernel"],
+        attn_bytes_per_head_token_flash_stock=c["attn_bytes_per_head_token_flash_stock"],
+        optimizer_bytes_per_param=c["optimizer_bytes_per_param"],
+        overhead_frac=c["overhead_frac"],
+        naive_loss_bytes_per_nv=c["naive_loss_bytes_per_nv"],
+        provenance=dict(cal.provenance),
     )
+
+
+def load_calibration() -> Calibration:
+    return calibration_from_file(load_calibration_file(
+        resources.files(_PACKAGE).joinpath(_DATA_FILE), expect_quantity=MLX_ACTIVE_MARGINAL))
