@@ -10,6 +10,7 @@ empirical fit to a persisted benchmark artifact (see its field docstring).
 `optimizer_bytes_per_param` is analytic (AdamW: two fp32 moments) and `overhead_frac`
 is a fixed safety margin -- those two are the only non-measured constants.
 """
+import re
 from dataclasses import dataclass
 from importlib import resources
 
@@ -22,6 +23,45 @@ from mlx_train_perf.memfit.calibration import (
 
 _PACKAGE = "mlx_train_perf.plan"
 _DATA_FILE = "calibration_data.json"
+
+# The mlx versions the STOCK attention term (`attn_bytes_per_head_token2`, the quadratic
+# O(N^2) SDPA-backward coefficient) was measured on. On mlx 0.32.4 stock causal
+# attention's backward memory grows linearly with seq_len, so the quadratic term
+# over-states the stock causal peak at long context there. Kept apart from
+# `_compat.VERIFIED_MLX_VERSIONS`: a version can be kernel-verified without this
+# coefficient being re-measured on it.
+STOCK_ATTENTION_CALIBRATED_MLX_VERSIONS: frozenset[str] = frozenset({"0.31.2", "0.32.0"})
+
+# The first mlx release whose stock attention backward memory changed (see above).
+_LINEAR_STOCK_BACKWARD_MLX: tuple[int, int, int] = (0, 32, 4)
+
+
+def _release_triple(mlx_version: str) -> tuple[int, int, int] | None:
+    """The leading `major.minor.patch` of a version string as ints ("0.33.0.dev1" ->
+    (0, 33, 0)), or None when it does not start with three numeric parts."""
+    match = re.match(r"(\d+)\.(\d+)\.(\d+)", mlx_version)
+    if match is None:
+        return None
+    major, minor, patch = (int(part) for part in match.groups())
+    return major, minor, patch
+
+
+def stock_attention_calibration_note(mlx_version: str) -> str | None:
+    """The warning text for a stock-attention estimate on `mlx_version`, or None when
+    that version is one the stock attention term was calibrated on. Only from mlx 0.32.4
+    on does the text name a direction (an over-statement for causal attention); for any
+    other uncalibrated version it says only that the term was not calibrated there."""
+    if mlx_version in STOCK_ATTENTION_CALIBRATED_MLX_VERSIONS:
+        return None
+    calibrated = " and ".join(sorted(STOCK_ATTENTION_CALIBRATED_MLX_VERSIONS))
+    head = (f"the stock attention memory term was calibrated on mlx {calibrated}; the "
+            f"installed mlx is {mlx_version}")
+    release = _release_triple(mlx_version)
+    if release is not None and release >= _LINEAR_STOCK_BACKWARD_MLX:
+        return (f"{head}. mlx 0.32.4 changed stock attention's backward memory behavior, "
+                "so for causal attention this estimate likely over-states the peak at "
+                "long context.")
+    return f"{head}, on which it was not calibrated, so this estimate may be off."
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

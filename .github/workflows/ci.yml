@@ -24,7 +24,7 @@ jobs:
       - run: uv run ruff check src/ tests/
       - name: Tracked artifacts carry no local paths
         run: |
-          if grep -rlE '/Users/|/home/' _artifacts/attention_fwd_rungs _artifacts/attention_bwd_rungs _artifacts/quant_opt_rungs; then
+          if grep -rlE '/(Users|home)/' _artifacts; then
             echo "tracked artifact files must not contain absolute home paths" >&2
             exit 1
           fi

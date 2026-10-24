@@ -13,6 +13,7 @@ small pure functions; `main` and the `_cmd_*` handlers are thin glue around them
 import argparse
 import json
 import sys
+import warnings
 from collections.abc import Callable
 from dataclasses import asdict, replace
 from pathlib import Path
@@ -28,6 +29,7 @@ from mlx_train_perf.contribute import (
 )
 from mlx_train_perf.errors import (
     BenchInputError,
+    CalibrationWarning,
     DoesNotFitError,
     MlxTrainPerfError,
     PlanInputError,
@@ -132,7 +134,33 @@ def _plan_exit_code(fit_report: FitReport) -> int:
     return 0 if fit_report.fits else 1
 
 
+def _surface_plan_warnings(caught: list[warnings.WarningMessage]) -> None:
+    """Prints each distinct planner `CalibrationWarning` once on stderr, in the CLI's
+    own `warning: ...` form (one `plan --max-seq` makes two planner calls, which raise
+    the same warning twice). Any other warning was recorded only because the caller's
+    filters already let it through, so it is shown as is with `warnings.showwarning`,
+    not run through the filters a second time."""
+    calibration = [str(w.message) for w in caught if issubclass(w.category, CalibrationWarning)]
+    for message in dict.fromkeys(calibration):
+        print(f"warning: {message}", file=sys.stderr)
+    for w in caught:
+        if not issubclass(w.category, CalibrationWarning):
+            warnings.showwarning(w.message, w.category, w.filename, w.lineno, w.file, w.line)
+
+
 def _cmd_plan(args: argparse.Namespace) -> int:
+    """Runs `plan`, surfacing the planner's calibration warnings on stderr. The exit code
+    is `_run_plan`'s, unchanged by any warning."""
+    caught: list[warnings.WarningMessage] = []
+    try:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", CalibrationWarning)
+            return _run_plan(args)
+    finally:
+        _surface_plan_warnings(caught)
+
+
+def _run_plan(args: argparse.Namespace) -> int:
     shape = _load_model_shape(args.config)
     shape = _apply_quant_override(shape, args.quant_bits)
     budget_bytes = int(args.budget_gb * 1024**3) if args.budget_gb is not None else None

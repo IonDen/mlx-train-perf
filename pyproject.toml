@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "mlx-train-perf"
 dynamic = ["version"]
-description = "Train longer sequences on your Mac: O(N)-memory attention, logit-free cross-entropy, and sequence packing for MLX LoRA fine-tuning"
+description = "Logit-free cross-entropy, sequence packing, Qwen 3.5 GatedDelta training and a RAM-fit planner for MLX LoRA fine-tuning"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
@@ -14,7 +14,10 @@ keywords = [
     "mlx", "apple-silicon", "lora", "qlora", "fine-tuning", "flash-attention",
     "metal", "cross-entropy", "long-context", "sequence-packing", "llm-training",
 ]
-dependencies = ["mlx>=0.32.0,<0.33"]
+# mlx is pinned exactly: the kernel contract is verified on mlx 0.31.2 and 0.32.0 only
+# (`_compat.VERIFIED_MLX_VERSIONS`). mlx 0.32.4 changed the recurrent path's numerics and
+# is not verified yet, so a range here would let a fresh install resolve a refused mlx.
+dependencies = ["mlx==0.32.0"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Programming Language :: Python :: 3.11",
@@ -37,7 +40,10 @@ fit = ["numpy"]
 # AutoTokenizer.register("NewlineTokenizer", ...) with a string class name, and
 # transformers 5.13's auto_factory.py:680 requires an actual class object there
 # (AttributeError: 'str' object has no attribute '__module__'). Verified clean on
-# 5.0.0/5.4.0/5.8.0/5.11.0/5.12.0; verified broken on 5.13.0.
+# 5.0.0/5.4.0/5.8.0/5.11.0/5.12.0; verified broken on 5.13.0 (checked against mlx-lm 0.31.3).
+# mlx-lm stays below 0.32: mlx-lm 0.32.x changed the qwen3_5 GatedDelta code
+# (gated_delta_update, GatedDeltaNet and RMSNormGated among it) that the recurrent path
+# mirrors, so the cap moves only after the mirror and its parity tests are redone.
 mlx-lm = ["mlx-lm>=0.31.3,<0.32", "transformers>=5.0,<5.13"]
 probe = ["pyobjc-framework-Metal"]
 # Optional external supervision for bench workers (`run_conditions(..., guard=...)`).
@@ -45,7 +51,7 @@ probe = ["pyobjc-framework-Metal"]
 # contract, and the supervisor reports a run leaves behind are only readable by the package
 # version that wrote them. Apple Silicon wheels only; no marker here on purpose, so
 # installing the extra anywhere else fails loudly instead of silently doing nothing.
-guard = ["mlx-guard==0.2.0"]
+guard = ["mlx-guard==0.3.0"]
 
 [project.scripts]
 mlx-train-perf = "mlx_train_perf.cli:main"
@@ -90,11 +96,11 @@ include = [
 dev = [
     "pytest>=8", "pytest-cov", "hypothesis", "ruff", "mypy", "basedpyright",
     # transformers>=5.13 breaks `import mlx_lm` (see the mlx-lm extra above for the
-    # verified-broken/verified-clean version detail); pinned here too since dev installs
-    # both groups.
+    # verified-broken/verified-clean version detail); the mlx-lm and transformers pins
+    # here match the extra exactly, so the dev environment tests what the extra promises.
     "mlx-lm>=0.31.3,<0.32", "transformers>=5.0,<5.13", "pyobjc-framework-Metal",
     # The real-supervisor test lane (`--run-guard`); same exact pin as the `guard` extra.
-    "mlx-guard==0.2.0",
+    "mlx-guard==0.3.0",
 ]
 
 [tool.ruff]

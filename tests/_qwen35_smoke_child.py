@@ -134,11 +134,11 @@ class _RecordingCallback:
 
 def main() -> None:
     from mlx.optimizers import Adam  # noqa: PLC0415 -- lazy: smoke-gated heavy deps
-    from mlx_lm import load  # noqa: PLC0415
     from mlx_lm.tuner.trainer import TrainingArgs, train  # noqa: PLC0415
     from mlx_lm.tuner.utils import linear_to_lora_layers  # noqa: PLC0415
 
     from mlx_train_perf.adapters.mlx_lm import make_loss_fn  # noqa: PLC0415
+    from mlx_train_perf.adapters.model_files import load_mlx_lm_model  # noqa: PLC0415
 
     scratch = Path(sys.argv[1])
     scratch.mkdir(parents=True, exist_ok=True)
@@ -156,7 +156,7 @@ def main() -> None:
         on_breach=_on_memory_breach,
     )
 
-    model, _tokenizer = load(_MODEL_REPO)
+    model, _tokenizer = load_mlx_lm_model(_MODEL_REPO)  # refuses a `model_file` config
     mx.eval(model.parameters())
     _cast_bf16_preserving_a_log(model)  # BEFORE enable -- see module docstring
     enable_gated_delta_training(model)

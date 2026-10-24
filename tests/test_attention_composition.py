@@ -12,26 +12,30 @@ Proves, on tiny shapes, the make-or-break unknowns BEFORE any attention kernel e
 (4) the GQA head-grouping convention of `mx.fast.scaled_dot_product_attention` is the
     contiguous `q_head // group_size` mapping, not the interleaved `q_head % Hkv` one
     (pinned here; `attention/reference.py::kv_head_for` implements what this proves);
-(5) the installed mlx's SDPA training backward is still O(N^2) — the moat this release
-    exists to fix. If this test ever FAILS, upstream shipped a memory-efficient backward
-    and the 0.2.0 strategy needs a fresh look (that is a feature of the test).
+(5) the memory class of the installed mlx's SDPA training backward: bounded as O(N^2)
+    on the mlx versions where that was measured (0.31.2, 0.32.0), recorded elsewhere.
 
 Sentinel discipline: the toy vjp multiplies the true gradient by _SENTINEL, so a sentinel-
 valued gradient PROVES our vjp produced it (autodiff would give the unscaled value). All
 assertions are on gradient VALUES or measured peaks — never on Python trace-time side
 effects, which are unobservable under mx.compile.
 """
+
 import math
 import subprocess
 import sys
+import warnings
+from collections.abc import Callable
 from pathlib import Path
 
 import mlx.core as mx
 import pytest
 from conftest import needs_comparative_peak_room
 
+from mlx_train_perf._compat import _installed_mlx_version
 from mlx_train_perf.attention.api import flash_attention
 from mlx_train_perf.attention.reference import math_attention
+from mlx_train_perf.plan.calibration import STOCK_ATTENTION_CALIBRATED_MLX_VERSIONS
 
 pytest.importorskip("mlx_lm")
 
@@ -131,7 +135,7 @@ def test_checkpoint_recomputes_instead_of_storing_under_compile() -> None:
         # mx.clear_cache() so both windows start from the same allocator state.
         g_fn = mx.compile(mx.grad(fn))
         warm = g_fn(x)
-        mx.eval(warm)     # warmup/trace OUTSIDE the measurement window
+        mx.eval(warm)  # warmup/trace OUTSIDE the measurement window
         mx.synchronize()  # no in-flight frees racing the reset
         mx.clear_cache()
         mx.reset_peak_memory()
@@ -139,7 +143,7 @@ def test_checkpoint_recomputes_instead_of_storing_under_compile() -> None:
         mx.eval(out)
         mx.synchronize()
         peak = int(mx.get_peak_memory())
-        del warm, out     # released only after the snapshot
+        del warm, out  # released only after the snapshot
         return peak
 
     plain_peak = compiled_grad_peak(plain)
@@ -156,7 +160,10 @@ def test_custom_vjp_survives_mlx_lm_class_patch() -> None:
     sentinel custom_function, then runs 2 real compiled train() steps. Its stdout carries
     the verdict."""
     proc = subprocess.run(
-        [sys.executable, str(_CHILD)], capture_output=True, text=True, timeout=300,
+        [sys.executable, str(_CHILD)],
+        capture_output=True,
+        text=True,
+        timeout=300,
         check=False,
     )
     assert proc.returncode == 0, f"child failed:\n{proc.stdout}\n{proc.stderr}"
@@ -174,9 +181,9 @@ def test_gqa_grouping_convention_matches_mlx(hq: int, hkv: int) -> None:
     group = hq // hkv
     q = mx.ones((1, hq, n, d))
     k = mx.ones((1, hkv, n, d))
-    v = mx.stack(
-        [mx.full((n, d), float(j + 1)) for j in range(hkv)], axis=0
-    )[None]  # (1, hkv, n, d)
+    v = mx.stack([mx.full((n, d), float(j + 1)) for j in range(hkv)], axis=0)[
+        None
+    ]  # (1, hkv, n, d)
     o = mx.fast.scaled_dot_product_attention(q, k, v, scale=1.0, mask=None)
     mx.eval(o)
 
@@ -190,10 +197,80 @@ def test_gqa_grouping_convention_matches_mlx(hq: int, hkv: int) -> None:
         )
 
 
-def test_sdpa_backward_is_still_quadratic_on_installed_mlx() -> None:
-    """The moat check, re-run on every installed mlx: fwd+bwd peak grows ~4x per N
-    doubling (O(N^2) backward). If this fails with a ~2x ratio, upstream shipped an
-    O(N)-memory training backward -- celebrate, then re-plan 0.2.0."""
+def _judge_sdpa_peak_ratio(mlx_version: str, peak_small: float, peak_large: float) -> float:
+    """Return peak_large / peak_small. Fails on a broken reading on any version, and on a
+    ratio at or below 3.0 on a version where the O(N^2) backward was observed.
+
+    The observed versions are the planner's STOCK_ATTENTION_CALIBRATED_MLX_VERSIONS (stock
+    SDPA's fwd+bwd peak grew ~4x per N doubling there), imported so this canary and the
+    planner's quadratic term cannot drift apart."""
+    assert peak_small > 0, f"broken measurement: N=1024 peak {peak_small} is not positive"
+    assert peak_large > 0, f"broken measurement: N=2048 peak {peak_large} is not positive"
+    ratio = peak_large / peak_small
+    assert math.isfinite(ratio), f"broken measurement: peak ratio {ratio} is not finite"
+    if mlx_version in STOCK_ATTENTION_CALIBRATED_MLX_VERSIONS:
+        assert ratio > 3.0, (
+            f"SDPA fwd+bwd peak ratio {ratio:.2f} for N 1024->2048 on mlx {mlx_version} is "
+            "not O(N^2)-class, where an O(N^2) backward was measured before"
+        )
+    return ratio
+
+
+@pytest.mark.parametrize("mlx_version", ["0.31.2", "0.32.0"])
+@pytest.mark.parametrize(
+    ("peak_large", "should_fail"),
+    [(299, True), (300, True), (301, False)],
+)
+def test_sdpa_peak_ratio_bound_applies_on_observed_versions(
+    mlx_version: str, peak_large: int, should_fail: bool
+) -> None:
+    """Bug caught: the 3.0 floor drifts (`>` to `>=`, or a shifted constant), or one of
+    the two observed versions drops out of the bounded set, so a broken O(N^2) reading
+    on 0.31.2/0.32.0 would pass. Peaks 100 -> 299/300/301 sit just below, on and just
+    above the floor."""
+    if should_fail:
+        with pytest.raises(AssertionError, match="not O\\(N\\^2\\)-class"):
+            _judge_sdpa_peak_ratio(mlx_version, 100, peak_large)
+    else:
+        assert _judge_sdpa_peak_ratio(mlx_version, 100, peak_large) == pytest.approx(3.01)
+
+
+@pytest.mark.parametrize("mlx_version", ["0.32.4", "0.33.0"])
+def test_sdpa_peak_ratio_is_recorded_unbounded_on_other_versions(mlx_version: str) -> None:
+    """Bug caught: the floor is applied to every version again (or a number is pinned
+    for an unobserved one), so a low reading outside 0.31.2/0.32.0 turns the lane red
+    instead of being recorded."""
+    assert _judge_sdpa_peak_ratio(mlx_version, 100, 119) == pytest.approx(1.19)
+
+
+@pytest.mark.parametrize("mlx_version", ["0.32.0", "0.32.4"])
+@pytest.mark.parametrize(
+    ("peak_small", "peak_large"),
+    [(0, 100), (100, 0), (-5, 100), (100, -5), (100, math.inf)],
+)
+def test_sdpa_peak_ratio_rejects_broken_measurements(
+    mlx_version: str, peak_small: float, peak_large: float
+) -> None:
+    """Bug caught: either positivity check or the finiteness check is dropped (or `>`
+    becomes `>=`), so a zero, negative or infinite peak passes as a recorded ratio on
+    any version."""
+    with pytest.raises(AssertionError, match="broken measurement"):
+        _judge_sdpa_peak_ratio(mlx_version, peak_small, peak_large)
+
+
+def test_sdpa_backward_memory_class_on_installed_mlx(
+    record_property: Callable[[str, object], None],
+) -> None:
+    """Stock attention's fwd+bwd peak at N=1024 vs N=2048, on the installed mlx.
+
+    On mlx 0.31.2 and 0.32.0 the peak grew ~4x per N doubling (an O(N^2) backward),
+    and on those versions the ratio must stay above 3.0. mlx 0.32.4 changed this
+    behaviour. On any other version the ratio is recorded (test property, warning,
+    printed line) for a re-measure and the test passes; a low reading is not a clean
+    O(N) result either, because `reset_peak_memory` counts the live inputs and earlier
+    process state, and this is one N pair, fp32, d=64, with grad on q only. A broken
+    reading (a zero or negative peak, a non-finite ratio) fails on every version.
+    """
     heads, d = 8, 64
 
     def peak_at(n: int) -> int:
@@ -203,21 +280,22 @@ def test_sdpa_backward_is_still_quadratic_on_installed_mlx() -> None:
         mx.eval(q, k, v)
 
         def f(q_: mx.array) -> mx.array:
-            return mx.fast.scaled_dot_product_attention(
-                q_, k, v, scale=1.0, mask="causal"
-            ).sum()
+            return mx.fast.scaled_dot_product_attention(q_, k, v, scale=1.0, mask="causal").sum()
 
         mx.reset_peak_memory()
         g = mx.grad(f)(q)
         mx.eval(g)
         return int(mx.get_peak_memory())
 
+    mlx_version = _installed_mlx_version()
     p1, p2 = peak_at(1024), peak_at(2048)
-    ratio = p2 / p1
-    assert ratio > 3.0, (
-        f"SDPA fwd+bwd peak ratio {ratio:.2f} for N 1024->2048 is not O(N^2)-class -- "
-        "installed mlx may have gained a memory-efficient attention backward"
-    )
+    ratio = _judge_sdpa_peak_ratio(mlx_version, p1, p2)
+    record_property("mlx_version", mlx_version)
+    record_property("sdpa_peak_ratio_n1024_n2048", ratio)
+    line = f"mlx {mlx_version}: SDPA fwd+bwd peak ratio N 1024->2048 = {ratio:.4f}"
+    print(line)
+    if mlx_version not in STOCK_ATTENTION_CALIBRATED_MLX_VERSIONS:
+        warnings.warn(f"{line} (recorded, not bounded on this version)", stacklevel=1)
 
 
 def test_flash_attention_under_compile_and_checkpoint() -> None:

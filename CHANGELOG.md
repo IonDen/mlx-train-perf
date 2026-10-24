@@ -4,6 +4,77 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.1] - 2026-10-24
+
+A compatibility release. It pins mlx to the one version the kernels are verified on, moves the
+optional mlx-guard extra to 0.3.0, warns when the planner runs on an mlx it was not calibrated
+on, adds a committed attention memory benchmark, and closes a model-code exposure in the
+model loaders. mlx 0.32.4 changed stock attention's backward memory behavior: the
+flash-attention path is no longer the main reason to use this library, and the README now
+leads with the fused loss, sequence packing, the Qwen 3.5 GatedDelta path and the planner.
+The comparative attention figures from earlier releases were measured on mlx 0.32.0 and have
+not been re-measured on 0.32.4; the 0.32.4 figures below come from the new benchmark.
+
+### Added
+- `scripts/bench_attention_marginal.py` measures the marginal peak memory of one attention
+  forward plus backward at 1,024 to 8,192 tokens, for stock attention and the flash path,
+  with a causal mask or a packed (block-diagonal) mask. It runs on whichever mlx is installed
+  and keeps one set of artifacts per version. Run
+  `python scripts/bench_attention_marginal.py --mode causal packed` reproduces the mlx 0.32.0
+  figures on the pinned install. The mlx 0.32.4 rows are maintainer measurements: the
+  package refuses its flash path on mlx 0.32.4, so all mlx 0.32.4 rows, stock and flash, were
+  taken with the script's measurement-only override, running this repository's source in an
+  mlx 0.32.4 environment. It is not a user option.
+- The planner API (`estimate_peak`, `plan_fit`, `max_seq_len_for_budget`,
+  `max_batch_for_budget`) emits a `CalibrationWarning` (`mlx_train_perf.errors`) when a
+  stock-attention estimate runs on an mlx outside the versions its attention term was
+  calibrated on, 0.31.2 and 0.32.0, and `mlx-train-perf plan` prints it. The estimate is
+  returned unchanged. The warning names mlx 0.32.4 only when it is running on 0.32.4 or later.
+- `ModelCodeRefusedError`, a new public error in `mlx_train_perf.errors`, raised when a model
+  config names a Python file under `model_file` (see Fixed).
+
+### Changed
+- mlx is pinned exactly: `mlx==0.32.0`, replacing the earlier 0.32 range. The kernels' JIT contract
+  is verified on mlx 0.31.2 and 0.32.0. mlx 0.32.4 is not verified yet, because it changed the
+  numerical results of the Qwen 3.5 GatedDelta path.
+- The `guard` extra pins `mlx-guard==0.3.0`, up from 0.2.0.
+- The `mlx-lm` extra keeps mlx-lm below 0.32. Because of the mlx pin, this package cannot be
+  installed next to mlx-lm 0.32.x, which requires mlx 0.32.2 or newer.
+- The README no longer presents flash attention as the headline. On mlx 0.32.4 the memory
+  advantage of the flash path is gone for causal attention at 8,192 tokens: one attention
+  forward plus backward peaks at 0.682 GiB with stock attention and 0.596 GiB with the flash
+  path (op level, causal). At 1,024 tokens stock attention still uses 4.6× more (0.270
+  against 0.059 GiB). On mlx 0.32.0 the same stock call peaks at 12.532 GiB. The
+  0.32.4 backward is lighter for causal attention only; the committed benchmark measured
+  causal and packed masks, not attention with no mask. The context-length and training-step
+  figures from earlier releases (7,936 against 23,040 tokens, 25.68 against 12.75 GiB) were
+  measured on mlx 0.32.0 and apply to that version. The fused loss and sequence packing are
+  unaffected.
+- Flash attention keeps its memory advantage for packed batches. On both versions, stock
+  attention with a packed mask peaks at 12.469 GiB at 8,192 tokens, because a block-diagonal
+  mask reaches stock attention as a materialized `(N, N)` array and its backward stays
+  quadratic. The flash path peaks at 0.596 GiB on mlx 0.32.0 and 0.659 GiB on 0.32.4 in the
+  committed runs (about 19–21× less). The recorded dK/dV range count and tile are the same in
+  both records, and the cause of the roughly 64 MiB difference is not identified.
+- The README labels the loss-layer memory figure (about 3900× less) as measured on mlx 0.31.2,
+  and states the packing figures with the mlx version, hardware and
+  script they were measured with. It no longer states a token-count crossover between stock
+  and flash attention, because no committed result backs one.
+
+### Fixed
+- A fresh install no longer resolves an mlx this package refuses.
+- Security: mlx-lm 0.31.x executes the Python file that a model's `config.json` names under
+  `model_file` when the model loads, with no opt-in. Before this release, mlx-train-perf
+  reached that path through the benchmark worker (`mlx-train-perf contribute` and the bench
+  runner, with user-named model ids), `examples/finetune_long_context.py`, and two
+  smoke-test loaders. 0.9.1 refuses such a model with `ModelCodeRefusedError` before anything
+  loads. The package's test gate checks that no code passes the mlx-lm 0.32 opt-in flags or
+  calls `sharded_load` or `pipeline_load`, and the loaders refuse `model_file` configs.
+
+### Credit
+- The 0.32.4 change to stock attention is [ml-explore/mlx#4563](https://github.com/ml-explore/mlx/pull/4563),
+  "Adding VJP for the scaled dot product attention.", by @tpegolotti.
+
 ## [0.9.0] - 2026-10-03
 
 Adds `mlx_train_perf.memfit`, a memory-fit toolkit for any pipeline that runs in phases, and makes
@@ -448,6 +519,7 @@ Silicon, with an mlx-lm adapter, a RAM-fit planner, and a benchmark harness.
   `ROADMAP.md`).
 - Architectures: Llama and Qwen3 only. Training: LoRA / QLoRA. Apple Silicon only.
 
+[0.9.1]: https://github.com/IonDen/mlx-train-perf/releases/tag/v0.9.1
 [0.9.0]: https://github.com/IonDen/mlx-train-perf/releases/tag/v0.9.0
 [0.8.0]: https://github.com/IonDen/mlx-train-perf/releases/tag/v0.8.0
 [0.7.0]: https://github.com/IonDen/mlx-train-perf/releases/tag/v0.7.0

@@ -22,6 +22,7 @@ import pytest
 mlx_lm = pytest.importorskip("mlx_lm")
 
 from mlx_train_perf.adapters.mlx_lm import make_packed_loss_fn  # noqa: E402
+from mlx_train_perf.adapters.model_files import load_mlx_lm_model  # noqa: E402
 from mlx_train_perf.attention.wrapper import enable_flash_attention  # noqa: E402
 from mlx_train_perf.data.packing import packed_iterate_batches  # noqa: E402
 
@@ -60,7 +61,7 @@ def test_packed_training_end_to_end_through_compiled_train(tmp_path: Path) -> No
     from mlx_lm.tuner.trainer import TrainingArgs, train  # noqa: PLC0415
     from mlx_lm.tuner.utils import linear_to_lora_layers  # noqa: PLC0415
 
-    model, _tokenizer = mlx_lm.load(_MODEL)
+    model, _tokenizer = load_mlx_lm_model(_MODEL)  # refuses a `model_file` config
     mx.eval(model.parameters())
     enable_flash_attention(model, seq_len=_L, batch_size=_B, packed=True)
     mx.random.seed(7)
