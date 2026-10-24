@@ -33,13 +33,19 @@ trainable, not just a low-rank adapter) are not modeled anywhere in this planner
 Estimates for `lora_rank == 0` configs are therefore optimistic; `lora_rank > 0`
 (LoRA/QLoRA) is the case this planner actually models end to end.
 """
+import warnings
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, replace
+from importlib import metadata
 from typing import Any, Literal
 
-from mlx_train_perf.errors import PlanInputError
+from mlx_train_perf.errors import CalibrationWarning, PlanInputError
 from mlx_train_perf.memfit.model import MemoryModel, Phase, estimate
-from mlx_train_perf.plan.calibration import Calibration, load_calibration
+from mlx_train_perf.plan.calibration import (
+    Calibration,
+    load_calibration,
+    stock_attention_calibration_note,
+)
 
 _DTYPE_BYTES: dict[str, int] = {"float32": 4, "bfloat16": 2, "float16": 2}
 
@@ -370,6 +376,58 @@ def _train_step_model(shape: ModelShape, calib: Calibration) -> MemoryModel[Trai
     }),), overhead_frac=calib.overhead_frac)
 
 
+def _installed_mlx_dist_version() -> str | None:
+    """The installed mlx distribution's version from package metadata, or None when mlx
+    is not installed. Reads metadata only, so the planner never imports mlx for it (the
+    kernel gate's `_compat._installed_mlx_version` imports `mlx.core`; this must not)."""
+    try:
+        return metadata.version("mlx")
+    except metadata.PackageNotFoundError:
+        return None
+
+
+def _warn_if_stock_attention_uncalibrated(cfg: TrainConfig, *, stacklevel: int) -> None:
+    """The one place the stock-attention calibration warning is raised, once per user
+    call: `plan_fit` calls it before any candidate search, and `estimate_peak` and
+    `plan.inverse`'s two searches reach it through `_warned_estimate_peak` (the inverse
+    bisection prices `_train_step_model` directly). Internal loops go through
+    `_estimate_peak`, which never warns. Callers validate `cfg` first, so a refused
+    config raises without a warning. Without mlx installed there is no version to
+    compare, so nothing is raised; the version comes from package metadata, so the
+    planner itself stays mlx-free.
+
+    `stacklevel` counts from this function's caller, as in `warnings.warn`: 1 blames
+    the line calling this function, 2 the line calling that function, and so on."""
+    if cfg.attention != "stock":
+        return
+    version = _installed_mlx_dist_version()
+    if version is None:
+        return
+    note = stock_attention_calibration_note(version)
+    if note is not None:
+        warnings.warn(note, CalibrationWarning, stacklevel=stacklevel + 1)
+
+
+def _estimate_peak(
+    shape: ModelShape, cfg: TrainConfig, calib: Calibration
+) -> tuple[int, dict[str, int]]:
+    """`estimate_peak` without the calibration warning, for the planner's own loops."""
+    _validate_cfg(cfg)
+    est = estimate(_train_step_model(shape, calib), _resolve_lora_layers(cfg, shape))
+    return est.peak_bytes, est.components["train_step"]
+
+
+def _warned_estimate_peak(
+    shape: ModelShape, cfg: TrainConfig, calib: Calibration, *, stacklevel: int
+) -> tuple[int, dict[str, int]]:
+    """`_estimate_peak` behind validation and the calibration warning, for the public
+    entry points. `stacklevel` counts from this function's caller (see
+    `_warn_if_stock_attention_uncalibrated`), so the warning names the user's line."""
+    _validate_cfg(cfg)
+    _warn_if_stock_attention_uncalibrated(cfg, stacklevel=stacklevel + 1)
+    return _estimate_peak(shape, cfg, calib)
+
+
 def estimate_peak(
     shape: ModelShape, cfg: TrainConfig, calib: Calibration
 ) -> tuple[int, dict[str, int]]:
@@ -380,10 +438,13 @@ def estimate_peak(
     (`mx.get_peak_memory` marginals), so the estimate models MLX active memory -- the
     allocator's retained cache pool is not included. A caller budgeting full resident
     footprint should bound that pool with `mx.set_cache_limit(...)` in the training
-    process."""
-    _validate_cfg(cfg)
-    est = estimate(_train_step_model(shape, calib), _resolve_lora_layers(cfg, shape))
-    return est.peak_bytes, est.components["train_step"]
+    process.
+
+    Emits one `CalibrationWarning` when `cfg.attention == "stock"` and the installed mlx
+    is outside the versions the stock attention term was calibrated on; the returned
+    numbers are the same either way. An invalid `cfg` raises `PlanInputError` before
+    any warning."""
+    return _warned_estimate_peak(shape, cfg, calib, stacklevel=2)
 
 
 def _suggestion_candidates(cfg: TrainConfig) -> Iterator[TrainConfig]:
@@ -404,7 +465,7 @@ def _find_fit(
     shape: ModelShape, cfg: TrainConfig, calib: Calibration, budget_bytes: int
 ) -> TrainConfig | None:
     for candidate in _suggestion_candidates(cfg):
-        peak, _ = estimate_peak(shape, candidate, calib)
+        peak, _ = _estimate_peak(shape, candidate, calib)
         if peak <= budget_bytes:
             return candidate
     return None
@@ -422,7 +483,13 @@ def plan_fit(
     caller planning specifically for the stock trainer's own path should pass
     `budget_bytes=int(mx.device_info()["max_recommended_working_set_size"])` explicitly
     for an honest stock-trainer budget rather than relying on this stricter default.
+
+    Emits at most one `CalibrationWarning` per call (see `estimate_peak`), however many
+    suggestion candidates the search prices, and none for an invalid `cfg`, which
+    raises `PlanInputError` first.
     """
+    _validate_cfg(cfg)
+    _warn_if_stock_attention_uncalibrated(cfg, stacklevel=2)
     calib = load_calibration()
     if budget_bytes is None:
         import mlx.core as mx  # noqa: PLC0415 -- device query only; keeps plan mlx-free
@@ -431,7 +498,7 @@ def plan_fit(
 
         dev_max = int(mx.device_info()["max_recommended_working_set_size"])
         budget_bytes, _ = clamped_caps(dev_max)
-    peak, components = estimate_peak(shape, cfg, calib)
+    peak, components = _estimate_peak(shape, cfg, calib)
     fits = peak <= budget_bytes
     suggestion = None if fits else _find_fit(shape, cfg, calib, budget_bytes)
     return FitReport(

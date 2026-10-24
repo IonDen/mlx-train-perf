@@ -34,11 +34,11 @@ from pathlib import Path
 import mlx.core as mx
 import mlx.optimizers as optim
 from mlx.utils import tree_flatten
-from mlx_lm import load
 from mlx_lm.tuner.trainer import TrainingArgs, train
 from mlx_lm.tuner.utils import linear_to_lora_layers
 
 from mlx_train_perf.adapters.mlx_lm import make_loss_fn
+from mlx_train_perf.adapters.model_files import load_mlx_lm_model
 from mlx_train_perf.attention import enable_flash_attention
 
 
@@ -78,7 +78,9 @@ def main() -> None:
     )
     args = ap.parse_args()
 
-    model, tokenizer = load(args.model)
+    # `mlx_lm.load`, but it first refuses a model whose config.json names a Python file
+    # (`model_file`) that mlx-lm would otherwise execute while loading.
+    model, tokenizer = load_mlx_lm_model(args.model)
 
     # 4-bit checkpoints compute in fp16 at runtime; the kernels need bf16 or fp32. The
     # quantized weights stay int4 -- this casts the floating-point activations only.

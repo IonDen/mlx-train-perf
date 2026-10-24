@@ -19,14 +19,16 @@ from mlx_train_perf.plan.estimate import (
     TrainConfig,
     _resolve_lora_layers,
     _train_step_model,
-    estimate_peak,
+    _warned_estimate_peak,
 )
 
 
-def _peak(shape: ModelShape, cfg: TrainConfig, calib: Calibration) -> int:
+def _peak(shape: ModelShape, cfg: TrainConfig, calib: Calibration, *, stacklevel: int) -> int:
     """`estimate_peak(...)[0]` alone -- the bisections below only need the scalar
-    predicted peak, never the component breakdown."""
-    peak, _ = estimate_peak(shape, cfg, calib)
+    predicted peak, never the component breakdown. `stacklevel` counts from this
+    function's caller, so the calibration warning names the user's line, not this
+    module's."""
+    peak, _ = _warned_estimate_peak(shape, cfg, calib, stacklevel=stacklevel + 1)
     return peak
 
 
@@ -71,7 +73,7 @@ def max_seq_len_for_budget(
         raise PlanInputError(f"seq_ceiling must be >= 1 (got {seq_ceiling})")
     calib = load_calibration()
     budget = _resolve_budget_bytes(budget_bytes)
-    floor_peak = _peak(shape, replace(cfg, seq_len=1), calib)
+    floor_peak = _peak(shape, replace(cfg, seq_len=1), calib, stacklevel=2)
     if floor_peak > budget:
         raise DoesNotFitError(
             f"no seq_len >= 1 fits budget_bytes={budget} (predicted peak at seq_len=1 "
@@ -102,7 +104,7 @@ def max_batch_for_budget(
         raise PlanInputError(f"batch_ceiling must be >= 1 (got {batch_ceiling})")
     calib = load_calibration()
     budget = _resolve_budget_bytes(budget_bytes)
-    floor_peak = _peak(shape, replace(cfg, batch=1), calib)
+    floor_peak = _peak(shape, replace(cfg, batch=1), calib, stacklevel=2)
     if floor_peak > budget:
         raise DoesNotFitError(
             f"no batch >= 1 fits budget_bytes={budget} (predicted peak at batch=1 is "

@@ -1,0 +1,148 @@
+{
+  "schema": "bench_attention_marginal/1",
+  "unit": "packed-stock-n4096",
+  "mode": "packed",
+  "impl": "stock",
+  "n": 4096,
+  "b": 1,
+  "hq": 32,
+  "hkv": 8,
+  "head_dim": 128,
+  "dtype": "bfloat16",
+  "scale": 0.08838834764831845,
+  "seed": 0,
+  "reps_requested": 3,
+  "loss": "out.sum()",
+  "grads": "mx.grad(loss, argnums=(0, 1, 2)), all evaluated",
+  "measured_call": "forward+backward after one warm-up call; every call's gradients stay alive until the unit ends",
+  "mlx_version": "0.32.0",
+  "mlx_metal_version": "0.32.0",
+  "mlx_train_perf_version": "0.9.1.dev2+gf6f969e26.d20261024",
+  "python": "3.13.12",
+  "macos": "27.0.1",
+  "machine": "arm64",
+  "device": {
+    "device_name": "Apple M1 Max",
+    "architecture": "applegpu_g13s",
+    "memory_size": 34359738368,
+    "max_recommended_working_set_size": 26800603136
+  },
+  "wired_limit_bytes": 21474836480,
+  "cache_limit_bytes": 1073741824,
+  "watchdog": {
+    "requested_limit_bytes": 19327352832,
+    "limit_bytes": 19327352832,
+    "device_margin_bytes": 4294967296,
+    "interval_s": 0.05,
+    "samples": "active + cache",
+    "wall_budget_s": 270.0
+  },
+  "env": {
+    "MLX_SDPA_VJP_FALLBACK": {
+      "set": false,
+      "value": null
+    }
+  },
+  "interpreter": ".venv/bin/python",
+  "python_version": "3.13.12",
+  "command_line": [
+    ".venv/bin/python",
+    "-I",
+    "scripts/bench_attention_marginal.py",
+    "--mode",
+    "causal",
+    "packed",
+    "--watchdog-gib",
+    "18"
+  ],
+  "worker_command": [
+    ".venv/bin/python",
+    "-I",
+    "-B",
+    "scripts/bench_attention_marginal.py",
+    "--single-unit",
+    "--mode",
+    "packed",
+    "--impl",
+    "stock",
+    "--seq-lens",
+    "4096",
+    "--reps",
+    "3",
+    "--watchdog-gib",
+    "18.0",
+    "--worker-wall-s",
+    "270.0",
+    "--expect-mlx",
+    "0.32.0",
+    "--out",
+    "_artifacts/bench_attention_marginal/mlx-0.32.0/packed-stock-n4096.json",
+    "--command-line",
+    "[\".venv/bin/python\", \"-I\", \"scripts/bench_attention_marginal.py\", \"--mode\", \"causal\", \"packed\", \"--watchdog-gib\", \"18\"]"
+  ],
+  "verification_gate_bypassed": false,
+  "mlx_train_perf_source": null,
+  "script_sha": "70f193ae62163c7e",
+  "started_at": "2026-10-24T14:07:08+00:00",
+  "layout": {
+    "lengths": [
+      1985,
+      1044,
+      686,
+      381
+    ],
+    "n_segments": 4,
+    "seed": 0,
+    "min_len": 256,
+    "max_len": 2048
+  },
+  "op": "mx.fast.scaled_dot_product_attention(mask=<bool (1, 1, N, N)>)",
+  "mask": {
+    "form": "boolean (True = attend)",
+    "shape": [
+      1,
+      1,
+      4096,
+      4096
+    ],
+    "dtype": "mlx.core.bool",
+    "bytes": 16777216,
+    "accounting": "allocated before the window: inside pre_bytes, not inside the marginal"
+  },
+  "status": "ok",
+  "reps": [
+    {
+      "rep": 0,
+      "pre_bytes": 117440528,
+      "peak_bytes": 3557031956,
+      "marginal_bytes": 3439591428,
+      "wall_s": 0.189101
+    },
+    {
+      "rep": 1,
+      "pre_bytes": 167772176,
+      "peak_bytes": 3607363604,
+      "marginal_bytes": 3439591428,
+      "wall_s": 0.194089
+    },
+    {
+      "rep": 2,
+      "pre_bytes": 218103824,
+      "peak_bytes": 3657695252,
+      "marginal_bytes": 3439591428,
+      "wall_s": 0.194584
+    }
+  ],
+  "n_reps": 3,
+  "marginal_median_bytes": 3439591428,
+  "marginal_min_bytes": 3439591428,
+  "marginal_max_bytes": 3439591428,
+  "wall_median_s": 0.194089,
+  "warmup_wall_s": 0.177902,
+  "grads_finite": true,
+  "active_after_bytes": 67108880,
+  "cache_after_bytes": 1073741824,
+  "finished_at": "2026-10-24T14:07:09+00:00",
+  "unit_exit": 0,
+  "unit_duration_s": 0.947
+}

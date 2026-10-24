@@ -5,6 +5,11 @@ class MlxTrainPerfError(Exception):
     """Root of all mlx-train-perf errors."""
 
 
+class CalibrationWarning(UserWarning):
+    """A planner estimate uses a calibrated memory term outside the mlx versions it was
+    measured on; the estimate is returned unchanged but may be off."""
+
+
 class UnsupportedHeadError(MlxTrainPerfError):
     """Head kind/dtype the requested impl cannot serve (no silent fallback)."""
 
@@ -31,6 +36,11 @@ class DoesNotFitError(MlxTrainPerfError, _memfit_errors.DoesNotFitError):
 
 class AdapterError(MlxTrainPerfError):
     """mlx-lm model can't be split (unsupported architecture, missing modules)."""
+
+
+class ModelCodeRefusedError(MlxTrainPerfError):
+    """A model's `config.json` names a Python file (`model_file`) that mlx-lm 0.31.x
+    would execute at load with no opt-in; the model is refused before any load."""
 
 
 class MissingDependencyError(MlxTrainPerfError):

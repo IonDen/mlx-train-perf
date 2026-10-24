@@ -172,15 +172,18 @@ def _require_mlx_lm() -> None:
 
 
 def _load_model(model_id: str, revision: str | None) -> tuple[Any, Any]:
-    """The sole call site that touches `mlx_lm.load` (a real repo/checkpoint read) --
-    isolated so tests can monkeypatch this one function and hand back a tiny,
-    freshly-constructed synthetic model instead of a real downloaded checkpoint. Cast
-    to `tuple[Any, Any]` deliberately -- `mlx_lm`'s own real (model, tokenizer) types
-    are not imported anywhere in this project (see `adapters/mlx_lm.py`'s identical
-    `model: Any` convention); this project verifies model support structurally, not
-    by type."""
-    import mlx_lm  # noqa: PLC0415
-    return cast("tuple[Any, Any]", mlx_lm.load(model_id, revision=revision))
+    """The worker's only model load (a real repo/checkpoint read) -- isolated so tests
+    can monkeypatch this one function and hand back a tiny, freshly-constructed
+    synthetic model instead of a real downloaded checkpoint. Goes through
+    `adapters.model_files.load_mlx_lm_model`, which refuses a config that sets
+    `model_file` (code mlx-lm 0.31.x would execute at load) with
+    `ModelCodeRefusedError` before `mlx_lm.load` runs. `tuple[Any, Any]` deliberately --
+    `mlx_lm`'s own real (model, tokenizer) types are not imported anywhere in this
+    project (see `adapters/mlx_lm.py`'s identical `model: Any` convention); this project
+    verifies model support structurally, not by type."""
+    from mlx_train_perf.adapters.model_files import load_mlx_lm_model  # noqa: PLC0415
+
+    return load_mlx_lm_model(model_id, revision=revision)
 
 
 def _synthetic_train_examples(

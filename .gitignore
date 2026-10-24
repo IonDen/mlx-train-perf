@@ -22,6 +22,9 @@ _artifacts/*
 !_artifacts/calib_050/
 !_artifacts/packed_bench_050/
 !_artifacts/packed_dkv/
+!_artifacts/bench_attention_marginal/
+# Superseded records and logs the attention bench moves aside on a re-run; kept local.
+_artifacts/bench_attention_marginal/**/attempts/
 # Probe outputs that record an absolute local path in their command line; kept local.
 _artifacts/attention_bwd_rungs/buffer_packing_probe/
 # The contribution kit's intermediate per-condition artifacts; only the single
