@@ -2,6 +2,19 @@
 
 ## Released
 
+### 0.9.1 - 2026-10-24
+- A compatibility release. mlx is pinned to 0.32.0, the version the kernels are verified on;
+  the `guard` extra moves to mlx-guard 0.3.0; the planner emits a warning (`mlx-train-perf
+  plan` prints it) when it runs on an mlx its attention term was not calibrated on; and a
+  committed benchmark measures stock against flash attention memory on mlx 0.32.0 and 0.32.4.
+  On mlx 0.32.4, stock attention's backward is lighter for causal attention and stays
+  quadratic with a packed (array) mask, so flash attention's memory advantage holds mainly
+  for packed batches. The 0.32.4 flash figures are maintainer measurements, since the
+  package refuses its flash path on an unverified mlx.
+- Fixed: mlx-lm 0.31.x runs the Python file a model's `config.json` names under `model_file`
+  when the model loads. mlx-train-perf now refuses such a model with `ModelCodeRefusedError`
+  before anything loads.
+
 ### 0.9.0 - 2026-10-03
 - `mlx_train_perf.memfit`, a memory-fit toolkit that does not need MLX. You describe a
   workload as phases of named terms, estimate its peak, search for the largest setting that
