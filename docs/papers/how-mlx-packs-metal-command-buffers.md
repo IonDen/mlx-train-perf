@@ -19,17 +19,19 @@ buffer.
 
 This article explains that packing rule, applies it to real attention dispatches, and separates three
 kinds of evidence: facts visible in MLX source, behavioral observations reported by the project, and
-an inference about why macOS terminates some long-running GPU work. It does not rerun the original
-experiments. Measurements are source-reported and cross-checked against the project README and
-changelog.
+an inference about why macOS terminates some long-running GPU work. Facts about the packing rule come from MLX
+source at v0.32.0. The behavioral observations come from the project's own recorded probe and are
+given here qualitatively; the probe's method is the committed script. The release README
+and changelog are the project's own record of the design that followed.
 
 ### Evidence scope
 
 - Project release: `mlx-train-perf` 0.3.0, documented 2026-07-14.
 - Runtime: MLX 0.32.0 wheel.
 - Machine: Apple M1 Max, 32 GB, reported as `applegpu_g13s`, running macOS 26.5.
-- Verification method: pinned MLX 0.32.0 source, cross-checked against the public 0.3.0 README and
-  changelog; the probe observations are source-reported, with no code or benchmark reruns.
+- Sources: pinned MLX 0.32.0 source for the packing rule; the project's recorded probe, described
+  qualitatively, for the behavioral observations; the public 0.3.0 README and changelog as the
+  project's own record of the resulting design. No code or benchmark was rerun.
 
 ## 1. Why the scheduling unit matters
 
@@ -50,7 +52,7 @@ macOS judged the cumulative duration of the whole evaluation. Under that model, 
 dispatch into several safe pieces did not help for long contexts: the sum still grew until the chain
 was refused.
 
-This created an apparent RAM-independent context ceiling. Attention memory had been reduced, but the
+This created an apparent context ceiling that did not depend on RAM. Attention memory had been reduced, but the
 launcher would not use the new headroom. The important question was no longer "how long is the chain?"
 It was "what work does MLX actually place in each command buffer?"
 
@@ -105,7 +107,7 @@ The source-reported arithmetic is:
 | backward `dK/dV` range | about 118 million | 112 | one dispatch crosses the threshold |
 | backward `dQ` range | about 85 to 89 million | 81 to 85 | one dispatch crosses the threshold |
 | MMA forward range, about 5,400 rows | about 73 million once the first range is encoded | 69 | one dispatch crosses the threshold |
-| scalar forward range, about 117 rows | 48 units plus about 0.46 per dispatch | crosses 50 near the fifth | roughly 4 to 6 dispatches can pack |
+| scalar forward range, 117 rows | 50,331,648 for `q`, `k`, `v`, counted once, plus 482,976 per range | 48 plus about 0.46 per range: 50 after six, 51 at the seventh | seven ranges pack; the commit follows the seventh |
 
 The `dK/dV` row can be reconstructed from the tensor shapes above, assuming the distinct backing
 buffers used by that measurement:
@@ -120,10 +122,23 @@ floor(total / 2²⁰)                                                        112
 ```
 
 Because 112 is already over the configured 50-unit limit, MLX commits after encoding that dispatch.
-The next range starts a new accounting window and references the large shared buffers again. By
-contrast, the scalar forward begins near 48 units; shared backing buffers count only once within that
-window, while each new range adds about 0.46 units of new output storage. The shifted counter crosses
-50 after several ranges, which produces the reported 4-to-6-dispatch estimate.
+The next range starts a new accounting window and references the large shared buffers again.
+
+The scalar forward row follows from the same shape. Its ranges are 117 query rows long, the range
+size the project's planner reported for this shape. Every range reads the same `q`, `k` and `v`,
+which count once per window, and writes its own output rows `o` and their `lse` values:
+
+```text
+q + k + v           32 × 8192 × 128 + 2 × (8 × 8192 × 128) = 50,331,648 elements = 48 units exactly
+o + lse per range   32 × 117 × 128 + 32 × 117              =    482,976 elements ≈ 0.46 units
+after six ranges    50,331,648 + 6 × 482,976 = 53,229,504     floor(total / 2²⁰) = 50
+after seven ranges  50,331,648 + 7 × 482,976 = 53,712,480     floor(total / 2²⁰) = 51
+```
+
+Under the strict rule six ranges leave the counter at 50, and the seventh takes it to 51: seven ranges
+pack into one buffer, and the commit follows the seventh. Buffers already counted in the window, such
+as framework work encoded before the first range, move the trigger earlier, by about two ranges per
+extra unit (one unit is 1,048,576 elements, a little over two ranges of 482,976).
 
 The large backward ranges are the decisive case. Their referenced unique backing buffers already
 exceed the element threshold after one encoded operation. Once MLX checks the counters, it commits. Successive
@@ -136,7 +151,7 @@ and pack together. A safe planner cannot simply delete all cumulative accounting
 projected work within each modeled command buffer, commit the model when either MLX threshold is
 crossed, and then begin a fresh buffer model.
 
-![How the MLX 0.32.0 commit rule packs two dispatch classes at the flagship shape: each large dK/dV backward range triggers a commit after encoding and may follow smaller prefix work, while scalar forward ranges accumulate about 0.46 units each and pack four to six per buffer](https://raw.githubusercontent.com/IonDen/mlx-train-perf/main/docs/papers/diagrams/command-buffer-packing-sequence.svg)
+![How the MLX 0.32.0 commit rule packs two dispatch classes at the flagship shape: each large dK/dV backward range triggers a commit after encoding and may follow smaller prefix work, while scalar forward ranges add about 0.46 units each to the 48 units of q, k and v, so seven pack per buffer and the commit follows the seventh](https://raw.githubusercontent.com/IonDen/mlx-train-perf/main/docs/papers/diagrams/command-buffer-packing-sequence.svg)
 
 *Figure 1. Packing behavior implied by the MLX 0.32.0 commit rule at the flagship attention shape.
 The structure is the source-derived accounting model and the element counts are source-reported
@@ -150,24 +165,29 @@ is published with the paper.*
 Source inspection tells us what MLX intends to count. On 2026-07-14, the project also recorded three
 subprocess-per-condition behavioral checks against the shipped 0.32.0 wheel on the M1 Max running
 macOS 26.5. These are qualitative consistency checks, not measurements of the exact threshold or an
-isolated overhead component.
+isolated overhead component. The probe's timings were not published with the release, so this section
+reports only what each probe showed. The method is the committed
+[probe script](https://github.com/IonDen/mlx-train-perf/blob/v0.3.0/scripts/probe_command_buffer_packing.py).
 
-First, a chain of 2,000 small serial matrix multiplications took 0.0180 seconds under the default
-configuration. Forcing a boundary after every operation increased the time to 0.0510 seconds, or
-2.8× the default. Raising the operation threshold to 5,000 produced 0.0235 seconds, which is slower
-than the default despite allowing fewer expected commits. The forced-every-operation contrast is
-consistent with aggregate overhead from more frequent commits, but the non-monotonic third point does
-not isolate that overhead or establish the exact threshold. The threshold semantics come from source.
+First, a chain of 2,000 small serial matrix multiplications ran clearly slower when a commit was
+forced after every operation than under the default configuration. With the operation threshold
+raised to 5,000, which allows fewer commits, the chain ran slower than the default in the recorded
+run, against the script's own stated expectation that it would be no slower. The forced-every-operation
+contrast is consistent with aggregate overhead from more frequent commits, but the third condition
+does not isolate that overhead or establish the exact threshold. The threshold semantics come from
+source.
 
-Second, 200 serial additions over roughly 13 million elements took 0.0875 seconds by default,
-0.0857 seconds with a very high element threshold, and 0.0937 seconds when every operation was forced
-across a boundary. The unreplicated spread is small, but its direction is consistent with the
-element-accounting model.
+Second, 200 serial additions over roughly 13 million elements ran under the default configuration, a
+very high element threshold, and a commit forced after every operation. The direction of the differences
+matched the script's stated expectation, within a small spread. With one process per condition, that spread does
+not by itself separate the three settings.
 
-Third, a real chained `dK/dV` backward at 12,288 tokens used twelve 1,024-row ranges. Its full chain
-was projected at roughly 4.3 seconds, beyond the retired total-chain cap. The project reports that it
-completed in 0.781 seconds wall time, returned finite outputs, and reached a 1.56 GB peak. The element
-arithmetic predicts that every large range triggers a commit at that shape.
+Third, a real chained `dK/dV` backward at 12,288 tokens used twelve 1,024-row ranges. The probe script
+projects the full chain at roughly 4.3 seconds, beyond the retired total-chain cap. The chain
+completed and returned finite outputs. The element arithmetic predicts that every large range
+triggers a commit at that shape. One completion shows that such a chain can run; it does not locate
+the watchdog's limit, and the probe script treats a survival as evidence about that day's machine
+state only.
 
 These probes support the practical consequence of the source rule. They do not directly expose Metal
 command-buffer boundaries, nor do they reveal the operating system's internal watchdog decision.
@@ -204,10 +224,11 @@ end-to-end latency, or other runtime limits can still bound the chain. Small dis
 together share one allowance; the planner cannot pretend that every custom-kernel call gets its own
 buffer.
 
-The change did not raise the project's safety margin. The 0.3.0 release record reports that the
-measured kernel rate is multiplied by the same 0.5 calibration safety factor, making projected
-duration about twice the estimate at the raw measured rate. Each modeled buffer is then capped at the
-same 0.5-second projected duration. What changed was the causal work estimate and the window over
+The change did not raise the project's safety margin. In the 0.3.0 code the measured kernel rate is
+multiplied by the same 0.5 calibration safety factor
+([`SAFETY_FACTOR = 0.5`](https://github.com/IonDen/mlx-train-perf/blob/v0.3.0/src/mlx_train_perf/attention/kernel/launch.py#L103)),
+making projected duration about twice the estimate at the raw measured rate. Each modeled buffer is
+then capped at the same 0.5-second projected duration. What changed was the causal work estimate and the window over
 which those projections accumulate.
 
 ## 6. What is known, and what remains an inference
@@ -225,9 +246,8 @@ commit-triggering dispatches can execute despite exceeding the retired chain-tot
 
 **Inferred rather than directly observed:** macOS interactivity kills are governed by the
 non-preemptible occupancy of an individual command buffer, with display contention affecting the
-boundary. This model reconciles the project's reported kill history and an external MLX issue, but the
-probes do not instrument the watchdog itself. It should remain a mechanism hypothesis, not be presented
-as an Apple-documented law.
+boundary. This model fits an external MLX issue report, but the probes do not instrument the watchdog
+itself. It should remain a mechanism hypothesis, not be presented as an Apple-documented law.
 
 ## 7. Limits and transferability
 
@@ -237,9 +257,9 @@ Donation, aliasing, and framework operations inserted between custom kernels may
 buffers are counted. Extra intervening work tends to cause earlier commits, but that conservative
 direction should still be checked when adapting the planner.
 
-The behavioral timings are source-reported single-machine observations, not a statistical performance
-analysis. They are consistent with the packing model; they do not define universal fence costs or
-watchdog thresholds.
+The behavioral probes are single recorded runs on one machine, given here by direction only, not a
+statistical performance analysis. One condition of the first probe ran against the script's
+expectation. They do not define universal fence costs or watchdog thresholds.
 
 The durable lesson is methodological. For this MLX/macOS configuration, modeled command-buffer windows
 are a better operational proxy than whole-chain duration. Pinned runtime source should establish how
@@ -255,17 +275,17 @@ also governs an operating-system kill remains a separate empirical question.
   Section 3 shows the attention-shape arithmetic derived from these rules; the probe observations are
   source-reported, with the public method linked below.
 - [`mlx-train-perf` 0.3.0 changelog](https://github.com/IonDen/mlx-train-perf/blob/v0.3.0/CHANGELOG.md)
-  and [release README](https://github.com/IonDen/mlx-train-perf/blob/v0.3.0/README.md), used as
-  independent documentary cross-checks.
+  and [release README](https://github.com/IonDen/mlx-train-perf/blob/v0.3.0/README.md), the
+  project's own release record of the resulting design.
 - [`scripts/probe_command_buffer_packing.py`](https://github.com/IonDen/mlx-train-perf/blob/v0.3.0/scripts/probe_command_buffer_packing.py),
   the recorded probe method; this article did not rerun it.
 - [ml-explore/mlx issue #3267](https://github.com/ml-explore/mlx/issues/3267), an external report of
   LoRA fine-tuning kills at roughly 1.2-second individual operations with the display active; used
-  only in the watchdog-mechanism reconciliation.
+  only for the watchdog inference in section 6.
 - [Apple `MTLCommandBufferError`](https://developer.apple.com/documentation/metal/mtlcommandbuffererror),
   documentation for Metal command-buffer error classes; it does not establish this article's inferred
   watchdog boundary.
 
 ---
 
-*Prepared 2026-07-15. Last updated 2026-07-20. Denis Ineshin.*
+*Prepared 2026-07-15. Last updated 2026-11-13. Denis Ineshin.*

@@ -22,14 +22,14 @@ rectangle "MLX 0.32.0 commit check on applegpu_g13s, after each encoded operatio
   }
 
   rectangle "Small forward dispatches (scalar class)" as laneB {
-    rectangle "Command buffer\nrange 1: ~48 units, shared q k v count once\neach later range adds ~0.46 units\ncounter crosses 50 near the fifth range" as b1 #DCFCE7
-    rectangle "Command buffer\nthe next 4-6 ranges\npack the same way" as b2 #DCFCE7
+    rectangle "Command buffer\nq k v: 48 units, counted once\neach range adds ~0.46 units\nthe 7th range reaches 51" as b1 #DCFCE7
+    rectangle "Command buffer\nthe next 7 ranges\npack the same way" as b2 #DCFCE7
   }
 }
 
 laneA -[hidden]down- laneB
 a1 -right-> a2 : range triggers commit\nafter it is encoded
-b1 -right-> b2 : commit near\nthe fifth range
+b1 -right-> b2 : commit after\nthe 7th range
 
 caption Accounting model derived from pinned MLX 0.32.0 source. Element counts are source-reported arithmetic, not a Metal command-buffer capture.
 @enduml
