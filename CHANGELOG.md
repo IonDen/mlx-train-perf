@@ -56,10 +56,13 @@ not been re-measured on 0.32.4; the 0.32.4 figures below come from the new bench
   quadratic. The flash path peaks at 0.596 GiB on mlx 0.32.0 and 0.659 GiB on 0.32.4 in the
   committed runs (about 19–21× less). The recorded dK/dV range count and tile are the same in
   both records, and the cause of the roughly 64 MiB difference is not identified.
-- The README labels the loss-layer memory figure (about 3900× less) as measured on mlx 0.31.2,
+- The README labels the loss-layer memory figure as measured on mlx 0.31.2,
   and states the packing figures with the mlx version, hardware and
   script they were measured with. It no longer states a token-count crossover between stock
   and flash attention, because no committed result backs one.
+  *Corrected 2026-11-13:* that loss-layer figure was a memory reduction ratio the
+  measurement does not support, and no published record shows it on mlx 0.31.2. The README
+  now gives the measured peaks from the mlx 0.32.0 benchmark record.
 
 ### Fixed
 - A fresh install no longer resolves an mlx this package refuses.
@@ -506,6 +509,9 @@ Silicon, with an mlx-lm adapter, a RAM-fit planner, and a benchmark harness.
   trainer, with per-step loss curves matching the stock trainer to bf16 tolerance
   (about 2e-3). End-to-end throughput is roughly 8-12% slower per step at bf16
   (`scripts/bench_train_step.py`).
+  *Corrected 2026-11-13:* the loss-layer ratio, the 2e-3 match and the 8-12% step cost
+  above came from runs with no published record. The README now gives the loss-layer peaks
+  and the train-step comparison from the mlx 0.32.0 records.
 - RAM-fit planner that estimates peak training memory and accounts for the O(N^2)
   attention backward that dominates at long context. Fit to measured Qwen3-8B train-step
   peaks and cross-model validated on Llama-3.2-3B to within about 9%.

@@ -8,7 +8,7 @@ Fine-tune with less memory for the loss, sequence packing for datasets of short 
 
 `mlx-train-perf` is a set of drop-in parts for [MLX](https://github.com/ml-explore/mlx) LoRA and QLoRA fine-tuning: a fused cross-entropy loss that never builds the logits tensor, sequence packing for datasets made of short examples, a training path for the GatedDelta layers of Qwen 3.5, and a planner that answers "will this fit in my RAM?" before you download the weights. A flash-attention path for long sequences is also included. It is not a trainer and does not want to be one. You keep `mlx_lm`'s training loop and swap in the pieces you need.
 
-Measured on one M1 Max (32 GB), Qwen3-8B-4bit QLoRA. The fused loss layer needs about 3900× less memory than the naive one (measured on mlx 0.31.2). On mlx 0.32.0, packing an Alpaca-shaped instruction dataset gave 3.0× more real tokens per second, and 2 to 3× depending on how short your examples are (`scripts/bench_packed_training.py`, listed under [Reproducing the numbers](#reproducing-the-numbers)). mlx 0.32.4 changed stock attention's backward memory. On that version the flash path's memory advantage is gone for causal attention at 8,192 tokens (0.682 against 0.596 GiB, op level), though at 1,024 tokens stock attention still uses 4.6× more (0.270 against 0.059 GiB). The advantage remains large for packed batches. The [flash-attention section](#flash-attention-training-path) has the details.
+The fused loss layer never builds the full logits tensor; [the fused loss section](#the-fused-cross-entropy-loss) has the measured peaks. Packing was measured on one M1 Max (32 GB), Qwen3-8B-4bit QLoRA. On mlx 0.32.0, packing an Alpaca-shaped instruction dataset gave 3.0× more real tokens per second, and 2 to 3× depending on how short your examples are (`scripts/bench_packed_training.py`, listed under [Reproducing the numbers](#reproducing-the-numbers)). mlx 0.32.4 changed stock attention's backward memory. On that version the flash path's memory advantage is gone for causal attention at 8,192 tokens (0.682 against 0.596 GiB, op level), though at 1,024 tokens stock attention still uses 4.6× more (0.270 against 0.059 GiB). The advantage remains large for packed batches. The [flash-attention section](#flash-attention-training-path) has the details.
 
 ### The problem, in mlx-lm's own words
 
@@ -34,10 +34,10 @@ The fused loss and sequence packing are unaffected by it.
 ### Measured on mlx 0.32.0
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/IonDen/mlx-train-perf/main/docs/images/training-step-memory.svg" alt="Training step peak memory at 8192 tokens on Qwen3-8B-4bit, measured on mlx 0.32.0: stock attention 25.68 GiB, above what a 32 GB Mac can use; flash attention 12.75 GiB, comfortably under it." width="720">
+  <img src="https://raw.githubusercontent.com/IonDen/mlx-train-perf/main/docs/images/training-step-memory.svg" alt="Training step peak memory at 8192 tokens on Qwen3-8B-4bit, measured on mlx 0.32.0: stock attention with mlx-lm's stock loss 25.68 GiB; flash attention with the fused loss 12.75 GiB." width="720">
 </p>
 
-On mlx 0.32.0 the longest sequence you can train on this machine goes from 7,936 tokens with stock attention to 23,040 with the flash path.
+On mlx 0.32.0 the longest sequence you can train on this machine goes from 7,936 tokens with stock attention to 23,040 with flash attention and the fused loss.
 
 ## Does this help me?
 
@@ -46,7 +46,7 @@ Including the cases where it does not.
 | What you are hitting | Does this help? |
 |---|---|
 | The truncation warning above, on examples you would rather keep whole | Yes. Raise `max_seq_length` and use the [flash-attention path](https://github.com/IonDen/mlx-train-perf#flash-attention-training-path). On mlx 0.32.0 this is where it helps most. On 0.32.4 stock attention is much lighter for causal attention, though not for packed batches. |
-| You raised `max_seq_length` and the run died or the machine locked up | Yes, if one step was the problem. On mlx 0.32.0, at 8192 tokens the step's peak drops from 25.68 to 12.75 GiB. |
+| You raised `max_seq_length` and the run died or the machine locked up | Yes, if one step was the problem. On mlx 0.32.0, at 8192 tokens the step's peak drops from 25.68 to 12.75 GiB with flash attention and the fused loss. |
 | An instruction dataset of short examples, and training crawls while the GPU looks idle | Yes. [Packing](https://github.com/IonDen/mlx-train-perf#sequence-packing) carried 2 to 3× more real tokens per second on mlx 0.32.0 (M1 Max 32 GB, `scripts/bench_packed_training.py`). |
 | You want to know whether a config fits before spending an hour finding out | Yes. [`mlx-train-perf plan`](https://github.com/IonDen/mlx-train-perf#ram-fit-planner) answers without loading the model. |
 | Everything already fits at the 2048 default | Not for the memory work. Packing can still help if your examples are short. |
@@ -56,7 +56,7 @@ Including the cases where it does not.
 | Qwen 3.5, which mixes full attention with GatedDelta (linear-attention) layers | Partly. [`enable_gated_delta_training`](https://github.com/IonDen/mlx-train-perf#gateddelta-training-for-qwen-35) gives the GatedDelta layers a training path; the full-attention layers stay on stock attention, and sequence packing and the RAM planner don't cover this family yet. |
 | Inference or serving speed | No. This is training only. |
 
-Every number here has a committed script under `scripts/` that reproduces it, all measured on one M1 Max (32 GB, macOS 26.5; the attention memory benchmark was run on macOS 27.0.1). The loss-layer figures were taken on mlx 0.31.2 and reproduce on the pinned 0.32.0; the flash-attention memory figures were taken on 0.32.0 in 0.2.0, and the 0.3.0 context-ceiling figures on 0.32.0. The attention figures labeled 0.32.4 come from `scripts/bench_attention_marginal.py`; the [attention memory section](#attention-memory-on-mlx-0320-and-0324) says how they were taken.
+Every number here has a committed script under `scripts/` that reproduces it, all measured on one M1 Max (32 GB, macOS 26.5.x except where a figure says otherwise; the attention memory benchmark was run on macOS 27.0.1). The loss-layer figures are the committed mlx 0.32.0 record (macOS 26.5.2) described in [the fused loss section](#the-fused-cross-entropy-loss); the flash-attention memory figures were taken on 0.32.0 in 0.2.0, and the 0.3.0 context-ceiling figures on 0.32.0. The attention figures labeled 0.32.4 come from `scripts/bench_attention_marginal.py`; the [attention memory section](#attention-memory-on-mlx-0320-and-0324) says how they were taken.
 
 ## Install
 
@@ -90,7 +90,7 @@ mlx_lm.lora --model mlx-community/Qwen3-8B-4bit --train --data ./data \
 truncated to 2048. Consider pre-splitting your data to save memory.
 ```
 
-On mlx 0.32.0, passing `--max-seq-length 8192` trades the truncation for a crash: the step peaks at 25.68 GiB, and a 32 GB Mac has roughly 24.5 GiB to give it. With the flash path that same step peaks at 12.75 GiB, and the longest sequence you can train moves from 7,936 tokens to 23,040 (`scripts/northstar_context_sweep.py`). On mlx 0.32.4 stock attention's backward uses far less memory for causal attention, so check the [flash-attention section](#flash-attention-training-path) before assuming the same crash.
+On mlx 0.32.0, passing `--max-seq-length 8192` trades the truncation for a crash: the step peaks at 25.68 GiB, and a 32 GB Mac has roughly 24.5 GiB to give it. With flash attention and the fused loss that same step peaks at 12.75 GiB, and the longest sequence you can train moves from 7,936 tokens to 23,040 (`scripts/northstar_context_sweep.py`). On mlx 0.32.4 stock attention's backward uses far less memory for causal attention, so check the [flash-attention section](#flash-attention-training-path) before assuming the same crash.
 
 ```python
 import mlx.core as mx
@@ -203,18 +203,20 @@ a statement about what has been verified, not about what the kernels could cover
 
 The idea is the same one behind [Cut Cross-Entropy](https://arxiv.org/abs/2411.09009) and [Liger-Kernel](https://github.com/linkedin/Liger-Kernel) on the CUDA side, ported to a Metal kernel: compute the cross-entropy loss and its gradient without ever building the full `(N, V)` logits tensor. For a large vocabulary that tensor is the single biggest allocation in the training step, and it is pure waste. You only need the per-token loss and a gradient back into the hidden states.
 
-Standard cross-entropy in a trainer materializes logits of shape `(batch·seq, vocab)`. At Qwen3-8B's vocabulary (151,936) and a 2048-token sequence, that is a 0.6 GB tensor in bf16, plus another for the softmax gradient in the backward pass. The fused kernel never allocates it: the forward regenerates logits in registers tile-by-tile over the vocabulary and returns three `N`-length arrays (the per-token NLL, the log-sum-exp, and the target logit); the backward recomputes the needed tiles instead of reading a stored matrix.
+Standard cross-entropy in a trainer materializes logits of shape `(batch·seq, vocab)`. At Qwen3-8B's vocabulary (151,936) and a 2048-token sequence, that is a tensor of about 0.58 GiB in bf16 (2,048 × 151,936 × 2 bytes), plus a gradient of the same shape in the backward pass. The fused kernel never allocates it: the forward regenerates logits in registers tile-by-tile over the vocabulary and returns three `N`-length arrays (the per-token NLL, the log-sum-exp, and the target logit); the backward recomputes the needed tiles instead of reading a stored matrix.
 
-Measured in isolation on mlx 0.31.2, at n=8192, V=151936, D=4096, bf16 (`scripts/bench_loss_layer.py`):
+Measured in isolation on mlx 0.32.0, macOS 26.5.2, M1 Max 32 GB, at n=8192, V=151936, D=4096, bf16, with random inputs (seed 0), three runs and the median wall time. The numbers are in [community-benchmarks/apple-m1-max-32gb-2026-07-13.json](https://github.com/IonDen/mlx-train-perf/blob/main/community-benchmarks/apple-m1-max-32gb-2026-07-13.json), recorded on 2026-07-13 by the quick tier of `mlx-train-perf contribute` on a development build. `scripts/bench_loss_layer.py` runs the same grid through the same measurement code. Memory is in GiB (2^30 bytes). "Active before" is the memory already held when the measurement starts, "marginal peak" is what the call adds at its highest point, and "total peak" is the highest total.
 
-| loss layer | peak memory | forward wall |
-|---|---|---|
-| naive (materialized logits) | 2.318 GB | 1.0× |
-| kernel (this project) | 0.0006 GB | 1.64× |
+| loss layer | active before | marginal peak | total peak | median forward wall |
+|---|---|---|---|---|
+| naive (materialized logits) | 5.8585 | 2.3184 | 8.1768 | 1.285595 s |
+| kernel (this project) | 1.2218 | 0.0006 | 1.2224 | 2.104592 s |
 
-About 3900× less memory for the loss layer, at a 1.64× cost on the forward pass.
+The naive path's measurement starts with 4.6367 GiB more active memory than the kernel's, and the cause was not isolated, so the columns do not give a clean per-call ratio. The kernel's 0.0006 GiB reads as near zero at the record's four-decimal resolution. The fused forward takes 1.64× as long (2.104592 / 1.285595).
 
-The fused loss is exact to bf16 tolerance against the stock trainer (per-step loss curves match to about 2e-3), and the throughput cost is small: roughly 8–12% slower per step at bf16 (`scripts/bench_train_step.py`, Qwen3-8B-4bit, LoRA r=8, gradient checkpointing on).
+The default test suite checks the loss against mlx-lm's stock `default_loss` on small models through the chunked path. An opt-in smoke test checks the Metal kernel against it on a real Qwen2.5-0.5B checkpoint, with a tolerance of 4e-3.
+
+Two committed train-step comparisons put the fused loss next to the stock loss in training. Both ran on mlx 0.32.0 with flash attention on both arms, for 20 steps: Qwen3-8B-4bit on macOS 26.5.1 ([`_artifacts/bench_train_step_flash/`](https://github.com/IonDen/mlx-train-perf/tree/main/_artifacts/bench_train_step_flash)) and Llama-3.2-3B-Instruct-4bit on macOS 26.5.2 ([`_artifacts/bench_train_step_flash_llama3b/`](https://github.com/IonDen/mlx-train-perf/tree/main/_artifacts/bench_train_step_flash_llama3b)). The worst per-step loss difference across the four pairs is 2.4e-3. In tokens per second, the fused loss ran at 0.93× (Qwen3-8B) and 0.92× (Llama-3.2-3B) of the stock loss at 2,048 tokens, and at 1.05× and 0.97× at 8,192 tokens. At 8,192 tokens the Qwen stock-loss run's speed varied widely from step to step.
 
 ## Flash-attention training path
 
@@ -254,14 +256,17 @@ On mlx 0.32.0, `mx.fast.scaled_dot_product_attention` has a memory-light forward
 
 0.2.0 adds a flash-attention path with a Metal forward *and* a Metal backward, neither of which materializes the score matrix. It keeps O(N) saved state — the attention output and the log-sum-exp — and recomputes the tiles it needs. You switch it on per model with `enable_flash_attention` and train exactly as before.
 
-On Qwen3-8B-4bit (LoRA rank 8, batch 1, gradient checkpointing on, bf16, mlx 0.32.0) the two attention paths are close at a 2048-token sequence. At 8192 they are not: the flash path halves the whole step's peak memory.
+On Qwen3-8B-4bit (LoRA rank 8, batch 1, gradient checkpointing on, bf16, mlx 0.32.0) the two attention paths are close at a 2048-token sequence. At 8192 they are not. In separate runs, flash attention took the step's peak from 25.68 to 15.92 GiB; in the same session, the fused loss took it from 15.92 to 12.75 GiB.
 
-| seq 8192, Qwen3-8B-4bit | total peak | marginal peak |
-|---|---|---|
-| stock attention | 25.68 GiB | 21.31 GiB |
-| flash attention | 12.75 GiB | 8.37 GiB |
+| seq 8192, Qwen3-8B-4bit | loss | total peak | marginal peak |
+|---|---|---|---|
+| stock attention | mlx-lm's stock loss | 25.68 GiB | 21.31 GiB |
+| flash attention | mlx-lm's stock loss | 15.92 GiB | 11.54 GiB |
+| flash attention | fused loss | 12.75 GiB | 8.37 GiB |
 
-(`scripts/bench_train_step.py`; M1 Max 32 GB, macOS 26.5, mlx 0.32.0. These memory and throughput figures are the 0.2.0 measurements, carried into 0.3.0 unchanged: 0.3.0 changed how the backward splits its kernel launches, not what it allocates, and the 0.3.0 context sweep below — measured fresh — confirms the flash path's memory still scales linearly in sequence length.)
+The fourth combination, stock attention with the fused loss, did not finish: the run crossed its memory watchdog ceiling (24.54 GiB, set from the memory free when it started) and was aborted.
+
+(`scripts/bench_train_step.py`; M1 Max 32 GB, macOS 26.5.1 and 26.5.2, mlx 0.32.0. These memory and throughput figures were measured during 0.2.0 development and carried into 0.3.0 unchanged: 0.3.0 changed how the backward splits its kernel launches, not what it allocates, and the 0.3.0 context sweep below — measured fresh — confirms the flash path's memory still scales linearly in sequence length.)
 
 On mlx 0.32.0, the 32 GB machine that peaked near its ceiling with stock attention runs the same step at half the memory. That headroom buys a longer sequence.
 
@@ -476,7 +481,7 @@ print(max_int_within_budget(model, lambda k: 64 * k, lo=1, hi=64, budget_bytes=1
 Each claim above has one script. They run on the GPU, take real wall-clock time, and print the artifacts they measured:
 
 ```bash
-python scripts/bench_loss_layer.py        # the ~3900x loss-layer memory number
+python scripts/bench_loss_layer.py        # the loss-layer memory and forward-time table
 python scripts/bench_attention_op.py      # the single-op flash vs stock memory + timing
 python scripts/bench_attention_marginal.py --mode causal packed  # the attention memory tables (reproduces the 0.32.0 rows on the pinned install)
 # the 12.75 vs 25.68 GiB training table: run each attention arm into its own --out dir

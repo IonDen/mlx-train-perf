@@ -13,6 +13,9 @@ on:
     paths-ignore: ['**.md', 'docs/**', 'LICENSE']
   pull_request:
     paths-ignore: ['**.md', 'docs/**', 'LICENSE']
+# Runner images now ship CPython 3.15 (no wheels for some locked deps); use the verified 3.14.
+env:
+  UV_PYTHON: "3.14"
 jobs:
   checks:
     runs-on: macos-15

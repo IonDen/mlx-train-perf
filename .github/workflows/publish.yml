@@ -6,6 +6,10 @@ on:
   push:
     tags: ["v*"]
 
+# Runner images now ship CPython 3.15 (no wheels for some locked deps); use the verified 3.14.
+env:
+  UV_PYTHON: "3.14"
+
 jobs:
   build:
     runs-on: ubuntu-latest
