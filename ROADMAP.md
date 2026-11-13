@@ -70,6 +70,10 @@
   unchanged. End to end on Qwen3-8B-4bit, packing's real-token throughput moves from
   2.72× to 3.00× against unpacked batching, and the packed arm's median step drops from
   44.7 s to 40.4 s.
+  *Corrected 2026-11-13:* the 44.7 s earlier step time and the 2.72× earlier reading are
+  withdrawn; no record published with the repository shows them. The README gives the
+  40.4 s packed median step and the 3.00× median reading, and no whole-step gain for the
+  dK/dV change.
 - Planner anchors past 8,192 tokens, with a safer flash fit. New measured anchors at
   10,240 and 12,288 tokens showed the flash memory coefficient under-predicting the
   stock-loss arm at long context. The fit now takes an envelope over the worst measured
@@ -86,6 +90,10 @@
   (parity 5.0e-4 on a packed-vs-unpacked batch). Measured on Alpaca at batch 1: real-data
   throughput 2.72× on Qwen3-8B-4bit and on Llama-3.2-3B-4bit alike, a 2.0–2.3× conservative
   steady-state reading — at batch 1 the win is per-step amortization, not padding removal.
+  *Corrected 2026-11-13:* the 2.72× and 2.0–2.3× readings are withdrawn; no record
+  published with the repository shows them. The README gives the mlx 0.32.0 median readings
+  (3.00× and 2.95×) and a different estimate from the shortest recorded step (about 2.3×
+  and 2.4×), which the README explains.
 
 ### 0.3.1 - 2026-07-15
 - Qwen2 (Qwen2.5 family) support in the flash-attention wrapper. `enable_flash_attention` now
@@ -102,6 +110,9 @@
   measured 23,040 tokens with flash attention against 7,936 with stock, both bound by the
   same effective memory ceiling — the flash path reaches 2.9x the context at one memory
   budget, because it keeps O(N) saved state.
+  *Corrected 2026-11-13:* the 23,040 and 7,936 token ceilings and the 2.9x ratio are
+  withdrawn; no record published with the repository shows them. The README gives the
+  op-level attention records and no maximum-trainable-context figure.
 - Qwen2 (Qwen2.5 family) support in the mlx-lm loss adapter, with loss parity against the
   stock trainer verified on a real checkpoint.
 - Benchmark hygiene: attention-arm artifact filenames, a distinct too-crowded status that
@@ -115,6 +126,9 @@
   than by memory. That cap comes from kernel launch throughput and does not depend on RAM:
   extra memory raises stock attention's memory-bound ceiling, while the flash path stays near
   10k until faster dK/dV backward kernels or new launch-budget evidence lift it.
+  *Corrected 2026-11-13:* the "roughly halves" comparison, the "near-tied" maximum trainable
+  context and the "near 10k" context figure are withdrawn; no record published with the repository shows them. The README gives the
+  op-level attention records and no whole-step figure for switching attention.
 - `enable_flash_attention` wrapper for the Llama (full-attention) and Qwen3 families, with
   typed refusals for the cases a causal training path does not serve.
 - Flash-aware RAM-fit planner (`plan --attention flash`).
@@ -143,10 +157,10 @@ GatedDelta layers. Extending packing to this family needs a segment carrier the 
 training path understands too.
 
 ### Faster dK/dV backward kernels
-The dK/dV backward is the slowest part of the flash path. A register-scheduling change to its
-Metal kernel (interleaving the key-tile work to lower register pressure) is the next lever on
-its throughput, which sets tokens/sec at long context. This is a speed item, not a memory or
-context-ceiling one — 0.3.0 already made the context ceiling memory-bound.
+A register-scheduling change to the dK/dV backward Metal kernel (interleaving the key-tile
+work to lower register pressure) is the next lever on the flash path's throughput. This is a
+speed item. It does not touch memory or the context ceiling, which 0.3.0 already freed from
+the launch-safety cap.
 
 ### Fused backward kernel for the loss
 The loss ships a fused forward paired with a proven chunked backward. A fully fused backward
