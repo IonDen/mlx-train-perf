@@ -112,9 +112,14 @@ absolute per-token loss differences were `4.8e-6` for fp32 inputs and `1.9e-6` f
 These checks cover the forward only, not gradient correctness.
 
 The exploratory parity artifacts are not public. The final library does publish a forward benchmark
-with the MLX and OS versions, package/source identity, shape, repetition count, and raw wall times.
-That artifact predates the driver's `script_sha` field, so it cannot identify the exact script
-revision that produced the rows.
+with the MLX and OS versions, package version, code fingerprint, shape, repetition count, and raw wall
+times. The quick tier of the package's community benchmark kit, `mlx-train-perf contribute`, wrote that
+artifact from a development build, `0.1.1.dev31+g1717b077f.d20260711`: commit 1717b07 plus uncommitted
+changes. That build is in no release, so the code that produced the table cannot be opened. The kit's
+code first appears publicly in commit
+[7fb690c](https://github.com/IonDen/mlx-train-perf/commit/7fb690c), which is part of v0.3.1. The
+loss-layer rows carry a code fingerprint (`code_sha`) of the unreleased build, and no separate script
+was involved. Other benchmark rows in the same file carry a script fingerprint; the loss rows do not.
 
 The committed MLX 0.32.0 run produced the following isolated forward result:
 
@@ -255,8 +260,12 @@ maximum trainable context. It attributes the long-context peak to stock attentio
 the raw historical sweep is not public, this remains a source-reported result rather than an
 independently reconstructable comparison.
 
-The loss kernel therefore removes loss-layer waste without solving training memory as a whole. It
-does not automatically increase maximum context.
+The loss kernel therefore removes loss-layer waste without solving training memory as a whole. In the
+project's measurements on MLX 0.31.2 it did not automatically increase maximum context; that was not
+re-measured as a sweep on 0.32.0, and not at all on 0.32.4. MLX 0.32.4 made stock causal attention
+light: the project's [v0.9.1 changelog](https://github.com/IonDen/mlx-train-perf/blob/v0.9.1/CHANGELOG.md)
+records one stock attention forward plus backward at 8,192 tokens peaking at 0.682 GiB, against
+12.532 GiB for the same call on MLX 0.32.0. The library still pins MLX 0.32.0.
 
 Speed also changes with scope. The isolated fused forward was 1.64× slower than the highly tuned
 materialized MLX path, but the loss layer is only part of a training step. Later end-to-end measurements
@@ -302,13 +311,16 @@ its scope.
 
 ## 10. Reproducibility and sources
 
-The final loss-layer benchmark is produced by
-[`bench_loss_layer.py`](https://github.com/IonDen/mlx-train-perf/blob/v0.3.1/scripts/bench_loss_layer.py).
-The [committed JSON artifact](https://github.com/IonDen/mlx-train-perf/blob/v0.3.1/community-benchmarks/apple-m1-max-32gb-2026-07-13.json)
-records its condition identities and all three wall-time samples. The exploratory ladder has no equivalent
-public bundle, so its results remain source-reported and cannot be rerun independently. The public JSON
-identifies the measured package source, but it predates the driver's `script_sha` field. The exact
-historical driver revision is therefore unknown.
+The final loss-layer table comes from the
+[committed JSON artifact](https://github.com/IonDen/mlx-train-perf/blob/v0.3.1/community-benchmarks/apple-m1-max-32gb-2026-07-13.json),
+which the quick tier of the package's community benchmark kit (`mlx-train-perf contribute`) wrote
+from the unreleased development build described in Section 3. In v0.3.1, the first release that
+contains the kit, the loss-layer grid lives in the package's own
+[`contribute.py`](https://github.com/IonDen/mlx-train-perf/blob/v0.3.1/src/mlx_train_perf/contribute.py#L491).
+[`bench_loss_layer.py`](https://github.com/IonDen/mlx-train-perf/blob/v0.3.1/scripts/bench_loss_layer.py)
+is a later standalone driver of the same grid. The JSON records the condition identities, the code
+fingerprint, and all three wall-time samples. The exploratory ladder has no equivalent public bundle,
+so its results remain source-reported and cannot be rerun independently.
 
 [Cut Cross-Entropy](https://arxiv.org/abs/2411.09009) develops the broader logit-free linear
 cross-entropy approach. [Liger-Kernel](https://github.com/linkedin/Liger-Kernel) provides fused training
@@ -328,4 +340,4 @@ compiled resource cost stays under control, and source-level reuse alone cannot 
 
 ---
 
-*Prepared 2026-07-14. Last updated 2026-07-19. Denis Ineshin.*
+*Prepared 2026-07-14. Last updated 2026-11-13. Denis Ineshin.*

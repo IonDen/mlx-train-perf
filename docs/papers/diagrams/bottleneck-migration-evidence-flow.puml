@@ -21,7 +21,7 @@ rectangle "Implementation response\nTiled FlashAttention forward and backward\nS
 rectangle "Hypothesis 2\nThe projected duration of the whole\npacked launch chain is the kill unit" as h2 #DBEAFE
 rectangle "MLX source and packing probe\nLarge production ranges each trigger\na command-buffer commit" as packing #FECACA
 rectangle "Guard correction\nBudget each command buffer separately\nKeep the safety margin unchanged" as guard #DCFCE7
-rectangle "Source-reported later sweep\n23,040 tokens on flash + fused\n7,936 tokens on the stock path" as sweep #EDE9FE
+rectangle "Source-reported later sweep\n23,040 tokens on flash + fused\n7,936 tokens on the stock path\n(mlx 0.32.0)" as sweep #EDE9FE
 
 h1 -down-> tie : measured
 tie -down-> probe : investigate shared peak
