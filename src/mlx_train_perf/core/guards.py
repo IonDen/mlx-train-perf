@@ -1,9 +1,14 @@
-"""Memory guardrails. TWO independent panic-prevention layers, because a wired cap and a
-soft memory limit each only bound ONE failure class:
+"""Memory guardrails. Three layers, each bounding a different thing: a wired residency cap,
+an advisory soft limit, and an active-memory watchdog (the third, below):
 
-1. The WIRED cap (`install_guardrails` -> `mx.set_wired_limit`) turns a WIRED-class
-   over-allocation into a clean MLX OOM instead of a kernel panic (unified memory; wired
-   pages can't swap).
+1. The WIRED cap (`install_guardrails` -> `mx.set_wired_limit`) caps how much GPU memory
+   MLX keeps resident (wired, non-pageable) in THIS process, keeping MLX's own resident
+   set below the device's recommended working set (`clamped_caps`) so reclaimable
+   headroom is preserved. It bounds MLX's share of the wired-memory risk, not other
+   processes', and mlx_lm `train()` raises it to the device max at entry (the bench
+   worker re-asserts it; see `wired_cap_holds`). Reaching it does NOT reject the next
+   allocation: buffers beyond it can remain unwired and PAGEABLE, and allocation can
+   continue into swap.
 
 2. The soft memory limit (`mx.set_memory_limit`) is ADVISORY only. Its own mlx 0.32.0
    docstring: the limit "is a guideline ... If the memory limit is exceeded and there is
@@ -15,10 +20,13 @@ soft memory limit each only bound ONE failure class:
    condition allocated past physical RAM and paged for ~3 h). Neither the wired cap nor
    the soft limit stops that: the over-allocation is pageable, not wired.
 
-The `install_memory_watchdog` below is the third layer that closes that gap: a daemon
-thread samples `mx.get_active_memory()` and fails a runaway condition FAST -- writing an
-honest aborted-status artifact and hard-exiting the process -- before the paging storm
-reaches the IOGPU-panic path.
+The `install_memory_watchdog` below is the third layer that closes that gap, best-effort:
+a daemon thread samples `mx.get_active_memory()` every 0.5 s (default `interval_s`) and
+fails a runaway condition FAST -- writing an honest aborted-status artifact and
+hard-exiting the process -- before the paging storm reaches the IOGPU-panic path, for
+growth slower than that sample interval. It reads ACTIVE memory only (the default sampler
+excludes MLX's cache pool), and a single fast allocation can cross the ceiling between
+samples.
 
 The ceiling it fails against has TWO terms (`effective_memory_ceiling` combines them):
 
@@ -97,8 +105,9 @@ _logger = logging.getLogger(__name__)
 # close for a value meant to be generous. The wall budget is a secondary backstop, not
 # the panic guard: the memory-ceiling watchdog (`install_memory_watchdog`'s
 # `ceiling_bytes` check) is what catches a PAGEABLE over-allocation before the IOGPU
-# paging-storm panic, and the wired cap (`install_guardrails`) turns a WIRED-class
-# over-allocation into a clean MLX OOM. Loosening the wall backstop to 2 h therefore
+# paging-storm panic; the wired cap (`install_guardrails`) only bounds this process's
+# resident WIRED set and never rejects an allocation -- the excess can remain pageable.
+# Loosening the wall backstop to 2 h therefore
 # costs nothing on the safety axis -- it only gives more legitimate long-running
 # conditions headroom before a spurious wall-budget abort.
 DEFAULT_WALL_BUDGET_S = 7200.0
@@ -108,7 +117,10 @@ DEFAULT_WALL_BUDGET_S = 7200.0
 # UNDER the reference, so every machine the 0.1.0 evidence was measured on gets
 # byte-identical caps by construction). Above the reference the caps grow with 85%/92% of
 # the excess working set — a 512 GB Ultra can measure big shapes while always keeping
-# real headroom below dev_max (clean MLX OOM, never a wired-memory kernel panic).
+# real headroom below dev_max (the configured wired limit is always strictly below
+# dev_max, the device's max recommended working set; mlx_lm `train()` raises it at entry
+# and the worker re-asserts it; allocations past the cap can remain pageable and are the
+# memory watchdog's concern).
 _PROPORTIONAL_REF_BYTES = 25 * 1024**3
 
 
@@ -179,7 +191,11 @@ def memory_ceiling_bytes(memory_size: int, *, headroom_gb: int = 4) -> int:
       8 GiB -> 4 GiB (subtraction and floor coincide there).
     - `memory_size` > 32 GiB: the 28 GiB anchor (at the default headroom) + 95% of the
       excess working set. A 512 GB Ultra can measure big shapes while always keeping real
-      headroom below physical (clean MLX OOM, never a wired-memory kernel panic).
+      headroom below physical (this is the static term of the watchdog's effective
+      ceiling; the watchdog aborts the run when sampled MLX active memory reaches the
+      effective ceiling -- a best-effort net against sustained growth, not a guarantee
+      against a fast single allocation; above 32 GiB the scaling is a policy
+      extrapolation, not a measured safety boundary).
 
     This rule ALSO doubles as the expected-free model for the machine class -- see
     `memory_divergence_warning`."""
