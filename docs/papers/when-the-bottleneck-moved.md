@@ -4,26 +4,43 @@
 
 > 📄 [Read on the website](https://ineshin.space/papers/when-the-bottleneck-moved/) — same paper, formatted for reading.
 
+## Notice, 2026-11-13
+
+On 2026-11-13 the project withdrew figures this paper relies on, among them the 25.68 GiB
+training-step peak, the 7,936 and 23,040 token contexts, the ceiling of about 24.5 GiB and section
+4's throughput figures ([changelog](https://github.com/IonDen/mlx-train-perf/blob/895957e/CHANGELOG.md)).
+This notice also withdraws the 21.39 GiB tie between fused and stock loss on MLX 0.31.2. None of
+these, and none of the other MLX 0.31.2 measurements in sections 1 and 2, is in a record published
+with the code; they cannot be checked against any published record. Do not rely on the figures after
+the update section below; for published numbers, see the
+[fused-loss paper](https://github.com/IonDen/mlx-train-perf/blob/main/docs/papers/fused-linear-cross-entropy-apple-gpus.md),
+the [command-buffer paper](https://github.com/IonDen/mlx-train-perf/blob/main/docs/papers/how-mlx-packs-metal-command-buffers.md),
+and the README's
+[fused-loss section](https://github.com/IonDen/mlx-train-perf/blob/895957e/README.md#the-fused-cross-entropy-loss)
+and [attention-memory tables](https://github.com/IonDen/mlx-train-perf/blob/895957e/README.md#attention-memory-on-mlx-0320-and-0324).
+
 ## Update, 2026-11-13: what changed in MLX 0.32.4
 
 On MLX 0.32.4 the tiled flash-attention path keeps a large memory advantage at 8,192 tokens only
-for packed batches. This paper's measurements are from MLX 0.32.0, or 0.31.2 where noted,
-including the headline results in the release
-[README](https://github.com/IonDen/mlx-train-perf/blob/v0.3.1/README.md): a training step at
-8,192 tokens peaked at 12.75 GiB with flash attention and the fused loss against 25.68 GiB with
-stock attention and stock loss, and the largest completed two-step probe, on the same pairs,
-reached 23,040 tokens against 7,936. The loss arms are not in the README; sections 4 and 6
-source them.
+for packed batches. This paper's measurements are from MLX 0.32.0, or 0.31.2 where noted. Both
+headline comparisons it took from the release
+[README](https://github.com/IonDen/mlx-train-perf/blob/v0.3.1/README.md) are withdrawn (see the
+notice above): 12.75 GiB with flash attention and the fused loss against 25.68 GiB with stock
+attention for a training step at 8,192 tokens, and 23,040 against 7,936 tokens for the largest
+completed two-step probe. Only the 12.75 GiB figure keeps a published record
+([`_artifacts/bench_train_step_flash/`](https://github.com/IonDen/mlx-train-perf/tree/v0.9.1/_artifacts/bench_train_step_flash)),
+and there its pair is 15.92 GiB for the stock loss, both under flash attention. No published step
+record uses stock attention.
 
 MLX 0.32.4 added a stock attention backward
 ([ml-explore/mlx#4563](https://github.com/ml-explore/mlx/pull/4563)). In the library's later
 attention benchmark ([0.9.1 changelog](https://github.com/IonDen/mlx-train-perf/blob/v0.9.1/CHANGELOG.md)),
 one causal forward plus backward at 8,192 tokens on 0.32.4 peaks at 0.682 GiB stock against
 0.596 GiB flash; on MLX 0.32.0 stock peaks at 12.532 GiB. A packed (block-diagonal) mask keeps the
-stock backward quadratic: 12.469 against 0.659 GiB. At 1,024 tokens causal stock still uses 4.6×
+stock backward quadratic on 0.32.4: 12.469 against 0.659 GiB. At 1,024 tokens causal stock still uses 4.6×
 more. Unmasked attention was not measured. The library still pins MLX 0.32.0 and refuses flash on
 0.32.4, so all 0.32.4 rows used a measurement-only override. This benchmark is neither section
-2's 12.75 GiB inline probe (MLX 0.31.2) nor section 4's 0.721 GiB single-op run.
+2's inline probe on MLX 0.31.2 nor section 4's 0.721 GiB single-op run.
 
 When you remove a bottleneck, measure what replaced it: here the stock attention backward, which
 0.32.4 lightened for causal masks, not packed ones.
