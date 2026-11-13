@@ -31,6 +31,13 @@ All notable changes to this project are documented here. The format follows
   "near 10k" launch cap, the "about 45x" ratio, the 0.186 s and 0.576 s timings, and the
   "about 3900x" ratio.
 
+### Documentation
+- Corrected how the README describes MLX attention during training (under `mx.grad` or
+  `value_and_grad`). On 0.32.0 the whole call falls back to unfused matrix operations. On
+  0.32.4 the backward is lighter for causal calls (measured) and, per the MLX source, for
+  calls with no mask (not measured), for supported head sizes and dtypes. A mask passed in as
+  an array, such as the block-diagonal mask that packing builds, stays quadratic.
+
 ## [0.9.1] - 2026-10-24
 
 A compatibility release. It pins mlx to the one version the kernels are verified on, moves the
@@ -87,6 +94,15 @@ not been re-measured on 0.32.4; the 0.32.4 figures below come from the new bench
   12.75 GiB peak are now in `evidence/2026-07-run-records/`. The withdrawal stands: 7,936 and
   22,528 are where one two-step sweep stopped, not ceilings, and the 23,040 point has a
   non-finite loss. The 25.68 GiB step is above both memory figures in the Unreleased entry.
+  *Corrected 2026-11-14:* this entry said the 0.32.4 backward is lighter "for causal attention
+  only". Per the MLX source at 0.32.4, a call with no mask given as an array (causal, or no
+  mask at all) runs MLX's single-kernel attention as a fused forward and a fused backward
+  during training (under `mx.grad` or `value_and_grad`), for supported head sizes and dtypes.
+  A mask passed in as an array (MLX also accepts the string "causal"), such as the
+  block-diagonal mask that packing builds, falls back and stays quadratic. The forward also
+  changed during training, so part of the 12.532 to 0.682 GiB drop may come from it; the
+  split was not measured. The backward works in score tiles of up to 1,024 × 1,024 per head,
+  so below 1,024 tokens a tile is the whole matrix. Attention with no mask was not measured.
 - Flash attention keeps its memory advantage for packed batches. On both versions, stock
   attention with a packed mask peaks at 12.469 GiB at 8,192 tokens, because a block-diagonal
   mask reaches stock attention as a materialized `(N, N)` array and its backward stays

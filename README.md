@@ -23,11 +23,11 @@ And if you leave `max_seq_length` at its default of 2048 while your data is long
 truncated to 2048. Consider pre-splitting your data to save memory.
 ```
 
-That advice is correct, and it means training on the first 2048 tokens of every contract, transcript, or source file and discarding the rest. The advice exists because, up to mlx 0.32.0, MLX's attention had a memory-light forward pass and a backward pass that rebuilt the full `(N, N)` score matrix. An MLX maintainer put it plainly while [closing an out-of-memory report](https://github.com/ml-explore/mlx/issues/3539#issuecomment-4445752643), at a time when that was true:
+That advice is correct, and it means training on the first 2048 tokens of every contract, transcript, or source file and discarding the rest. The advice exists because, up to mlx 0.32.0, MLX's single-kernel attention ran only when no gradient was taken ([per the MLX 0.32.0 source](https://github.com/ml-explore/mlx/blob/v0.32.0/mlx/backend/metal/scaled_dot_product_attention.cpp#L601-L604)). During training (under `mx.grad` or `value_and_grad`) the call fell back to plain matrix operations, so the forward built the full `(N, N)` score matrix and the backward differentiated through it. An MLX maintainer put it plainly while [closing an out-of-memory report](https://github.com/ml-explore/mlx/issues/3539#issuecomment-4445752643), at a time when that was true:
 
 > The RAM needed for training grows quadratically as sequence length increases, so I'm afraid the OOM is not something we can simply solve.
 
-MLX has since addressed this for causal attention. mlx 0.32.4 added a backward pass for `mx.fast.scaled_dot_product_attention` that no longer builds the score matrix ([ml-explore/mlx#4563](https://github.com/ml-explore/mlx/pull/4563), "Adding VJP for the scaled dot product attention.", by @tpegolotti). This library's flash-attention path keeps O(N) state for the architectures it supports; on mlx 0.32.0 the op-level records show what that saves (12.532 GiB with stock attention against 0.596 GiB with flash for one forward plus backward at 8,192 tokens), and the figures below are labeled with the mlx version they were measured on. This release pins mlx 0.32.0.
+MLX has since addressed this for attention with no mask passed in as an array (MLX also accepts the string "causal"), that is, causal attention or no mask at all. mlx 0.32.4 added a fused backward pass for `mx.fast.scaled_dot_product_attention`, and the forward now runs fused during training too. The backward works in score tiles of up to 1,024 × 1,024 per head, for supported head sizes and dtypes, so it never holds the full score matrix above 1,024 tokens ([ml-explore/mlx#4563](https://github.com/ml-explore/mlx/pull/4563), "Adding VJP for the scaled dot product attention.", by @tpegolotti). A mask passed in as an array, such as the block-diagonal mask that packing builds, still falls back to the plain path and stays quadratic. This library's flash-attention path keeps O(N) state for the architectures it supports; on mlx 0.32.0 the op-level records show what that saves (12.532 GiB with stock attention against 0.596 GiB with flash for one forward plus backward at 8,192 tokens), and the figures below are labeled with the mlx version they were measured on. This release pins mlx 0.32.0.
 
 The fused loss and sequence packing are unaffected by it.
 
@@ -45,7 +45,7 @@ Including the cases where it does not.
 
 | What you are hitting | Does this help? |
 |---|---|
-| The truncation warning above, on examples you would rather keep whole | Yes. Raise `max_seq_length` and use the [flash-attention path](https://github.com/IonDen/mlx-train-perf#flash-attention-training-path). On mlx 0.32.0 one stock attention forward plus backward at 8,192 tokens peaks at 12.532 GiB against 0.596 GiB for flash (op level). On 0.32.4 stock attention is much lighter for causal attention, though not for packed batches. |
+| The truncation warning above, on examples you would rather keep whole | Yes. Raise `max_seq_length` and use the [flash-attention path](https://github.com/IonDen/mlx-train-perf#flash-attention-training-path). On mlx 0.32.0 one stock attention forward plus backward at 8,192 tokens peaks at 12.532 GiB against 0.596 GiB for flash (op level). On 0.32.4 stock attention is much lighter for causal calls (measured) and, per the MLX source, for calls with no mask (not measured). Packed batches pass their mask in as an array and stay quadratic. |
 | You raised `max_seq_length` and the run died or the machine locked up | Partly. On mlx 0.32.0, one stock attention forward plus backward at 8,192 tokens peaks at 12.532 GiB against 0.596 GiB for the flash path (op level). The whole step on stock attention was not measured. With flash attention, the fused loss takes the step's peak from 15.92 to 12.75 GiB. |
 | An instruction dataset of short examples, and training crawls while the GPU looks idle | Yes. [Packing](https://github.com/IonDen/mlx-train-perf#sequence-packing) carried about 2.3 to 3× more real tokens per second on an Alpaca sample (mlx 0.32.0, M1 Max 32 GB, `scripts/bench_packed_training.py`). No long run was measured. |
 | You want to know whether a config fits before spending an hour finding out | Yes. [`mlx-train-perf plan`](https://github.com/IonDen/mlx-train-perf#ram-fit-planner) answers without loading the model. |
@@ -90,7 +90,7 @@ mlx_lm.lora --model mlx-community/Qwen3-8B-4bit --train --data ./data \
 truncated to 2048. Consider pre-splitting your data to save memory.
 ```
 
-On mlx 0.32.0, passing `--max-seq-length 8192` trades the truncation for a much heavier attention call: one stock attention forward plus backward peaks at 12.532 GiB at that length, against 0.596 GiB for the flash path (op level). The whole step on stock attention was not measured. With flash attention and the fused loss the step peaks at 12.75 GiB. On mlx 0.32.4 stock attention's backward uses far less memory for causal attention, so the gap is much smaller there; the [flash-attention section](https://github.com/IonDen/mlx-train-perf#flash-attention-training-path) has the numbers.
+On mlx 0.32.0, passing `--max-seq-length 8192` trades the truncation for a much heavier attention call: one stock attention forward plus backward peaks at 12.532 GiB at that length, against 0.596 GiB for the flash path (op level). The whole step on stock attention was not measured. With flash attention and the fused loss the step peaks at 12.75 GiB. On mlx 0.32.4 stock attention uses far less memory with a causal mask (measured; per the MLX source, calls with no mask are lighter too, not measured), so the gap is much smaller there; the [flash-attention section](https://github.com/IonDen/mlx-train-perf#flash-attention-training-path) has the numbers.
 
 ```python
 import mlx.core as mx
@@ -110,7 +110,7 @@ train(model=model, optimizer=opt, train_dataset=ds, args=args,
       loss=make_loss_fn(model, impl="auto"))
 ```
 
-Two independent levers sit in those last three lines. `enable_flash_attention` swaps each layer's attention for the O(N) path, which is what removes the quadratic attention backward at the op level (see the [attention memory tables](https://github.com/IonDen/mlx-train-perf#attention-memory-on-mlx-0320-and-0324)). `make_loss_fn` routes the loss through the fused kernel and frees the logit buffer on top of that. Either one works without the other.
+Two independent levers sit in those last three lines. `enable_flash_attention` swaps each layer's attention for the O(N) path, which is what removes the quadratic attention backward at the op level on mlx 0.32.0 (see the [attention memory tables](https://github.com/IonDen/mlx-train-perf#attention-memory-on-mlx-0320-and-0324)). `make_loss_fn` routes the loss through the fused kernel and frees the logit buffer on top of that. Either one works without the other.
 
 The elisions above are the parts of a stock mlx-lm LoRA run that do not change. [`examples/finetune_long_context.py`](https://github.com/IonDen/mlx-train-perf/blob/main/examples/finetune_long_context.py) is the same thing with nothing left out: argument parsing, dataset loading, the freeze and adapter setup, and adapter saving. Run it as is.
 
@@ -220,9 +220,9 @@ Two sets of recorded train-step comparisons put the fused loss next to the stock
 
 ## Flash-attention training path
 
-Opt-in, added in 0.2.0. mlx 0.32.4 made stock attention's backward lighter on memory for causal attention. At 8,192 tokens with a causal mask, the flash path's advantage is gone on that version: one attention forward plus backward peaks at 0.682 GiB with stock attention against 0.596 GiB with flash (op level). With a packed (array) mask, stock attention stays quadratic and the flash path keeps a large advantage. The training-step figures below were measured on mlx 0.32.0 and apply to that version. The fused loss and sequence packing are unaffected. This release pins mlx 0.32.0; mlx 0.32.4 is not verified yet, because it changed the numerical results of the Qwen 3.5 GatedDelta path.
+Opt-in, added in 0.2.0. mlx 0.32.4 made stock attention lighter on memory for causal calls (measured) and, per the MLX source, for calls with no mask (not measured). At 8,192 tokens with a causal mask, the flash path's advantage is gone on that version: one attention forward plus backward peaks at 0.682 GiB with stock attention against 0.596 GiB with flash (op level). With a packed mask (passed in as an array), stock attention stays quadratic and the flash path keeps a large advantage. The training-step figures below were measured on mlx 0.32.0 and apply to that version. The fused loss and sequence packing are unaffected. This release pins mlx 0.32.0; mlx 0.32.4 is not verified yet, because it changed the numerical results of the Qwen 3.5 GatedDelta path.
 
-The upstream change is [ml-explore/mlx#4563](https://github.com/ml-explore/mlx/pull/4563), "Adding VJP for the scaled dot product attention.", by @tpegolotti, released in mlx 0.32.4. The recorded benchmark below measured two cases on mlx 0.32.4: the backward is lighter for causal attention, and with a packed (array) mask stock attention stays quadratic. It did not measure attention with no mask.
+The upstream change is [ml-explore/mlx#4563](https://github.com/ml-explore/mlx/pull/4563), "Adding VJP for the scaled dot product attention.", by @tpegolotti, released in mlx 0.32.4. The recorded benchmark below measured two cases on mlx 0.32.4: a causal mask, where stock attention is much lighter, and a packed mask, where it stays quadratic. It did not measure attention with no mask. In the MLX source, the lighter path applies to any call with no mask passed in as an array, and part of the drop may come from the forward, which also changed during training; the split was not measured.
 
 ### Attention memory on mlx 0.32.0 and 0.32.4
 
@@ -252,7 +252,7 @@ Reproduce the 0.32.0 tables on the pinned install with `python scripts/bench_att
 
 ### Flash-attention figures measured on mlx 0.32.0
 
-On mlx 0.32.0, `mx.fast.scaled_dot_product_attention` has a memory-light forward and an O(N²) backward that rebuilds the `(N, N)` score matrix one layer at a time. At long sequences that backward is what sets the attention op's peak.
+On mlx 0.32.0, `mx.fast.scaled_dot_product_attention` uses its memory-light fused kernel only when no gradient is taken. Under `mx.grad` or `value_and_grad` the whole call falls back to unfused operations: the forward builds the `(N, N)` score matrix and the backward is O(N²) through it. At long sequences that fallback is what sets the attention op's peak.
 
 0.2.0 adds a flash-attention path with a Metal forward *and* a Metal backward, neither of which materializes the score matrix. It keeps O(N) saved state — the attention output and the log-sum-exp — and recomputes the tiles it needs. You switch it on per model with `enable_flash_attention` and train exactly as before.
 

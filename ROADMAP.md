@@ -11,6 +11,15 @@
   quadratic with a packed (array) mask, so flash attention's memory advantage holds mainly
   for packed batches. The 0.32.4 flash figures are maintainer measurements, since the
   package refuses its flash path on an unverified mlx.
+  *Corrected 2026-11-14:* this entry said the backward is lighter "for causal attention".
+  Per the MLX source at 0.32.4, a call with no mask given as an array (causal, or no mask at
+  all) runs MLX's single-kernel attention as a fused forward and a fused backward during
+  training (under `mx.grad` or `value_and_grad`), for supported head sizes and dtypes. A mask
+  passed in as an array (MLX also accepts the string "causal"), such as the block-diagonal
+  mask that packing builds, falls back and stays quadratic. The forward also changed during
+  training, so part of the 12.532 to 0.682 GiB drop may come from it; the split was not
+  measured. The backward works in score tiles of up to 1,024 × 1,024 per head, so below
+  1,024 tokens a tile is the whole matrix. Attention with no mask was not measured.
 - Fixed: mlx-lm 0.31.x runs the Python file a model's `config.json` names under `model_file`
   when the model loads. mlx-train-perf now refuses such a model with `ModelCodeRefusedError`
   before anything loads.
