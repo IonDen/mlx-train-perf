@@ -70,22 +70,22 @@ from mlx_train_perf.attention.kernel.source import (
 )
 from mlx_train_perf.errors import AttentionInputError, LaunchBudgetError
 
-# 0.5, NOT 1.0 (T6 rung-0 kill evidence, macOS 26 / mlx 0.32.0): a projected-1.0s flagship
+# 0.5, NOT 1.0 (observed-kill evidence, macOS 26 / mlx 0.32.0): a projected-1.0s flagship
 # dispatch sized from the SAFETY-halved calibrated rate was killed by the OS with
 # kIOGPUCommandBufferCallbackErrorImpactingInteractivity -- a softer, EARLIER kill than the
 # 5-10s GPU watchdog the 1.0s figure assumed. The CE kernel's shipped ~0.5s-real dispatches
-# have never been killed (0.1.0 T13: zero watchdog events), so 0.5s projected (~0.25s real
-# behind the 2x SAFETY margin) sits in the proven-safe class. Raising this needs new
-# kill-threshold evidence. A 2026-07-10 ground-truth probe (13 conditions,
-# _artifacts/attention_bwd_rungs/buffer_packing_probe/) found the kill SYSTEM-STATE-DEPENDENT:
-# real 1.0s single dispatches SURVIVED, but only on a PERMISSIVE (idle-display) day -- the kill
-# is display/UI-contention-driven, so this stays pinned to the WORST observed day and a
-# permissive-day survival never licenses raising it.
+# have never been killed (zero watchdog events were observed in the 0.1.0 training benchmarks), so
+# 0.5s projected (~0.25s real behind the 2x SAFETY margin) sits in the proven-safe class.
+# Raising this needs new kill-threshold evidence. A 2026-07-10 ground-truth probe (13
+# conditions, _artifacts/attention_bwd_rungs/probe_buffer_packing.py) found the kill
+# SYSTEM-STATE-DEPENDENT: real 1.0s single dispatches SURVIVED, but only on a PERMISSIVE
+# (idle-display) day -- the kill is display/UI-contention-driven, so this stays pinned to the
+# WORST observed day and a permissive-day survival never licenses raising it.
 MAX_DISPATCH_SECONDS = 0.5
 _CANARY_BUDGET_S = 0.1   # projected cost of the calibration's final full-working-set probe
-# 0.3.0 (backlog 0025, launch-budget evidence study): the OS kill unit is the individual
+# 0.3.0 (launch-budget evidence study): the OS kill unit is the individual
 # COMMAND BUFFER -- there is no chain-total or per-eval kill mechanism (the retired
-# MAX_TOTAL_SECONDS = 2.0 guarded a mis-attributed reading of the rung-0 kill: those "35
+# MAX_TOTAL_SECONDS = 2.0 guarded a mis-attributed reading of the kill above: those "35
 # packed dispatches" were really ~4-6-dispatch ~1.0-1.5 s packed BUFFERS dying on a
 # kill-active day; external corroboration ml-explore/mlx#3267). mlx 0.32.0 commits a buffer
 # when it holds >50 ops OR >50 M unique input+output ELEMENTS (device.cpp needs_commit,
@@ -108,7 +108,8 @@ _PROBE_N_HARD_CAP = 8192 # never probe past this many keys/queries during calibr
                          # 8192 tile cap)
 
 # key: (head_dim, dtype, causal, b, hq, n-bucket, variant, d_slab, packed) -- variant/d_slab/
-# packed-aware (T6 rung 3 + 0.4.0): probe what you rate, see calibrated_fwd_rate's own docstring.
+# packed-aware (variant/d_slab since 0.2.0, packed since 0.4.0): probe what you rate,
+# see calibrated_fwd_rate's own docstring.
 _FWD_RATE_CACHE: dict[
     tuple[int, str, bool, int, int, int, str, int | None, bool], float
 ] = {}
