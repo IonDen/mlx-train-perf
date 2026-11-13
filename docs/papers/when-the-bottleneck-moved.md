@@ -4,23 +4,54 @@
 
 > 📄 [Read on the website](https://ineshin.space/papers/when-the-bottleneck-moved/) — same paper, formatted for reading.
 
+## Update, 2026-11-13: what changed in MLX 0.32.4
+
+On MLX 0.32.4 the tiled flash-attention path keeps a large memory advantage at 8,192 tokens only
+for packed batches. This paper's measurements are from MLX 0.32.0, or 0.31.2 where noted,
+including the headline results in the release
+[README](https://github.com/IonDen/mlx-train-perf/blob/v0.3.1/README.md): a training step at
+8,192 tokens peaked at 12.75 GiB with flash attention and the fused loss against 25.68 GiB with
+stock attention and stock loss, and the largest completed two-step probe, on the same pairs,
+reached 23,040 tokens against 7,936. The loss arms are not in the README; sections 4 and 6
+source them.
+
+MLX 0.32.4 added a stock attention backward
+([ml-explore/mlx#4563](https://github.com/ml-explore/mlx/pull/4563)). In the library's later
+attention benchmark ([0.9.1 changelog](https://github.com/IonDen/mlx-train-perf/blob/v0.9.1/CHANGELOG.md)),
+one causal forward plus backward at 8,192 tokens on 0.32.4 peaks at 0.682 GiB stock against
+0.596 GiB flash; on MLX 0.32.0 stock peaks at 12.532 GiB. A packed (block-diagonal) mask keeps the
+stock backward quadratic: 12.469 against 0.659 GiB. At 1,024 tokens causal stock still uses 4.6×
+more. Unmasked attention was not measured. The library still pins MLX 0.32.0 and refuses flash on
+0.32.4, so all 0.32.4 rows used a measurement-only override. This benchmark is neither section
+2's 12.75 GiB inline probe (MLX 0.31.2) nor section 4's 0.721 GiB single-op run.
+
+When you remove a bottleneck, measure what replaced it: here the stock attention backward, which
+0.32.4 lightened for causal masks, not packed ones.
+
+---
+
 Removing a large allocation does not necessarily move a system's memory ceiling. It moves the
 ceiling only when that allocation is alive at the peak.
 
 That distinction cost `mlx-train-perf` its first product hypothesis. A fused linear cross-entropy forward
 removed the `(tokens, vocabulary)` logits matrix, and at moderate sequence lengths an end-to-end
 training run used less memory. We expected the saving to extend the longest context that fit on a
-32 GB Mac. It did not. At 8192 tokens, the fused-loss and stock-loss training paths reached the same
-21.39 GiB marginal peak above resident state. Together with that tie, an isolated attention operation
-whose forward-plus-backward window peaked at 12.75 GiB pointed to the credible dominant shared term:
-a quadratic-memory attention backward. The experiments did not directly trace the lifetime of the loss
-buffers, so they do not establish the ordering or overlap of the loss and attention peaks.
+32 GB Mac. It did not. At 8192 tokens on MLX 0.31.2, the fused-loss and stock-loss training paths
+reached the same 21.39 GiB marginal peak above resident state. Together with that tie, an isolated
+attention operation whose forward-plus-backward window peaked at 12.75 GiB on the same release
+pointed to the credible dominant shared term: a quadratic-memory attention backward, which stock
+attention had on MLX 0.31.2 and 0.32.0. The experiments
+did not directly trace the lifetime of the loss buffers, so they do not establish the ordering or
+overlap of the loss and attention peaks.
 
 The next implementation replaced that quadratic-memory backward with tiled recomputation on Metal.
-At 8192 tokens, the release documents report a 12.75 GiB total peak for flash attention plus fused
-loss against 25.68 GiB for stock attention plus stock loss. This full-product comparison changes two
-components at once, and the public evidence does not contain a complete memory 2×2 (both attention
-paths crossed with both loss paths) that could assign an order-independent share to either component.
+At 8192 tokens on MLX 0.32.0, the release documents report a 12.75 GiB total peak with flash
+attention against 25.68 GiB with stock attention; the project's unpublished benchmark record pairs
+them with the fused and the stock loss respectively. This full-product comparison changes two
+components at once, and the public evidence does not contain a complete memory 2×2 (both
+attention paths crossed with both loss paths) that could assign an order-independent share to
+either component. Neither this comparison nor the context sweep below was re-measured on MLX
+0.32.4 (see the update above).
 
 One more model then failed. The first release of the flash path capped the total projected duration of
 a chained Metal launch. MLX source inspection and a dedicated packing probe showed that successive
@@ -30,9 +61,10 @@ the range in the buffer it closes. The evidence is consistent with command-buffe
 relevant to macOS interactivity kills, but it does not directly observe the operating system's
 decision rule.
 
-The project [README](https://github.com/IonDen/mlx-train-perf/blob/main/README.md) and [changelog](https://github.com/IonDen/mlx-train-perf/blob/main/CHANGELOG.md) report a later context sweep reaching 23,040 tokens on the
-flash-plus-fused path versus 7,936 on the stock path on the same M1 Max. This article treats those as
-source-reported measurements; it does not independently rerun the benchmark. The public release record
+The project [README](https://github.com/IonDen/mlx-train-perf/blob/v0.3.1/README.md) and [changelog](https://github.com/IonDen/mlx-train-perf/blob/v0.3.1/CHANGELOG.md) report a later context sweep on MLX 0.32.0 reaching 23,040 tokens on the
+flash-plus-fused path versus 7,936 on the stock path on the same M1 Max. This article treats the
+step peaks and the sweep as source-reported measurements; it does not independently rerun the
+benchmark. The public release record
 does not include the raw failed probes above 23,040, so it cannot establish a pure post-correction
 memory frontier for an outside reader.
 
@@ -46,7 +78,9 @@ Neural Accelerators, together with the evidence trail showing how two plausible 
 ![Evidence flow from the failed logits-memory hypothesis through FlashAttention and the corrected command-buffer guard](https://raw.githubusercontent.com/IonDen/mlx-train-perf/main/docs/papers/diagrams/bottleneck-migration-evidence-flow.svg)
 
 *Figure 1. Two measured corrections changed the implementation. The sequence is conceptual, the
-values are source-reported, and the figure does not claim an allocation-lifetime trace. The editable
+values are source-reported (the 21.39 GiB tie and the 12.75 GiB isolated attention peak on MLX
+0.31.2; the 23,040 against 7,936 sweep on MLX 0.32.0), and the figure does not claim an
+allocation-lifetime trace. The editable
 [PlantUML source](https://github.com/IonDen/mlx-train-perf/blob/main/docs/papers/diagrams/bottleneck-migration-evidence-flow.puml)
 is published with the paper.*
 
@@ -71,7 +105,8 @@ layers, bfloat16 compute, AdamW, gradient checkpointing, and the compiled `mlx-l
 Every context probe ran in a separate subprocess and executed two real fine-tuning steps. The search
 doubled the context and then bisected to a 256-token granularity.
 
-The result contradicted the hypothesis. The values below, from the dated project record, are
+The result contradicted the hypothesis. The values below, from the earlier run described after
+the table, are
 **source-reported marginal peaks** above roughly 4.29 GiB of resident model state; later tables use a
 different metric, the total peak:
 
@@ -87,9 +122,9 @@ the available precision. The largest successful contexts were 8,448 for the fuse
 stock, one search step apart and reversed from the prediction. The honest interpretation was a tie,
 not a small loss for fusion.
 
-These values come from the dated research record that preceded the public benchmark bundle. That
-record includes the environment, search procedure, and result table summarized here, but its raw
-per-probe artifacts and original sweep driver were not published. The table is therefore an
+These values come from an earlier measurement run whose raw artifacts and driver were not
+published with the code; the environment, search procedure, and result table summarized here are
+that run's. The table is therefore an
 attributed historical result, not an independently reproducible result from the current repository.
 
 This experiment also corrected the meaning of an earlier measurement: the loss layer in isolation,
@@ -104,13 +139,15 @@ The shape of the training curve pointed away from vocabulary logits. When `N` do
 4,096 and then 8,192, the peak grew much faster than linearly. Both loss arms converged on the same
 curve. That supports a shared dominant term but does not identify allocation lifetimes.
 
-A direct scaled-dot-product-attention experiment measured the candidate term. The dated research
-record reports an inline experiment with one causal `mx.fast.scaled_dot_product_attention` operation,
-32 heads, head dimension 128, and bfloat16 inputs. It evaluated materialized inputs, cleared the cache,
-reset MLX's peak-memory counter, and measured forward-only and gradient evaluations separately. The
-raw result artifact and a standalone historical driver are not part of the public evidence bundle.
-The MLX fast path had a memory-light forward, but its training backward fell back to an unfused
-implementation:
+A direct scaled-dot-product-attention experiment measured the candidate term: an inline
+experiment with one causal `mx.fast.scaled_dot_product_attention` operation, 32 heads, head
+dimension 128, and bfloat16 inputs, from an earlier measurement run whose raw artifacts and driver
+were not published with the code. It evaluated materialized inputs, cleared the cache, reset MLX's
+peak-memory counter, and measured forward-only and gradient evaluations separately. On MLX 0.31.2
+and 0.32.0, this fast path had a memory-light forward, but its training backward fell back to an
+unfused implementation (MLX 0.32.4 added a backward for it,
+[ml-explore/mlx#4563](https://github.com/ml-explore/mlx/pull/4563)). The table below was measured
+on MLX 0.31.2:
 
 | sequence length | forward peak | forward-plus-backward peak |
 |---:|---:|---:|
@@ -129,8 +166,9 @@ The behavior also matched pinned MLX source. In [MLX 0.31.2](https://github.com/
 and [MLX 0.32.0](https://github.com/ml-explore/mlx/blob/v0.32.0/mlx/backend/metal/scaled_dot_product_attention.cpp#L591-L607),
 the Metal fast-SDPA training path fell back, and the
 [0.32.0 VJP GPU implementation](https://github.com/ml-explore/mlx/blob/v0.32.0/mlx/backend/metal/scaled_dot_product_attention.cpp#L792-L799)
-was marked `NYI` (not yet implemented). The missing component was not another loss optimization. It
-was a memory-efficient attention backward.
+was marked `NYI` (not yet implemented). On those two releases, the missing component was a
+memory-efficient attention backward, not another loss optimization. MLX 0.32.4's backward is far
+lighter with a causal mask (see the update above).
 
 ## 3. What the FlashAttention schedule changes
 
@@ -201,16 +239,20 @@ loss-curve agreement, not elementwise attention error.
 ## 4. Separating the attention win from the loss win
 
 The 0.2 release benchmark used MLX 0.32.0 on the same 32 GB M1 Max, with Qwen3-8B-4bit, batch 1,
-LoRA rank 8, bfloat16 compute, and gradient checkpointing. The public [README](https://github.com/IonDen/mlx-train-perf/blob/main/README.md) and
-[changelog](https://github.com/IonDen/mlx-train-perf/blob/main/CHANGELOG.md) report the following 8,192-token outcomes; the raw train-step JSON is
-not committed, so values are rounded to the public release precision:
+LoRA rank 8, bfloat16 compute, and gradient checkpointing. The public [README](https://github.com/IonDen/mlx-train-perf/blob/v0.3.1/README.md) and
+[changelog](https://github.com/IonDen/mlx-train-perf/blob/v0.3.1/CHANGELOG.md) report the following 8,192-token outcomes; the raw train-step JSON is
+not committed, so values are rounded to the public release precision. The two documents name the
+loss arm of each throughput figure and of the abort, but give the two total peaks only by
+attention arm; their loss-arm labels come from the project's unpublished benchmark record. The
+flash plus fused-loss throughput is published only as a ratio: under flash attention, the fused
+loss ran at 0.99× the stock loss's tokens per second at 8,192 tokens.
 
 | attention | loss | status | total peak | median throughput |
 |---|---|---|---:|---:|
 | stock | stock | completed | 25.68 GiB | 78.1 tok/s |
 | stock | fused | memory-watchdog abort | not available | not available |
 | flash | stock | completed | not published | 74.0 tok/s |
-| flash | fused | completed | 12.75 GiB | 72.9 tok/s |
+| flash | fused | completed | 12.75 GiB | 0.99× flash + stock loss |
 
 The full-product comparison, flash plus fused loss against stock attention plus stock loss, was close
 to a twofold reduction in total peak. It changed two components at once. The fixed-stock-loss
@@ -223,7 +265,7 @@ The stock-attention plus fused-loss cell aborted while the stock-loss cell compl
 documents do not expose enough session state to explain that ordering as a monotonic allocation result.
 The missing cell must remain missing; it cannot be reconstructed from the other three.
 
-The [committed single-op reproduction](https://github.com/IonDen/mlx-train-perf/blob/main/community-benchmarks/apple-m1-max-32gb-2026-07-13.json)
+The [committed single-op reproduction](https://github.com/IonDen/mlx-train-perf/blob/v0.3.1/community-benchmarks/apple-m1-max-32gb-2026-07-13.json)
 compares the flash kernel with the project's materialized
 pure-MLX mathematical reference. It does **not** measure `mx.fast.scaled_dot_product_attention` and
 must not be read as an installed-MLX stock-path comparison. Its values are marginal device peaks
@@ -238,7 +280,9 @@ after implementation-specific warm-up and an active-memory baseline reset:
 The flash measurements are consistent with the intended linear saved-state design, but three points
 do not constitute an asymptotic proof. The 4,096→8,192 measured peak grows by 3.06× because the metric
 includes more than the persistent `O` and `L` arrays. The safe claim is that the implementation avoids
-the full score matrix and measured far below the stock path at the tested long-context shapes.
+the full score matrix and measured far below the project's pure-MLX reference at the tested
+long-context shapes. That reference is not stock `mx.fast.scaled_dot_product_attention`; the
+update above gives the stock call's figures on MLX 0.32.0 and 0.32.4.
 
 ## 5. The second wrong model: budgeting the whole chain
 
@@ -265,13 +309,15 @@ not semantic tensor liveness. At the 8,192-token training shape, a single `dK/dV
 cannot share one command buffer: each triggers a commit after it is encoded, although smaller preceding
 work may share the buffer it closes. The chain total is not the duration of one command buffer.
 
-A source-reported behavioral probe, using the public
-[`probe_command_buffer_packing.py`](https://github.com/IonDen/mlx-train-perf/blob/main/scripts/probe_command_buffer_packing.py) method, was
-consistent with the scheduler thresholds being active in the shipped wheel. For example, forcing a
-boundary after every operation made a chain of 2,000 tiny serial matrix multiplies 2.8× slower, an
-aggregate cost associated with more frequent commits rather than an isolated fence measurement. A
-separate `N=12,288` chained `dK/dV` probe, nominally beyond the retired total-chain budget, completed
-in 0.781 s wall with finite outputs and a 1.56 GiB peak. The raw probe JSON is not in the public bundle.
+The project's recorded behavioral probe, not rerun here, follows the method of the public
+[`probe_command_buffer_packing.py`](https://github.com/IonDen/mlx-train-perf/blob/v0.3.1/scripts/probe_command_buffer_packing.py)
+and was consistent with the operation-count threshold being active in the shipped wheel. Forcing
+a commit after every operation made a chain of 2,000 tiny serial matrix multiplies clearly slower.
+Raising the operation threshold did not make the chain faster, so the probe does not isolate the
+per-commit overhead. For a chain of large additions, the three size-threshold settings were within
+a small spread, so the element threshold rests on the source reading above. A separate `N=12,288`
+chained `dK/dV` probe, whose total projected time exceeded the retired chain cap, completed with
+finite outputs. The raw probe record is not in the public bundle.
 
 The corrected guard models work per command buffer. It keeps the worst-day safety margin for each
 buffer and accounts for small dispatches that can still pack together. No safety margin was raised.
@@ -281,25 +327,28 @@ internal decision boundary.
 ## 6. The source-reported context sweep
 
 After the guard correction, the project ran the sweep that its
-[README](https://github.com/IonDen/mlx-train-perf/blob/main/README.md) and
-[changelog](https://github.com/IonDen/mlx-train-perf/blob/main/CHANGELOG.md) report: Qwen3-8B-4bit
-QLoRA, batch 1, LoRA rank 8, bfloat16 compute, gradient checkpointing, and two training steps per
-isolated probe. The two documents agree on the following source-reported results:
+[README](https://github.com/IonDen/mlx-train-perf/blob/v0.3.1/README.md) and
+[changelog](https://github.com/IonDen/mlx-train-perf/blob/v0.3.1/CHANGELOG.md) report, on MLX
+0.32.0: Qwen3-8B-4bit QLoRA, batch 1, LoRA rank 8, bfloat16 compute, gradient checkpointing, and
+two training steps per isolated probe. The
+[sweep driver](https://github.com/IonDen/mlx-train-perf/blob/v0.3.1/scripts/northstar_context_sweep.py)
+pairs flash attention with the fused loss and stock attention with the stock loss. The two
+documents agree on the following source-reported results, which were not re-measured on MLX 0.32.4:
 
 | path | reported largest completed context | reported peak there |
 |---|---:|---:|
 | stock attention + stock loss | 7,936 | about 24.5 GiB |
 | flash attention + fused loss | 23,040 | about 24.5 GiB |
 
-The ratio of the reported largest completed points is 2.90× on this machine and this run. It is not a
-universal context multiplier. The comparison changes both attention and loss, uses one model and
+The ratio of the reported largest completed points is 2.90× on this machine, in this run. It is
+not a universal context multiplier. The comparison changes both attention and loss, uses one model and
 batch size, and depends on the available-memory ceiling at probe start. Larger-memory hardware was
 not measured, and this article did not rerun the sweep.
 
 The release documents call both completed frontiers memory-bounded, but the raw failed probes are not
 in the public evidence bundle. The reported ceilings and ratio can therefore be cited as release
 results; the precise failure sequence above 23,040 and a pure post-correction memory frontier cannot be
-independently audited here.
+independently verified here.
 
 The supported editorial claim is narrower: the project documents report a two-step execution at
 23,040 tokens with roughly the total peak that stock used at 7,936. This is a documented
@@ -335,19 +384,19 @@ mechanism that should guide the next design.
 The evidence comes from one M1 Max with 32 GB unified memory, two pinned MLX releases, one flagship
 Qwen3 recipe, and short two-step context probes. Absolute ceilings depend on machine availability,
 thermal and display state, software versions, and the active safety ceiling. The context sweep measures
-two short steps, not training quality over a meaningful optimization run. This article cross-checks
-the reported figures against existing project documents and does not rerun the research code.
+two short steps, not training quality over a meaningful optimization run. This article compares
+the figures with the project's own release documents and does not rerun the research code.
 
 The algorithms and benchmark drivers are public in this repository:
 
-- [`scripts/bench_attention_op.py`](https://github.com/IonDen/mlx-train-perf/blob/main/scripts/bench_attention_op.py) measures isolated attention memory and wall time.
-- [`scripts/bench_train_step.py`](https://github.com/IonDen/mlx-train-perf/blob/main/scripts/bench_train_step.py) measures the attention/loss combinations.
-- [`scripts/northstar_context_sweep.py`](https://github.com/IonDen/mlx-train-perf/blob/main/scripts/northstar_context_sweep.py) performs the context search.
-- [`scripts/probe_command_buffer_packing.py`](https://github.com/IonDen/mlx-train-perf/blob/main/scripts/probe_command_buffer_packing.py) tests the scheduler model.
+- [`scripts/bench_attention_op.py`](https://github.com/IonDen/mlx-train-perf/blob/v0.3.1/scripts/bench_attention_op.py) measures isolated attention memory and wall time.
+- [`scripts/bench_train_step.py`](https://github.com/IonDen/mlx-train-perf/blob/v0.3.1/scripts/bench_train_step.py) measures the attention/loss combinations.
+- [`scripts/northstar_context_sweep.py`](https://github.com/IonDen/mlx-train-perf/blob/v0.3.1/scripts/northstar_context_sweep.py) performs the context search.
+- [`scripts/probe_command_buffer_packing.py`](https://github.com/IonDen/mlx-train-perf/blob/v0.3.1/scripts/probe_command_buffer_packing.py) tests the scheduler model.
 
-The [committed community artifact](https://github.com/IonDen/mlx-train-perf/blob/main/community-benchmarks/apple-m1-max-32gb-2026-07-13.json)
+The [committed community artifact](https://github.com/IonDen/mlx-train-perf/blob/v0.3.1/community-benchmarks/apple-m1-max-32gb-2026-07-13.json)
 contains the MLX 0.32.0 single-op measurements through 8,192 tokens. The release
-[README](https://github.com/IonDen/mlx-train-perf/blob/main/README.md) and [changelog](https://github.com/IonDen/mlx-train-perf/blob/main/CHANGELOG.md) record the train-step and context results.
+[README](https://github.com/IonDen/mlx-train-perf/blob/v0.3.1/README.md) and [changelog](https://github.com/IonDen/mlx-train-perf/blob/v0.3.1/CHANGELOG.md) record the train-step and context results.
 Raw JSON for the train-step, context-sweep, and command-buffer campaigns is not part of the public
 evidence bundle, so this is a source-based technical article, not an independently reproducible
 benchmark report.
@@ -360,7 +409,8 @@ algorithm for the quadratic attention-memory bottleneck this paper targets;
 non-matrix-multiply overhead. [Cut Cross-Entropy](https://arxiv.org/abs/2411.09009) and
 [Liger-Kernel](https://github.com/linkedin/Liger-Kernel) address the separate `(tokens, vocabulary)`
 logits bottleneck. Their relevance here is the systems interaction: removing loss-layer materialization
-does not increase end-to-end context when an O(N²)-memory attention backward becomes the next peak.
+does not increase end-to-end context when an O(N²)-memory attention backward becomes the next peak
+(as on MLX 0.31.2 and 0.32.0).
 
 Closer Apple-platform implementations predate this work. [Metal FlashAttention 2.0](https://engineering.drawthings.ai/p/metal-flashattention-2-0-pushing-forward-on-device-inference-training-on-apple-silicon-fe8aac1ab23c)
 published Swift/C++ Metal kernels and an experimental backward for diffusion training in January 2025.
@@ -373,4 +423,4 @@ arbitrary attention modes.
 
 ---
 
-*Prepared 2026-07-14. Last updated 2026-07-20. Denis Ineshin.*
+*Prepared 2026-07-14. Last updated 2026-11-13. Denis Ineshin.*
