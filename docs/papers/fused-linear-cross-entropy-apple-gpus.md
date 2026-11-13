@@ -9,7 +9,7 @@ tokens and a vocabulary of size `V`, that matrix has shape `(N, V)`. Yet the los
 log-sum-exp and one target logit from each row. We built a fused MLX/Metal forward kernel that computes
 those values in tiles and never stores the full matrix. At `N=8192`, `V=151936`, and hidden dimension
 `D=4096`, the fused forward took 2.105 s versus 1.286 s for materialized MLX. A public memory run also
-recorded a much lower peak for the fused path. Unequal warm-up baselines, however, prevent a sound
+recorded a much lower peak for the fused path. Unequal starting baselines, however, prevent a sound
 per-call memory ratio; Section 3 reports the full measurements and explains the limit.
 
 The optimization process produced two less obvious results. First, forcing `mx.eval` after each
@@ -128,15 +128,15 @@ The committed MLX 0.32.0 run produced the following isolated forward result:
 | Materialized MLX logits | 5.8585 GiB | 2.3184 GiB | 8.1768 GiB | 1.285595 s | 3965.577 G MAC/s |
 | Fused Metal kernel | 1.2218 GiB | 0.0006 GiB | 1.2224 GiB | 2.104592 s | 2422.382 G MAC/s |
 
-The same-session timing gives a 1.64× forward slowdown. The memory columns need more care. The benchmark
-warms each implementation, keeps the warm-up loss alive, clears the allocator cache, and resets the
-peak counter. The materialized path therefore starts its measured window with 4.6367 GiB more active
-memory than the fused path.
+The same-session timing gives a 1.64× forward slowdown. The memory columns need more care. The
+materialized path starts its measured window at 8,192 tokens with 4.6367 GiB more active memory than
+the fused path. The cause was not isolated: at 512 and 2,048 tokens the two paths start from the same
+active memory.
 
 That baseline gap dominates a ratio between the two marginal columns, while the 0.0006 GiB value is
 also rounded to four decimal places. The table shows different memory behavior, but it does not provide
 a clean per-call reduction ratio. Such a ratio would require raw byte counts and a fresh run from a
-common input-only baseline with no live warm-up graph.
+common baseline.
 
 ## 4. The load-reuse model works once
 
@@ -250,7 +250,7 @@ another unmeasured way.
 ## 7. Forward savings do not predict full-step savings
 
 The fused kernel removes the logits allocation from the forward loss layer by construction. The public
-memory run is consistent with a large reduction, but its unequal warmed baselines do not support a clean
+memory run is consistent with a large reduction, but its unequal starting baselines do not support a clean
 ratio. In a complete training step, the transformer, optimizer, model weights, and attention backward
 remain. Removing one allocation does not guarantee a proportional increase in maximum context.
 
@@ -304,7 +304,7 @@ Absolute rates can change with the machine, OS, MLX release, thermal state, and 
 medians capture large design differences, not fine-grained variance.
 
 The experiments did not confirm the occupancy and register-spill explanations with ISA or counter
-evidence. The public memory protocol also uses unequal warm-up baselines, so it cannot support a clean
+evidence. The public memory run also starts from unequal baselines at 8,192 tokens, so it cannot support a clean
 per-call memory ratio. This article reports that limitation rather than rerunning the experiment. It
 also covers only the forward kernel. The shipping backward path and quantized-head variants are outside
 its scope.
@@ -330,7 +330,7 @@ kernels for other accelerator stacks.
 
 The fused forward removes the `(N, V)` logits matrix, but it trades memory for time. On the measured
 M1 Max shape, it ran 1.64× slower than materialized MLX. The public memory result points to a large
-reduction, but its unequal warm-up baselines prevent a reliable per-call ratio.
+reduction, but a baseline gap at 8,192 tokens prevents a reliable per-call ratio.
 
 The optimization ladder matters for a different reason. A load-reuse model correctly predicted the
 `4 × 4` improvement and failed at `4 × 8`; the `32 × 32` matrix tile later recovered the best observed
