@@ -34,10 +34,10 @@ The fused loss and sequence packing are unaffected by it.
 ### Measured on mlx 0.32.0
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/IonDen/mlx-train-perf/main/docs/images/training-step-memory.svg" alt="Training step peak memory at 8192 tokens on Qwen3-8B-4bit, measured on mlx 0.32.0: stock attention 25.68 GiB, above what a 32 GB Mac can use; flash attention 12.75 GiB, comfortably under it." width="720">
+  <img src="https://raw.githubusercontent.com/IonDen/mlx-train-perf/main/docs/images/training-step-memory.svg" alt="Training step peak memory at 8192 tokens on Qwen3-8B-4bit, measured on mlx 0.32.0: stock attention with mlx-lm's stock loss 25.68 GiB; flash attention with the fused loss 12.75 GiB." width="720">
 </p>
 
-On mlx 0.32.0 the longest sequence you can train on this machine goes from 7,936 tokens with stock attention to 23,040 with the flash path.
+On mlx 0.32.0 the longest sequence you can train on this machine goes from 7,936 tokens with stock attention to 23,040 with flash attention and the fused loss.
 
 ## Does this help me?
 
@@ -46,7 +46,7 @@ Including the cases where it does not.
 | What you are hitting | Does this help? |
 |---|---|
 | The truncation warning above, on examples you would rather keep whole | Yes. Raise `max_seq_length` and use the [flash-attention path](https://github.com/IonDen/mlx-train-perf#flash-attention-training-path). On mlx 0.32.0 this is where it helps most. On 0.32.4 stock attention is much lighter for causal attention, though not for packed batches. |
-| You raised `max_seq_length` and the run died or the machine locked up | Yes, if one step was the problem. On mlx 0.32.0, at 8192 tokens the step's peak drops from 25.68 to 12.75 GiB. |
+| You raised `max_seq_length` and the run died or the machine locked up | Yes, if one step was the problem. On mlx 0.32.0, at 8192 tokens the step's peak drops from 25.68 to 12.75 GiB with flash attention and the fused loss. |
 | An instruction dataset of short examples, and training crawls while the GPU looks idle | Yes. [Packing](https://github.com/IonDen/mlx-train-perf#sequence-packing) carried 2 to 3× more real tokens per second on mlx 0.32.0 (M1 Max 32 GB, `scripts/bench_packed_training.py`). |
 | You want to know whether a config fits before spending an hour finding out | Yes. [`mlx-train-perf plan`](https://github.com/IonDen/mlx-train-perf#ram-fit-planner) answers without loading the model. |
 | Everything already fits at the 2048 default | Not for the memory work. Packing can still help if your examples are short. |
@@ -90,7 +90,7 @@ mlx_lm.lora --model mlx-community/Qwen3-8B-4bit --train --data ./data \
 truncated to 2048. Consider pre-splitting your data to save memory.
 ```
 
-On mlx 0.32.0, passing `--max-seq-length 8192` trades the truncation for a crash: the step peaks at 25.68 GiB, and a 32 GB Mac has roughly 24.5 GiB to give it. With the flash path that same step peaks at 12.75 GiB, and the longest sequence you can train moves from 7,936 tokens to 23,040 (`scripts/northstar_context_sweep.py`). On mlx 0.32.4 stock attention's backward uses far less memory for causal attention, so check the [flash-attention section](#flash-attention-training-path) before assuming the same crash.
+On mlx 0.32.0, passing `--max-seq-length 8192` trades the truncation for a crash: the step peaks at 25.68 GiB, and a 32 GB Mac has roughly 24.5 GiB to give it. With flash attention and the fused loss that same step peaks at 12.75 GiB, and the longest sequence you can train moves from 7,936 tokens to 23,040 (`scripts/northstar_context_sweep.py`). On mlx 0.32.4 stock attention's backward uses far less memory for causal attention, so check the [flash-attention section](#flash-attention-training-path) before assuming the same crash.
 
 ```python
 import mlx.core as mx
@@ -256,14 +256,17 @@ On mlx 0.32.0, `mx.fast.scaled_dot_product_attention` has a memory-light forward
 
 0.2.0 adds a flash-attention path with a Metal forward *and* a Metal backward, neither of which materializes the score matrix. It keeps O(N) saved state — the attention output and the log-sum-exp — and recomputes the tiles it needs. You switch it on per model with `enable_flash_attention` and train exactly as before.
 
-On Qwen3-8B-4bit (LoRA rank 8, batch 1, gradient checkpointing on, bf16, mlx 0.32.0) the two attention paths are close at a 2048-token sequence. At 8192 they are not: the flash path halves the whole step's peak memory.
+On Qwen3-8B-4bit (LoRA rank 8, batch 1, gradient checkpointing on, bf16, mlx 0.32.0) the two attention paths are close at a 2048-token sequence. At 8192 they are not. In separate runs, flash attention took the step's peak from 25.68 to 15.92 GiB; in the same session, the fused loss took it from 15.92 to 12.75 GiB.
 
-| seq 8192, Qwen3-8B-4bit | total peak | marginal peak |
-|---|---|---|
-| stock attention | 25.68 GiB | 21.31 GiB |
-| flash attention | 12.75 GiB | 8.37 GiB |
+| seq 8192, Qwen3-8B-4bit | loss | total peak | marginal peak |
+|---|---|---|---|
+| stock attention | mlx-lm's stock loss | 25.68 GiB | 21.31 GiB |
+| flash attention | mlx-lm's stock loss | 15.92 GiB | 11.54 GiB |
+| flash attention | fused loss | 12.75 GiB | 8.37 GiB |
 
-(`scripts/bench_train_step.py`; M1 Max 32 GB, macOS 26.5, mlx 0.32.0. These memory and throughput figures are the 0.2.0 measurements, carried into 0.3.0 unchanged: 0.3.0 changed how the backward splits its kernel launches, not what it allocates, and the 0.3.0 context sweep below — measured fresh — confirms the flash path's memory still scales linearly in sequence length.)
+The fourth combination, stock attention with the fused loss, did not finish: the run crossed its memory watchdog ceiling (24.54 GiB, set from the memory free when it started) and was aborted.
+
+(`scripts/bench_train_step.py`; M1 Max 32 GB, macOS 26.5.1 and 26.5.2, mlx 0.32.0. These memory and throughput figures were measured during 0.2.0 development and carried into 0.3.0 unchanged: 0.3.0 changed how the backward splits its kernel launches, not what it allocates, and the 0.3.0 context sweep below — measured fresh — confirms the flash path's memory still scales linearly in sequence length.)
 
 On mlx 0.32.0, the 32 GB machine that peaked near its ceiling with stock attention runs the same step at half the memory. That headroom buys a longer sequence.
 
