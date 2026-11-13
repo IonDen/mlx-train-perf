@@ -111,8 +111,9 @@
   same effective memory ceiling — the flash path reaches 2.9x the context at one memory
   budget, because it keeps O(N) saved state.
   *Corrected 2026-11-13:* the 23,040 and 7,936 token ceilings and the 2.9x ratio are
-  withdrawn; no record published with the repository shows them. The README gives the
-  op-level attention records and no maximum-trainable-context figure.
+  withdrawn. The July 2026 records in `evidence/2026-07-run-records/` include a sweep with
+  those points, with the caveats listed there. The README gives the op-level attention
+  records and no maximum-trainable-context figure.
 - Qwen2 (Qwen2.5 family) support in the mlx-lm loss adapter, with loss parity against the
   stock trainer verified on a real checkpoint.
 - Benchmark hygiene: attention-arm artifact filenames, a distinct too-crowded status that
@@ -127,7 +128,9 @@
   extra memory raises stock attention's memory-bound ceiling, while the flash path stays near
   10k until faster dK/dV backward kernels or new launch-budget evidence lift it.
   *Corrected 2026-11-13:* the "roughly halves" comparison, the "near-tied" maximum trainable
-  context and the "near 10k" context figure are withdrawn; no record published with the repository shows them. The README gives the
+  context and the "near 10k" context figure are withdrawn. The July 2026 records in
+  `evidence/2026-07-run-records/` include whole steps and a context sweep, with the caveats
+  listed there; none of them holds the "near 10k" figure. The README gives the
   op-level attention records and no whole-step figure for switching attention.
 - `enable_flash_attention` wrapper for the Llama (full-attention) and Qwen3 families, with
   typed refusals for the cases a causal training path does not serve.

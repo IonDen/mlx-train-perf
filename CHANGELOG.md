@@ -4,6 +4,33 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- Six sets of July 2026 run records are committed to this repository on 2026-11-14, in
+  `evidence/2026-07-run-records/`, with a note that separates what each file says from what
+  was added afterwards. They are the runs behind figures the project README carried until
+  2026-11-13, now marked withdrawn in this CHANGELOG and in the ROADMAP. A session is one
+  launch of a benchmark script, which writes one file per point.
+  Status: recorded (records published 2026-11-14; chip and run date annotated). The figures
+  stay withdrawn, for these reasons. Some compare arms from two different sessions, and two
+  sessions disagree on flash throughput at 8,192 tokens. The 25.68 GiB step reached a peak
+  above two memory figures. One is the 20 GiB wired cap the benchmark held: a peak above it is
+  not by itself a failure, and the records do not measure wired memory. The other is the wired
+  limit the record shows before the benchmark put its own 20 GiB cap back
+  (`wired_limit_before_reassert_gb`, 24.96 GiB). Two mlx 0.31.2 points (26.23 and 26.47 GiB)
+  are also above 24.96 GiB, and so are two readings from points the memory watchdog stopped
+  (status `aborted_memory_ceiling`): 25.4168 GiB in the stock-attention set and 25.6379 GiB in
+  the sweep at 24,576 tokens. A peak above 24.96 GiB is not evidence of a safe working size.
+  The 23,040-token sweep point reports `ok` but its second loss is non-finite.
+  In that sweep the last point with finite losses is 22,528 tokens and the last completed
+  stock point is 7,936, but every point was set to two steps, the abort ceilings (23.11 to
+  24.70 GiB) followed free memory at launch, and stock attention completed 8,192 tokens in
+  another session.
+  Some withdrawn figures have no record in that folder: the 10,240 and 9,728 token limits, the
+  "near 10k" launch cap, the "about 45x" ratio, the 0.186 s and 0.576 s timings, and the
+  "about 3900x" ratio.
+
 ## [0.9.1] - 2026-10-24
 
 A compatibility release. It pins mlx to the one version the kernels are verified on, moves the
@@ -51,11 +78,15 @@ not been re-measured on 0.32.4; the 0.32.4 figures below come from the new bench
   measured on mlx 0.32.0 and apply to that version. The fused loss and sequence packing are
   unaffected.
   *Corrected 2026-11-13:* the 7,936 and 23,040 token ceilings and the 25.68 GiB
-  stock-attention step peak are withdrawn; no record published with the repository shows
-  them. The 0.32.4 op-level figures above were taken with the benchmark's measurement-only
+  stock-attention step peak are withdrawn; no record was published with the repository at
+  the time. The 0.32.4 op-level figures above were taken with the benchmark's measurement-only
   override, since the package refuses mlx 0.32.4. The README gives the op-level attention
   records for both mlx versions and whole-step figures for the fused loss against the stock
   loss, and no whole-step figure for switching attention.
+  *Updated 2026-11-14:* records for 7,936 tokens, 23,040 tokens, the 25.68 GiB peak and the
+  12.75 GiB peak are now in `evidence/2026-07-run-records/`. The withdrawal stands: 7,936 and
+  22,528 are where one two-step sweep stopped, not ceilings, and the 23,040 point has a
+  non-finite loss. The 25.68 GiB step is above both memory figures in the Unreleased entry.
 - Flash attention keeps its memory advantage for packed batches. On both versions, stock
   attention with a packed mask peaks at 12.469 GiB at 8,192 tokens, because a block-diagonal
   mask reaches stock attention as a materialized `(N, N)` array and its backward stays
@@ -269,9 +300,12 @@ suggesting you pre-split your data. Making that unnecessary is what this library
 - A diagram of where a training step's memory goes at 8,192 tokens, against what a 32 GB machine
   can actually use.
   *Corrected 2026-11-13:* the 25.68 GiB stock-attention bar in that diagram is withdrawn; no
-  record published with the repository shows it. The chart at the same path now shows the
-  fused loss against the stock loss under flash attention at 2,048, 8,192, 10,240 and 12,288
-  tokens, from published records.
+  record was published with the repository at the time. The chart at the same path now shows
+  the fused loss against the stock loss under flash attention at 2,048, 8,192, 10,240 and
+  12,288 tokens, from published records.
+  *Updated 2026-11-14:* the 25.68 GiB step now has a record in
+  `evidence/2026-07-run-records/`. The withdrawal stands: that step's peak is above both
+  memory figures in the Unreleased entry, so it is not evidence of a size that fits.
 - PyPI metadata that was missing: keywords, and project URLs for the repository, issues and
   changelog.
 
@@ -425,8 +459,17 @@ its memory limit, and adds Qwen2 to the loss adapter. Measured on an M1 Max (32 
   a machine with more free memory lets both climb together.
   *Corrected 2026-11-13:* the 23,040 and 7,936 token ceilings, the 2.9x ratio, the
   ~24.5 GiB figure and the "launch-capped near 10k tokens" figure are withdrawn; no record
-  published with the repository shows them. The README gives the op-level attention records
-  and the whole-step figures up to 12,288 tokens, and no maximum-trainable-context figure.
+  was published with the repository at the time. The README gives the op-level attention
+  records and the whole-step figures up to 12,288 tokens, and no maximum-trainable-context
+  figure.
+  *Updated 2026-11-14:* records for 23,040 tokens and 7,936 tokens are now in
+  `evidence/2026-07-run-records/`. The withdrawal stands: the 23,040 point has a non-finite
+  loss, the last point with finite losses is 22,528, and 7,936 and 22,528 are where one
+  two-step sweep stopped. The "~24.5 GiB" ceiling has no single record: the sweep's abort
+  ceilings were 23.5141 GiB (stock, 8,192 tokens), 24.6956 GiB (flash, 23,552) and
+  23.1137 GiB (flash, 24,576), so the two arms were not bound by one ceiling. The 2.9x ratio
+  rests on the 23,040 point and falls with it. The "near 10k" launch cap still has no record;
+  it comes from an earlier sweep that is not published.
 - The single flash attention op runs at 16,384 tokens instead of refusing on the retired
   launch budget (`scripts/bench_attention_op.py`). Stock attention still cannot reach that
   context on 32 GB; it aborts on the memory ceiling well before it.
@@ -454,9 +497,17 @@ net, a one-command community benchmark kit, and a flash-aware planner. The 0.1.0
 unchanged. Measured on an M1 Max (32 GB, macOS 26.5, mlx 0.32.0), Qwen3-8B-4bit unless noted.
 
 *Corrected 2026-11-13:* the claim in the first sentence that flash attention "halves the
-training-step peak memory at 8192-token context" is withdrawn; no record published with the
-repository shows it. The README gives the op-level attention records and no whole-step
-figure for switching attention.
+training-step peak memory at 8192-token context" is withdrawn; no record was published with
+the repository at the time. The README gives the op-level attention records and no
+whole-step figure for switching attention.
+
+*Updated 2026-11-14:* records for both 8,192-token steps are now in
+`evidence/2026-07-run-records/` (flash attention 12.7462 GiB, stock attention 25.6808 GiB).
+The withdrawal stands: the two peaks come from different sessions and are also different
+loss arms. 12.7462 GiB is flash attention with the fused loss, 25.6808 GiB is stock attention
+with the stock loss, the like-for-like flash file with the stock loss reads 15.9153 GiB, and
+the stock-attention run with the fused loss aborted. The 25.6808 GiB peak is above both
+memory figures in the Unreleased entry.
 
 ### Added
 - Flash-attention Metal kernels (forward + backward) for the training path. At seq 8192
@@ -473,12 +524,19 @@ figure for switching attention.
   loss curves match the stock trainer to bf16 tolerance (worst per-step diff 2.4e-3).
   *Corrected 2026-11-13:* the 25.68 GiB stock-attention step peak, the "about half"
   comparison built on it, the "about 45x below stock" ratio, and the 0.186 s forward and
-  0.576 s backward timings are withdrawn; no record published with the repository shows
-  them. The published records give 21× at the op level (12.532 against 0.596 GiB, mlx 0.32.0)
-  and 0.183 s and 0.573 s for the flash op, which makes the "3.1x" backward-to-forward ratio
-  3.13x. The worst per-step loss difference, 2.4e-3, is over the six 20-step pairs the README
-  lists. The README gives the op-level attention records and no whole-step figure for
-  switching attention.
+  0.576 s backward timings are withdrawn; no record of them was published with the
+  repository at the time. The published records give 21× at the op level (12.532 against
+  0.596 GiB, mlx 0.32.0) and 0.183 s and 0.573 s for the flash op, which makes the "3.1x"
+  backward-to-forward ratio 3.13x. The worst per-step loss difference, 2.4e-3, is over the
+  six 20-step pairs the README lists. The README gives the op-level attention records and no
+  whole-step figure for switching attention.
+  *Updated 2026-11-14:* the 25.68 GiB step now has a record in
+  `evidence/2026-07-run-records/`, and so does the 12.75 GiB flash step it was set against.
+  The withdrawal stands: the two steps come from different sessions and are also different
+  loss arms (12.75 GiB is flash attention with the fused loss, 25.68 GiB is stock attention
+  with the stock loss; the like-for-like flash file with the stock loss reads 15.9153 GiB, and
+  the stock-attention fused-loss run aborted). The "about 45x" ratio and the 0.186 s and
+  0.576 s timings have no record there.
 - `enable_flash_attention(model, seq_len=..., batch_size=...)`: opt-in mlx-lm wrapper that
   swaps each decoder layer's attention for the flash path in place, for the Llama
   (full-attention) and Qwen3 families. Causal- and training-only: it refuses sliding-window
@@ -494,10 +552,21 @@ figure for switching attention.
   cross-entropy (0.94x at 2048, 0.99x at 8192; 0.92x / 0.97x on Llama-3.2-3B).
   *Corrected 2026-11-13:* the stock-attention throughput figures (5.3%, 5.5% and 5.9%; 74.0
   vs 78.1, 86.4 vs 91.5 and 92.1 vs 97.8 tok/s) and the Qwen3-8B 0.94x and 0.99x ratios are
-  withdrawn; no record published with the repository shows them. The published Qwen3-8B
-  pairs give 0.93x at 2048 and 1.05x at 8192 (the stock-loss run slowed after its eighth
-  step, so read the 1.05x with care), and the Llama-3.2-3B ratios stand. The README gives
-  no throughput cost for switching from stock to flash attention.
+  withdrawn; no record of them was published with the repository at the time. The Qwen3-8B
+  pairs in `_artifacts/bench_train_step_flash/` give 0.93x at 2048 and 1.05x at 8192 (the
+  stock-loss run slowed after its eighth step, so read the 1.05x with care), and the
+  Llama-3.2-3B ratios stand. The README gives no throughput cost for switching from stock to
+  flash attention.
+  *Updated 2026-11-14:* the folder `evidence/2026-07-run-records/` now holds the figures
+  that this entry gives from the Qwen3-8B runs: 78.14, 91.466 and 97.794 tok/s in the
+  stock-attention set, and 74.009, 86.398 and 92.072 tok/s in the flash-attention set. The
+  Llama-3.2-3B pairs are in `_artifacts/bench_train_step_flash_llama3b/`, and the 0.93x and
+  1.05x pair is in `_artifacts/bench_train_step_flash/`. The withdrawal stands: each cost sets
+  a stock-attention step against a flash-attention step from a different session, and three
+  of the four flash-set files carry a memory warning. At 8,192 tokens two sessions disagree:
+  the flash set in the folder gives 0.985x and `_artifacts/bench_train_step_flash/` gives
+  1.05x. The withdrawn 0.94x is 86.398 over 92.072 from the folder's flash set, and the
+  withdrawn 0.99x rounds 72.903 over 74.009, which is 0.985x.
 - Planner `--attention flash`: prices the flash path with an analytic saved-state term plus
   one measured linear coefficient. It over-predicts the cushioned total by 8% to 20% at the
   four measured anchors up to 8192 tokens — on the safe side for a fit tool.
@@ -520,6 +589,11 @@ figure for switching attention.
   *Corrected 2026-11-13:* the 10,240 and 9,728 token figures are withdrawn; no record
   published with the repository shows them. The README gives no maximum-trainable-context
   figure; its longest completed step is 12,288 tokens.
+  *Updated 2026-11-14:* the records in `evidence/2026-07-run-records/` include a context
+  sweep, but it does not hold these figures: its flash arm has points up to 23,040 tokens
+  (the second loss at 23,040 is non-finite; the last point with finite losses is 22,528) and
+  its stock arm completed points up to 7,936. The 10,240 and 9,728 token figures still have
+  no record, and the withdrawal stands.
 
 ### Changed
 - Minimum mlx is now 0.32.0 (bounded `>=0.32.0,<0.33`); the kernel JIT contract is re-verified
@@ -538,10 +612,19 @@ until faster dK/dV backward kernels or new launch-budget evidence lift its cap. 
 figures in this release are not comparable to the numbers 0.1.0 reported.
 
 *Corrected 2026-11-13:* "roughly halves the step's peak memory at 8192", "does not extend the
-maximum trainable context" and "stays near 10k" are withdrawn; no record published with the
-repository shows them. The README gives the
+maximum trainable context" and "stays near 10k" are withdrawn; no record was published with
+the repository at the time. The README gives the
 op-level attention records and no whole-step figure for switching attention, and no
 maximum-trainable-context figure.
+
+*Updated 2026-11-14:* records for the 8,192-token steps and for a context sweep are now in
+`evidence/2026-07-run-records/`. The withdrawal stands: the two 8,192-token peaks come from
+different sessions and are also different loss arms (12.7462 GiB is flash attention with the
+fused loss, 25.6808 GiB is stock attention with the stock loss, the like-for-like flash file
+reads 15.9153 GiB, and the stock-attention fused-loss run aborted). The sweep's points were
+set to two steps and their abort ceilings followed free memory at launch, so they do not
+settle a maximum. "Stays near 10k" comes from an earlier sweep that is not published and
+still has no record.
 
 ## [0.1.0] - 2026-07-08
 
@@ -565,8 +648,15 @@ Silicon, with an mlx-lm adapter, a RAM-fit planner, and a benchmark harness.
   (about 2e-3). End-to-end throughput is roughly 8-12% slower per step at bf16
   (`scripts/bench_train_step.py`).
   *Corrected 2026-11-13:* the "about 3900x" loss-layer ratio, the 2e-3 match and the 8-12%
-  step cost above are withdrawn; no record published with the repository shows them. The
-  README gives the loss-layer peaks and the train-step comparison from the mlx 0.32.0 records.
+  step cost above are withdrawn; no record was published with the repository at the time.
+  The README gives the loss-layer peaks and the train-step comparison from the mlx 0.32.0
+  records.
+  *Updated 2026-11-14:* the gradient-checkpointing set in `evidence/2026-07-run-records/`
+  holds the runs behind the 8-12% step cost and the 2e-3 match: 84.972 against 92.013 tok/s
+  at 1,024 tokens and 84.791 against 96.699 at 2,048, with worst per-step loss differences of
+  2.42e-3 and 1.46e-3. The withdrawal stands: those runs used mlx 0.31.2, which the package
+  no longer supports, with one pair per length, and the README reports the mlx 0.32.0
+  records. The "about 3900x" ratio still has no record.
 - RAM-fit planner that estimates peak training memory and accounts for the O(N^2)
   attention backward that dominates at long context. Fit to measured Qwen3-8B train-step
   peaks and cross-model validated on Llama-3.2-3B to within about 9%.
