@@ -7,11 +7,12 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
-- Six sets of July 2026 run records are committed to this repository on 2026-11-14, in
+- Seven sets of July 2026 run records are committed to this repository on 2026-11-14, in
   `evidence/2026-07-run-records/`, with a note that separates what each file says from what
   was added afterwards. They are the runs behind figures the project README carried until
-  2026-11-13, now marked withdrawn in this CHANGELOG and in the ROADMAP. A session is one
-  launch of a benchmark script, which writes one file per point.
+  2026-11-13, now marked withdrawn in this CHANGELOG and in the ROADMAP. A session is the set
+  of files that share one session id: one launch for the train-step scripts; for the
+  context-sweep script the id marks the recipe.
   Status: recorded (records published 2026-11-14; chip and run date annotated). The figures
   stay withdrawn, for these reasons. Some compare arms from two different sessions, and two
   sessions disagree on flash throughput at 8,192 tokens. The 25.68 GiB step reached a peak
@@ -21,7 +22,9 @@ All notable changes to this project are documented here. The format follows
   (`wired_limit_before_reassert_gb`, 24.96 GiB). Two mlx 0.31.2 points (26.23 and 26.47 GiB)
   are also above 24.96 GiB, and so are two readings from points the memory watchdog stopped
   (status `aborted_memory_ceiling`): 25.4168 GiB in the stock-attention set and 25.6379 GiB in
-  the sweep at 24,576 tokens. A peak above 24.96 GiB is not evidence of a safe working size.
+  the sweep at 24,576 tokens. The 2026-07-11 sweep adds three completed stock-attention peaks
+  (25.6808, 26.7864 and 27.5445 GiB) and four aborted readings (28.0754 to 31.2302 GiB) above
+  that line. A peak above 24.96 GiB is not evidence of a safe working size.
   The 23,040-token sweep point reports `ok` but its second loss is non-finite.
   In that sweep the last point with finite losses is 22,528 tokens and the last completed
   stock point is 7,936, but every point was set to two steps, the abort ceilings (23.11 to
@@ -30,6 +33,11 @@ All notable changes to this project are documented here. The format follows
   Some withdrawn figures have no record in that folder: the 10,240 and 9,728 token limits, the
   "near 10k" launch cap, the "about 45x" ratio, the 0.186 s and 0.576 s timings, and the
   "about 3900x" ratio.
+  *Updated 2026-11-14:* the 2026-07-11 sweep in `evidence/2026-07-run-records/` is a seventh set.
+  It holds the 9,728-token stock point (27.5445 GiB, above the 24.96 GiB wired limit the
+  record shows) and the "near 10k" launch refusals. It does not hold a completed 10,240-token
+  flash point: flash attention completed up to 9,984 tokens (14.5425 GiB) and was refused at
+  10,240. The figures stay withdrawn.
 
 ### Documentation
 - Corrected how the README describes MLX attention during training (under `mx.grad` or
@@ -486,6 +494,11 @@ its memory limit, and adds Qwen2 to the loss adapter. Measured on an M1 Max (32 
   23.1137 GiB (flash, 24,576), so the two arms were not bound by one ceiling. The 2.9x ratio
   rests on the 23,040 point and falls with it. The "near 10k" launch cap still has no record;
   it comes from an earlier sweep that is not published.
+  *Updated 2026-11-14:* the launch refusals behind "near 10k" are in the 2026-07-11 sweep
+  (`evidence/2026-07-run-records/`), not in an earlier, unpublished one. Flash attention
+  completed up to 9,984 tokens and was refused at 10,240, 12,288 and 16,384. The stop point
+  came from a launch check that 0.3.0 retired, and it depends on the kernel speed measured at
+  launch, so it is not a memory or context limit. The figures stay withdrawn.
 - The single flash attention op runs at 16,384 tokens instead of refusing on the retired
   launch budget (`scripts/bench_attention_op.py`). Stock attention still cannot reach that
   context on 32 GB; it aborts on the memory ceiling well before it.
@@ -610,6 +623,12 @@ memory figures in the Unreleased entry.
   (the second loss at 23,040 is non-finite; the last point with finite losses is 22,528) and
   its stock arm completed points up to 7,936. The 10,240 and 9,728 token figures still have
   no record, and the withdrawal stands.
+  *Updated 2026-11-14:* the 2026-07-11 sweep in `evidence/2026-07-run-records/` holds the
+  9,728-token stock point (27.5445 GiB, above the 24.96 GiB wired limit the record shows) but
+  no completed 10,240-token flash point: flash attention completed up to 9,984 tokens
+  (14.5425 GiB) and was refused at 10,240. The two arms stopped for different reasons (flash
+  by the launch budget, stock by the memory ceiling), so neither number is a measured
+  maximum. The 10,240 figure still has no published record, and the withdrawal stands.
 
 ### Changed
 - Minimum mlx is now 0.32.0 (bounded `>=0.32.0,<0.33`); the kernel JIT contract is re-verified
@@ -641,6 +660,16 @@ reads 15.9153 GiB, and the stock-attention fused-loss run aborted). The sweep's 
 set to two steps and their abort ceilings followed free memory at launch, so they do not
 settle a maximum. "Stays near 10k" comes from an earlier sweep that is not published and
 still has no record.
+
+*Updated 2026-11-14:* the refusals behind "stays near 10k" are in the 2026-07-11 sweep
+(`evidence/2026-07-run-records/`). Flash attention completed up to 9,984 tokens and was
+refused at 10,240 by that build's launch budget. Stock attention completed up to 9,728
+(27.5445 GiB, above the 24.96 GiB wired limit the record shows) and was stopped by the
+memory watchdog from 9,984. The two arms show no measured tie. The same sweep also holds
+both 8,192-token peaks in one sweep (one build, one write window): 12.7462 GiB for flash
+attention with the fused loss and 25.6808 GiB for stock attention with the stock loss. The
+arms change attention and loss together, and the stock peak is above 24.96 GiB, so the
+comparison stays withdrawn.
 
 ## [0.1.0] - 2026-07-08
 
