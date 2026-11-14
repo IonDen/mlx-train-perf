@@ -74,7 +74,7 @@ PUBLISHED_SET_SIZES = {
     "bench_train_step_stockattn": 4,
     "bench_train_step": 4,
     "bench_train_step_gradckpt": 4,
-    "pre-rc-refresh-backup-2026-07-12/northstar_context_sweep": 4,
+    "pre-rc-refresh-backup-2026-07-12/northstar_context_sweep": 24,
     "launch_budget_evidence": 1,
 }
 
@@ -85,18 +85,58 @@ class RunSet(NamedTuple):
     script_sha: str
 
 
-# What each set's records carry in their own `identity` (the probe set has none).
-RUN_SETS = {
-    "northstar_context_sweep": RunSet({"6cdf97ec": 20}, "0.32.0", "304787652e37ab2e"),
-    "bench_train_step_stockattn": RunSet(
-        {"97d6b7fb": 3, "2f9f3185": 1}, "0.32.0", "191fc55b97263907"
+# What each set's records carry in their own `identity` (the probe set has none). A set
+# may hold several runs, each with its own mlx version and script revision.
+RUN_SETS: dict[str, tuple[RunSet, ...]] = {
+    "northstar_context_sweep": (RunSet({"6cdf97ec": 20}, "0.32.0", "304787652e37ab2e"),),
+    "bench_train_step_stockattn": (
+        RunSet({"97d6b7fb": 3, "2f9f3185": 1}, "0.32.0", "191fc55b97263907"),
     ),
-    "bench_train_step": RunSet({"77982f98": 4}, "0.32.0", "191fc55b97263907"),
-    "bench_train_step_gradckpt": RunSet({"00b615e3": 4}, "0.31.2", "afb0ac0e9a72c80e"),
-    "pre-rc-refresh-backup-2026-07-12/northstar_context_sweep": RunSet(
-        {"435c2eff": 4}, "0.31.2", "2521d5810a1ceb7b"
+    "bench_train_step": (RunSet({"77982f98": 4}, "0.32.0", "191fc55b97263907"),),
+    "bench_train_step_gradckpt": (RunSet({"00b615e3": 4}, "0.31.2", "afb0ac0e9a72c80e"),),
+    "pre-rc-refresh-backup-2026-07-12/northstar_context_sweep": (
+        RunSet({"435c2eff": 4}, "0.31.2", "2521d5810a1ceb7b"),
+        # Read from the 20 records (frozen set); git 01b2f7b reproduces the script_sha.
+        RunSet({"68b48e5f": 20}, "0.32.0", "cdb2a14be0c07fca"),
     ),
 }
+
+# The folder above holds two sessions; the files of each, by name.
+PRE_RC_SWEEP_DIR = "pre-rc-refresh-backup-2026-07-12/northstar_context_sweep"
+
+
+def _sweep_file(seq_len: int, arm: str) -> str:
+    return f"northstar_mlx-community__Qwen3-8B-4bit_seq{seq_len}_{arm}.json"
+
+
+PRE_RC_SESSION_FILES = {
+    # The four rows the fc45488 MANIFEST held for this folder.
+    "435c2eff": frozenset(
+        {
+            _sweep_file(8448, "ours"),
+            _sweep_file(8704, "ours"),
+            _sweep_file(8704, "stock"),
+            _sweep_file(8960, "stock"),
+        }
+    ),
+    # The 2026-07-11 sweep's source folder listing: ten lengths, both arms.
+    "68b48e5f": frozenset(
+        _sweep_file(n, arm)
+        for n in (1024, 2048, 4096, 8192, 9216, 9728, 9984, 10240, 12288, 16384)
+        for arm in ("ours", "stock")
+    ),
+}
+
+# The 2026-07-11 sweep's outcome per (length, arm), as the evidence README's 2026-07-11
+# section states it: flash (ours) completed up to 9,984 and was refused by the launch
+# budget above; stock completed up to 9,728 and hit the 28.0 GiB ceiling from 9,984.
+SWEEP_0711_OUTCOMES = {
+    **{(n, "ours"): "ok" for n in (1024, 2048, 4096, 8192, 9216, 9728, 9984)},
+    **{(n, "ours"): "refused" for n in (10240, 12288, 16384)},
+    **{(n, "stock"): "ok" for n in (1024, 2048, 4096, 8192, 9216, 9728)},
+    **{(n, "stock"): "aborted_memory_ceiling" for n in (9984, 10240, 12288, 16384)},
+}
+SWEEP_0711_CEILING_GB = 28.0  # the fixed ceiling the same README section names
 
 # The cited sets already tracked under `_artifacts/`: directory -> run-record count.
 TRACKED_SET_SIZES = {
@@ -364,17 +404,66 @@ def test_each_published_set_has_its_size() -> None:
     assert counts == PUBLISHED_SET_SIZES
 
 
+def _expected_runs(runs: tuple[RunSet, ...]) -> Counter[tuple[str, str, str]]:
+    """(session prefix, mlx version, script fingerprint) -> number of records."""
+    counts: Counter[tuple[str, str, str]] = Counter()
+    for run in runs:
+        for session, n in run.sessions.items():
+            counts[(session, run.mlx_version, run.script_sha)] += n
+    return counts
+
+
+def _runs_in(identities: list[dict[str, Any]]) -> Counter[tuple[str, str, str]]:
+    return Counter(
+        (str(i.get("session_id"))[:8], str(i.get("mlx_version")), str(i.get("script_sha")))
+        for i in identities
+    )
+
+
 @pytest.mark.parametrize("set_dir", sorted(RUN_SETS))
 def test_each_run_set_holds_only_records_of_its_own_run(set_dir: str) -> None:
     """Bug caught: a record from another run moved into a set (another session, mlx
-    version or script revision), even with its manifest row rebuilt to match. Checked
-    against each record's own `identity`, not the manifest."""
-    expected = RUN_SETS[set_dir]
+    version or script revision), even with its manifest row rebuilt to match, or a record
+    of one run carrying another run's mlx version or script revision. Checked against each
+    record's own `identity`, not the manifest."""
     files = sorted((_evidence_dir() / set_dir).glob("*.json"))
     identities = [_load_json(p).get("identity", {}) for p in files]
-    assert dict(Counter(str(i.get("session_id"))[:8] for i in identities)) == expected.sessions
-    assert {i.get("mlx_version") for i in identities} == {expected.mlx_version}
-    assert {i.get("script_sha") for i in identities} == {expected.script_sha}
+    assert _runs_in(identities) == _expected_runs(RUN_SETS[set_dir])
+
+
+def test_each_session_in_the_two_session_folder_holds_its_own_files() -> None:
+    """Bug caught: two records of the two sessions in the pre-rc folder trading their
+    identities (session, mlx version, script revision) with both manifest rows rebuilt;
+    the per-run counts stay balanced, so only the file names tell the swap."""
+    by_session: dict[str, set[str]] = {}
+    for path in sorted((_evidence_dir() / PRE_RC_SWEEP_DIR).glob("*.json")):
+        session = str(_load_json(path).get("identity", {}).get("session_id"))[:8]
+        by_session.setdefault(session, set()).add(path.name)
+    assert by_session == PRE_RC_SESSION_FILES
+
+
+def test_the_0711_sweep_keeps_its_outcomes() -> None:
+    """Bug caught: a point of the 2026-07-11 sweep whose status changed after copying (a
+    refused flash point at 10,240 reading `ok`, a stock abort turned into a completion),
+    an abort whose ceiling is not 28.0 GiB, or two files that traded their bytes (the
+    9,984 and 10,240 flash records, say), each even with its manifest hash rebuilt. Each
+    file is read by its name, `seq{n}_{arm}`, and must hold that length and arm."""
+    assert {_sweep_file(n, arm) for n, arm in SWEEP_0711_OUTCOMES} == PRE_RC_SESSION_FILES[
+        "68b48e5f"
+    ]
+    named: dict[tuple[int, str], tuple[Any, Any]] = {}
+    outcomes: dict[tuple[int, str], str] = {}
+    ceilings: set[Any] = set()
+    for n, arm in SWEEP_0711_OUTCOMES:
+        record = _load_json(_evidence_dir() / PRE_RC_SWEEP_DIR / _sweep_file(n, arm))
+        identity = record["identity"]
+        named[(n, arm)] = (identity["seq_len"], identity["stock"])
+        outcomes[(n, arm)] = record["status"]
+        if record["status"] == "aborted_memory_ceiling":
+            ceilings.add(record["ceiling_gb"])
+    assert named == {(n, arm): (n, arm == "stock") for n, arm in SWEEP_0711_OUTCOMES}
+    assert outcomes == SWEEP_0711_OUTCOMES
+    assert ceilings == {SWEEP_0711_CEILING_GB}
 
 
 @pytest.mark.parametrize("set_dir", sorted(TRACKED_RUN_SETS))
@@ -429,7 +518,7 @@ def test_only_the_23040_record_holds_a_non_finite_value() -> None:
     record (another diverged run, or a value corrupted on copying), even with its
     manifest hash updated to match."""
     rows = _manifest_rows()
-    assert len(rows) == 37
+    assert len(rows) == 57
     non_finite: set[str] = set()
     for row in rows:
         value, constants = _read_json(_record_path(str(row["path"])))
