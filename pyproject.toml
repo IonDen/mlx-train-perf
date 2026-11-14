@@ -79,6 +79,8 @@ include = [
     # The community contribution kit's submission how-to (backlog 0015).
     "/community-benchmarks/README.md",
 ]
+# It needs the git history and the evidence folder, which only a checkout has.
+exclude = ["/tests/test_evidence_records.py"]
 
 [tool.hatch.build.targets.wheel.force-include]
 # The contribution kit (`mlx_train_perf.contribute`) shells out to these two committed

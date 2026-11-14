@@ -1,0 +1,33 @@
+{
+  "identity": {
+    "schema_version": 1,
+    "mlx_version": "0.32.0",
+    "mlx_lm_version": "0.31.3",
+    "machine": "arm64",
+    "macos": "26.5.2",
+    "code_sha": "8998406ac4718cbb",
+    "package_version": "0.2.1.dev0+g37660d762.d20260714",
+    "kind": "train_step",
+    "session_id": "6cdf97ec49ab98e47468fe0a22dc974a",
+    "attention_impl": "flash",
+    "model": "mlx-community/Qwen3-8B-4bit",
+    "revision": null,
+    "seq_len": 23552,
+    "batch": 1,
+    "steps": 2,
+    "lora_rank": 8,
+    "lora_layers": -1,
+    "impl": "auto",
+    "stock": false,
+    "seed": 0,
+    "compute_dtype": "bfloat16",
+    "grad_checkpoint": true,
+    "script_sha": "304787652e37ab2e",
+    "dataset_recipe": "synthetic-fixed-length-random-tokens (bench/worker.py::_synthetic_train_examples)"
+  },
+  "status": "aborted_memory_ceiling",
+  "observed_active_gb": 24.7523,
+  "ceiling_gb": 24.6956,
+  "elapsed_s": 188.378,
+  "wall_budget_s": 7200.0
+}

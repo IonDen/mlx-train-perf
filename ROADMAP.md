@@ -11,6 +11,15 @@
   quadratic with a packed (array) mask, so flash attention's memory advantage holds mainly
   for packed batches. The 0.32.4 flash figures are maintainer measurements, since the
   package refuses its flash path on an unverified mlx.
+  *Corrected 2026-11-14:* this entry said the backward is lighter "for causal attention".
+  Per the MLX source at 0.32.4, a call with no mask given as an array (causal, or no mask at
+  all) runs MLX's single-kernel attention as a fused forward and a fused backward during
+  training (under `mx.grad` or `value_and_grad`), for supported head sizes and dtypes. A mask
+  passed in as an array (MLX also accepts the string "causal"), such as the block-diagonal
+  mask that packing builds, falls back and stays quadratic. The forward also changed during
+  training, so part of the 12.532 to 0.682 GiB drop may come from it; the split was not
+  measured. The backward works in score tiles of up to 1,024 × 1,024 per head, so below
+  1,024 tokens a tile is the whole matrix. Attention with no mask was not measured.
 - Fixed: mlx-lm 0.31.x runs the Python file a model's `config.json` names under `model_file`
   when the model loads. mlx-train-perf now refuses such a model with `ModelCodeRefusedError`
   before anything loads.
@@ -111,8 +120,9 @@
   same effective memory ceiling — the flash path reaches 2.9x the context at one memory
   budget, because it keeps O(N) saved state.
   *Corrected 2026-11-13:* the 23,040 and 7,936 token ceilings and the 2.9x ratio are
-  withdrawn; no record published with the repository shows them. The README gives the
-  op-level attention records and no maximum-trainable-context figure.
+  withdrawn. The July 2026 records in `evidence/2026-07-run-records/` include a sweep with
+  those points, with the caveats listed there. The README gives the op-level attention
+  records and no maximum-trainable-context figure.
 - Qwen2 (Qwen2.5 family) support in the mlx-lm loss adapter, with loss parity against the
   stock trainer verified on a real checkpoint.
 - Benchmark hygiene: attention-arm artifact filenames, a distinct too-crowded status that
@@ -127,7 +137,9 @@
   extra memory raises stock attention's memory-bound ceiling, while the flash path stays near
   10k until faster dK/dV backward kernels or new launch-budget evidence lift it.
   *Corrected 2026-11-13:* the "roughly halves" comparison, the "near-tied" maximum trainable
-  context and the "near 10k" context figure are withdrawn; no record published with the repository shows them. The README gives the
+  context and the "near 10k" context figure are withdrawn. The July 2026 records in
+  `evidence/2026-07-run-records/` include whole steps and a context sweep, with the caveats
+  listed there; none of them holds the "near 10k" figure. The README gives the
   op-level attention records and no whole-step figure for switching attention.
 - `enable_flash_attention` wrapper for the Llama (full-attention) and Qwen3 families, with
   typed refusals for the cases a causal training path does not serve.

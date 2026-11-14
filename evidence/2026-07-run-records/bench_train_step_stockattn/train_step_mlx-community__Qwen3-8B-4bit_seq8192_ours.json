@@ -1,0 +1,33 @@
+{
+  "identity": {
+    "schema_version": 1,
+    "mlx_version": "0.32.0",
+    "mlx_lm_version": "0.31.3",
+    "machine": "arm64",
+    "macos": "26.5.2",
+    "code_sha": "f1765993faef3a4e",
+    "package_version": "0.1.1.dev31+g1717b077f.d20260711",
+    "kind": "train_step",
+    "session_id": "2f9f3185373349e6ba1f0e3040906e85",
+    "attention_impl": "stock",
+    "model": "mlx-community/Qwen3-8B-4bit",
+    "revision": null,
+    "seq_len": 8192,
+    "batch": 1,
+    "steps": 20,
+    "lora_rank": 8,
+    "lora_layers": -1,
+    "impl": "kernel",
+    "stock": false,
+    "learning_rate": 1e-05,
+    "seed": 0,
+    "compute_dtype": "bfloat16",
+    "grad_checkpoint": true,
+    "script_sha": "191fc55b97263907"
+  },
+  "status": "aborted_memory_ceiling",
+  "observed_active_gb": 25.4168,
+  "ceiling_gb": 24.5423,
+  "elapsed_s": 55.066,
+  "wall_budget_s": 7200.0
+}

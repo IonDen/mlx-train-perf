@@ -1,0 +1,23 @@
+{
+  "probe": "command_buffer_packing",
+  "date": "2026-07-14 09:17:13",
+  "machine": "macOS-26.5.2-arm64-arm-64bit-Mach-O",
+  "model_source": "mlx v0.32.0 mlx/backend/metal/device.cpp (needs_commit, L512-515; arch switch L601-623; commit resets L554-557)",
+  "probe1_tiny_ops": {
+    "default": "0.017953583999769762",
+    "ops_0": "0.051005540997721255",
+    "ops_5000": "0.023507917001552414",
+    "prediction": "ops_0 markedly slower than default; ops_5000 <= default"
+  },
+  "probe2_big_sizes": {
+    "default": "0.08752416700008325",
+    "mb_huge": "0.08573879200412193",
+    "mb_1": "0.09369654200418154",
+    "prediction": "mb_1 slower than default (boundary every op); mb_huge fastest or ~default"
+  },
+  "probe3_dkv_chain_12288": {
+    "result": "0.7809427090032841 True 1563426940",
+    "fields": "wall_s finite_ok peak_bytes",
+    "note": "12 dispatches, each its own predicted command buffer (inputs ~118 M elements > 50 M threshold); survival is today's-state evidence only"
+  }
+}

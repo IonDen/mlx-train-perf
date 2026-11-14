@@ -1,0 +1,31 @@
+{
+  "identity": {
+    "schema_version": 1,
+    "mlx_version": "0.31.2",
+    "mlx_lm_version": "0.31.3",
+    "machine": "arm64",
+    "macos": "26.5.1",
+    "code_sha": "b0e898412e2b4a89",
+    "package_version": "0.1.dev18+gf5c5aa587.d20260704",
+    "kind": "train_step",
+    "session_id": "435c2effe54a8d0bc2f4dd8ce46e8301",
+    "model": "mlx-community/Qwen3-8B-4bit",
+    "revision": null,
+    "seq_len": 8704,
+    "batch": 1,
+    "steps": 2,
+    "lora_rank": 8,
+    "lora_layers": -1,
+    "impl": "auto",
+    "stock": false,
+    "seed": 0,
+    "compute_dtype": "bfloat16",
+    "grad_checkpoint": true,
+    "script_sha": "2521d5810a1ceb7b",
+    "dataset_recipe": "synthetic-fixed-length-random-tokens (bench/worker.py::_synthetic_train_examples)"
+  },
+  "status": "error",
+  "error_type": "WorkerCrashed",
+  "error_msg": "\nFetching 9 files:   0%|          | 0/9 [00:00<?, ?it/s]\nFetching 9 files: 100%|\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588| 9/9 [00:00<00:00, 12244.16it/s]\nlibc++abi: terminating due to uncaught exception of type std::runtime_error: [METAL] Command buffer execution failed: Insufficient Memory (00000008:kIOGPUCommandBufferCallbackErrorOutOfMemory)\n",
+  "returncode": -6
+}
