@@ -1,6 +1,6 @@
 # July 2026 run records
 
-This folder holds six sets of result files from July 2026 training runs, copied unchanged. We chose these sets because they hold the runs behind figures the project README carried until 2026-11-13, now marked withdrawn in the CHANGELOG and ROADMAP. A session is one launch of a benchmark script, which writes one file per point. Each set is whole within one session, except the stock-attention set, which holds two. The files were kept outside the repository until 2026-11-14, months after the sessions. Each file is one point (one sequence length, one arm), written by the benchmark scripts in `scripts/`. This note says what each file states by itself and what we added afterwards.
+This folder holds seven sets of result files from July 2026 training runs, copied unchanged. We chose these sets because they hold the runs behind figures the project README carried until 2026-11-13, now marked withdrawn in the CHANGELOG and ROADMAP. A session is the files that share one session id. For the train-step scripts that is one launch; for the sweep script it marks the recipe (see the 2026-07-11 section). Every set comes from a single session, except the stock-attention set, which holds two. Two of the sets, the mlx 0.31.2 points and the 2026-07-11 sweep, share one subfolder. The files were kept outside the repository until 2026-11-14, months after the sessions. Each file is one point (one sequence length, one arm), written by the benchmark scripts in `scripts/`. This note says what each file states by itself and what we added afterwards.
 
 ## What the runs compare
 
@@ -8,7 +8,7 @@ Every training point here fine-tunes Qwen3-8B-4bit with LoRA rank 8, gradient ch
 
 Each set compares the fused loss with the stock loss, with attention fixed within the set. The context sweep changes both together: flash attention with the fused loss against stock attention with the stock loss. Comparisons across sets mix sessions. An arm is one side of a comparison. In file names, `ours` is the fused-loss arm and `stock` is the stock-loss arm.
 
-Memory figures use three words. The peak is the most memory MLX had in use during the point. The marginal peak is what the point added on top of what was already held before it started. The ceiling is the level at which the benchmark's watchdog stops a point. A point stopped this way is recorded as `aborted_memory_ceiling`. The ceiling follows the free memory at launch, so it differs from point to point.
+Memory figures use three words. The peak is the most memory MLX had in use during the point. The marginal peak is what the point added on top of what was already held before it started. The ceiling is the level at which the benchmark's watchdog stops a point. A point stopped this way is recorded as `aborted_memory_ceiling`. In the 2026-07-14 sweep the ceiling follows the free memory at launch, so it differs from point to point. The 2026-07-11 sweep used a fixed ceiling of 28.0 GiB.
 
 Every `*_gb` field in these files is GiB (bytes divided by 1024³).
 
@@ -17,7 +17,7 @@ Every `*_gb` field in these files is GiB (bytes divided by 1024³).
 - 20.0 GiB (`house_wired_limit_gb`) is the wired cap the benchmark held. Peak active memory above it is not by itself a failure, and the records do not measure wired memory.
 - 24.96 GiB is the wired limit the record shows before the benchmark put its own 20 GiB cap back (`wired_limit_before_reassert_gb`). A peak above it went past that limit, so it is not evidence of a safe working size.
 
-Three completed points are above 24.96 GiB: the 8,192-token stock-loss step in the stock-attention set (25.6808 GiB), and two points on mlx 0.31.2, at 8,448 tokens (26.2299 GiB) and 8,704 tokens (26.473 GiB). Two aborted points also observed more than 24.96 GiB before they were stopped: 25.4168 GiB in the stock-attention set and 25.6379 GiB at 24,576 tokens in the sweep.
+Six completed points are above 24.96 GiB: the 8,192-token stock-loss step in the stock-attention set (25.6808 GiB), two points on mlx 0.31.2, at 8,448 tokens (26.2299 GiB) and 8,704 tokens (26.473 GiB), and three stock-attention points in the 2026-07-11 sweep, at 8,192 tokens (25.6808 GiB), 9,216 tokens (26.7864 GiB) and 9,728 tokens (27.5445 GiB). Six aborted points also observed more than 24.96 GiB before they were stopped: 25.4168 GiB in the stock-attention set, 25.6379 GiB at 24,576 tokens in the 2026-07-14 sweep, and four stock-attention points in the 2026-07-11 sweep, at 9,984 tokens (28.0754 GiB), 10,240 tokens (28.0843 GiB), 12,288 tokens (28.3303 GiB) and 16,384 tokens (31.2302 GiB).
 
 ## Three things that apply to every set
 
@@ -27,11 +27,11 @@ Three completed points are above 24.96 GiB: the 8,192-token stock-loss step in t
 
 Figures from these files carry one label: recorded (records published 2026-11-14; chip and run date annotated). It means the file says it, and we added the chip and the date. It does not mean anyone ran the measurement again.
 
-Throughput is the median tokens per second. In the 20-step sets that median includes the first step. In the sweep each point was set to two training steps, so its median covers two values and cannot be compared with the 20-step sets.
+Throughput is the median tokens per second. In the 20-step sets that median includes the first step. In the sweeps each point was set to two training steps, so its median covers two values and cannot be compared with the 20-step sets.
 
-## Context sweep (mlx 0.32.0)
+## Context sweep, 2026-07-14 (mlx 0.32.0)
 
-Folder `northstar_context_sweep/`, 20 files. Flash attention with the fused loss (`ours`) and stock attention with the stock loss (`stock`), at rising sequence lengths. Refusals and aborts are included. Every point was set to two training steps.
+Folder `northstar_context_sweep/` (at the top level of this folder, not the one under `pre-rc-refresh-backup-2026-07-12/`), 20 files. Flash attention with the fused loss (`ours`) and stock attention with the stock loss (`stock`), at rising sequence lengths. Refusals and aborts are included. Every point was set to two training steps.
 
 | In the record | Added afterwards |
 |---|---|
@@ -47,9 +47,34 @@ Read these before using any number from this set.
   - every point was set to two training steps;
   - the sweep's stock arm ran slowly (at 2,048 tokens it reads 27.219 tokens per second, against 97.794 for the same condition in the stock-attention set, with the same 8.041 GiB peak);
   - the abort ceilings varied by point, from 23.1137 to 24.6956 GiB, with free memory at launch (23.5141 for stock at 8,192 tokens, 24.6956 at 23,552, 23.1137 at 24,576);
-  - stock attention completed 8,192 tokens in another session, the stock-attention set below.
+  - stock attention completed 8,192 tokens in another session (the stock-attention set below) and in the 2026-07-11 sweep below.
 - Stock attention at 8,192 tokens aborted in this sweep: 24.0674 GiB observed against a 23.5141 GiB ceiling. The flash points at 23,552 and 24,576 tokens aborted the same way (24.7523 against 24.6956, and 25.6379 against 23.1137).
-- The 23,296 and 32,768 points were refused before they ran. In both, the launch budget projected more than 1.0 s per dispatch. They are launch-budget refusals, not memory failures.
+- The 23,296 and 32,768 points were refused before they ran. In both, the launch budget projected more than 1.0 s per dispatch (one GPU launch of the attention kernel). They are launch-budget refusals, not memory failures.
+
+## Context sweep, 2026-07-11 (mlx 0.32.0)
+
+Folder `pre-rc-refresh-backup-2026-07-12/northstar_context_sweep/` (inside this folder), 20 files that share one session id. For this script the id marks the recipe, not the launch, so the id alone does not prove one launch. What ties the 20 files together is one build, one macOS version, one library fingerprint, and that the files were written one after another. The same folder holds the four mlx 0.31.2 points described further down, from another session. Flash attention with the fused loss (`ours`) and stock attention with the stock loss (`stock`), probed at ten sequence lengths each from 1,024 to 16,384 tokens. Refusals and aborts are included. Every point was set to two training steps.
+
+The flash launch refusals near 10k tokens and the stock point at 9,728 tokens, withdrawn in the CHANGELOG and ROADMAP, are in this sweep. A completed flash point at 10,240 tokens is not: here flash was refused at 10,240, and its last completed point is 9,984. The stop point of the flash refusals came from a launch check that 0.3.0 retired, and it depends on the kernel speed measured at launch, so it is not a memory or context limit. The invocation that ran the sweep is not recorded. The script is `scripts/northstar_context_sweep.py` at revision `01b2f7b`.
+
+| In the record | Added afterwards |
+|---|---|
+| `arm64`, macOS 26.5.1, mlx 0.32.0 | M1 Max 32 GB: the maintainer's only Mac when these runs were made; not stated in the record |
+| Build `0.1.1.dev1+g30f05857c.d20260709` | Last-written window: 2026-07-11, 20:41 to 22:19 |
+| Script fingerprint `cdb2a14be0c07fca` | The build string names base revision `30f05857c`, but it comes from the package's install metadata, which can lag behind the code. The script matches revision `01b2f7b` |
+| Library fingerprint `14cdad93fdab8137` | The measured-path library files match revision `facc5b8`, the same revision as the flash-attention train steps listed under "Records already in the repository". That revision was authored on 2026-07-11 at 09:28 CEST, before the first file at 20:41, and committed to main on 2026-07-14. The rest of the source tree was not checked |
+
+Read these before using any number from this set.
+
+- Completed points record `total_peak_gb`. Aborted points record `observed_active_gb` against `ceiling_gb`. Refused points record only the reason.
+- Flash attention with the fused loss completed the probed lengths 1,024, 2,048, 4,096, 8,192 (12.7462 GiB total peak), 9,216, 9,728 and 9,984 tokens. The 9,984-token point has a total peak of 14.5425 GiB. It was refused at 10,240, 12,288 and 16,384 tokens, before it ran. The record's budget is 0.5 s per dispatch and 2.0 s in total, and the launch check compares a projection of the GPU time with it. The projections were 0.50 s per dispatch and 2 s in total at 10,240 tokens, 0.49 s and 3 s at 12,288, and 0.50 s and 3 s at 16,384. The per-dispatch projection stayed at or under 0.5 s, so each refusal came from the total (2 to 3 s, rounded in the record, against 2.0 s). These refusals are not memory failures: no memory reading was taken, and the last completed flash point peaked at 14.5425 GiB.
+- Stock attention with the stock loss completed the probed lengths 1,024, 2,048, 4,096, 8,192 (25.6808 GiB total peak), 9,216 and 9,728 tokens. Three of those completed points have peaks above 24.96 GiB: 8,192 tokens (25.6808 GiB), 9,216 tokens (26.7864 GiB) and 9,728 tokens (27.5445 GiB). Because they are above the wired limit the record shows (24.96 GiB, described above), they are not evidence of a safe working size.
+- The stock arm slowed as it climbed. Its median throughput is 76.782 tokens per second at 8,192 tokens, 55.785 at 9,216 and 42.709 at 9,728, each from two steps. Read "completed up to 9,728" with that in mind.
+- Stock attention was stopped by the memory watchdog (`aborted_memory_ceiling`) at four lengths. The observed value against the 28.0 GiB ceiling: 9,984 tokens (28.0754), 10,240 tokens (28.0843), 12,288 tokens (28.3303) and 16,384 tokens (31.2302).
+- This sweep's ceiling was a fixed 28.0 GiB, above the 24.96 GiB wired limit the record shows. The 2026-07-14 sweep above used a ceiling that followed the free memory at launch (23.1137 to 24.6956 GiB). The 9,728-token stock point's peak here (27.5445 GiB) is above every ceiling recorded in the 2026-07-14 sweep. The 8,192-token stock point completed here and aborted in the 2026-07-14 sweep.
+- The ceiling is compared with active memory only (`observed_active_gb`), not with cached memory, so the observed reading understates what the machine held.
+- In this sweep the flash stop at 9,984 tokens is the last completed point before launch refusals, and the stock stop at 9,728 is the last completed point before memory aborts. Those are different kinds of stop, so the two arms show no measured tie.
+- The two sweeps ran different code. The script fingerprints differ (`cdb2a14be0c07fca` here, `304787652e37ab2e` above), the builds differ, and the library files of the 2026-07-14 sweep match revision `3fea237` instead of `facc5b8`. Their ceilings differ too. Their stop points are not comparable, and neither sweep gives the limit of either attention path.
 
 ## Stock-attention train steps (mlx 0.32.0)
 
@@ -67,7 +92,7 @@ The fused-loss run at 8,192 tokens in the same folder aborted with `aborted_memo
 
 At 2,048 tokens the fused-loss arm reads 91.466 tokens per second and the stock-loss arm 97.794, with total peaks of 7.3212 and 8.041 GiB.
 
-Stock attention at 8,192 tokens also appears in the context sweep, where it aborted. It completed here and aborted there.
+Stock attention at 8,192 tokens also appears in both context sweeps. It completed here and in the 2026-07-11 sweep (25.6808 GiB in both), and aborted in the 2026-07-14 sweep.
 
 ## Flash-attention train steps (mlx 0.32.0)
 
@@ -101,7 +126,7 @@ Throughput, fused loss against stock loss: 84.972 against 92.013 tokens per seco
 
 ## mlx 0.31.2 context points
 
-Folder `pre-rc-refresh-backup-2026-07-12/northstar_context_sweep/`, 4 files, at 8,448, 8,704 and 8,960 tokens. The folder name comes from a copy kept when newer runs replaced the older ones. These are the only points from that sweep that survive. The script has no flash path, so the arms are called fused-loss and stock-loss, and the records name no attention implementation.
+Folder `pre-rc-refresh-backup-2026-07-12/northstar_context_sweep/` holds two sessions, 24 files in all. This section covers the 4 files from the mlx 0.31.2 session, at 8,448, 8,704 and 8,960 tokens; the other 20 are the 2026-07-11 sweep above. The folder name comes from a copy kept when newer runs replaced the older ones. These are the only points from the mlx 0.31.2 sweep that survive. The script has no flash path, so the arms are called fused-loss and stock-loss, and the records name no attention implementation.
 
 | In the record | Added afterwards |
 |---|---|
@@ -136,7 +161,7 @@ Three more sets were committed to the repository earlier, under `_artifacts/`. T
 |---|---|
 | `arm64`, macOS 26.5.1, mlx 0.32.0 | M1 Max 32 GB: the maintainer's only Mac when these runs were made; not stated in the record |
 | Build `0.1.1.dev1+g30f05857c.d20260709` | Run date: no earlier than 2026-07-09 (the build date), no later than 2026-07-23 (the day the files were first committed) |
-| Script fingerprint `191fc55b97263907` | Built from base revision `30f05857c` plus uncommitted changes |
+| Script fingerprint `191fc55b97263907` | The build string names base revision `30f05857c`, but it comes from the package's install metadata, which can lag behind the code. The library fingerprint is the reliable link |
 | Library fingerprint `14cdad93fdab8137` | The measured-path library files match revision `facc5b8` (the earliest revision with those files, and the only one on main). The run used a checkout with changes committed later, so the matching revision can come after the run. The rest of the source tree was not checked |
 
 ### Flash-attention train steps, Llama-3.2-3B (`_artifacts/bench_train_step_flash_llama3b/`)
@@ -165,13 +190,13 @@ The 10,240-token fused-loss file carries a `memory_warning`. The memory availabl
 
 ## What is not here
 
-These sets were chosen for the figures they back. Other records exist and are held back: an earlier mlx 0.31.2 pair at 1,024 tokens from 2026-07-07, whose records show no gradient checkpointing, an earlier context sweep from 2026-07-11, other July runs, and the run summary logs. No raw record survives for the mlx 0.31.2 points at 4,096 and 8,192 tokens, or for the mlx 0.31.2 attention probe, so figures that came from those runs have no file in this folder.
+These sets were chosen for the figures they back. Other records exist and are held back: an earlier mlx 0.31.2 pair at 1,024 tokens from 2026-07-07, whose records show no gradient checkpointing, other July runs, and the run summary logs. No raw record survives for the mlx 0.31.2 points at 4,096 and 8,192 tokens, or for the mlx 0.31.2 attention probe, so figures that came from those runs have no file in this folder.
 
 Runs of related shapes are already in the repository: `_artifacts/bench_train_step_flash/` and `_artifacts/calib_050/` hold flash-attention step records, and the project README uses them.
 
 ## How to check
 
-`MANIFEST.json` has two lists: `records`, for the files in this folder, and `tracked_elsewhere`, for the records already in the repository under `_artifacts/`, which the test checks the same way. The first list gives every file here with its SHA-256 hash, the script fingerprint inside it, and the script revision whose bytes match that fingerprint (or "not checkable" for the probe). It also lists the library fingerprint (`code_sha`), the earliest commit whose files reproduce it (`code_commit`) and the files it covers (`code_deps`). `session_id` is the benchmark's run id, written in each record's identity block. To run the check:
+`MANIFEST.json` has two lists: `records`, for the files in this folder, and `tracked_elsewhere`, for the records already in the repository under `_artifacts/`, which the test checks the same way. The first list gives every file here with its SHA-256 hash, the script fingerprint inside it, and the script revision whose bytes match that fingerprint (or "not checkable" for the probe). It also lists the library fingerprint (`code_sha`), the earliest commit whose files reproduce it (`code_commit`) and the files it covers (`code_deps`). `session_id`, written in each record's identity block, is the session id defined at the top of this note: one launch for the train-step scripts, the recipe for the sweep script. To run the check:
 
 ```
 uv run pytest tests/test_evidence_records.py

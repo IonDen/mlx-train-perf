@@ -141,6 +141,13 @@
   `evidence/2026-07-run-records/` include whole steps and a context sweep, with the caveats
   listed there; none of them holds the "near 10k" figure. The README gives the
   op-level attention records and no whole-step figure for switching attention.
+  *Updated 2026-11-14:* in the 2026-07-11 sweep (`evidence/2026-07-run-records/`), flash
+  attention completed up to 9,984 tokens, then was refused at 10,240 by that build's launch
+  budget. Stock attention completed up to 9,728 (27.5445 GiB, above the 24.96 GiB wired limit
+  the record shows) and was stopped by the memory watchdog from 9,984. The two arms show no
+  measured tie, and the sweep holds no completed 10,240-token flash point. The "near 10k"
+  stop point came from a launch check that 0.3.0 retired, and it depends on the kernel speed
+  measured at launch, so it is not a memory or context limit. The figures stay withdrawn.
 - `enable_flash_attention` wrapper for the Llama (full-attention) and Qwen3 families, with
   typed refusals for the cases a causal training path does not serve.
 - Flash-aware RAM-fit planner (`plan --attention flash`).
