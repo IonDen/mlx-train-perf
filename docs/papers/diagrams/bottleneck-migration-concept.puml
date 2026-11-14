@@ -1,0 +1,33 @@
+@startuml
+title After each fix, look again for the limit
+
+skinparam backgroundColor #FFFFFF
+skinparam shadowing false
+skinparam roundCorner 10
+skinparam defaultFontName Helvetica
+skinparam defaultFontColor #111827
+skinparam ArrowColor #4B5563
+skinparam ArrowFontColor #374151
+skinparam rectangle {
+  BorderColor #4B5563
+  FontColor #111827
+  BackgroundColor #F8FAFC
+}
+
+rectangle "First hypothesis\nRemove the (N, V) logits matrix\nto train longer contexts" as logits #DBEAFE
+rectangle "Attention is the credible shared bottleneck\nMLX ran attention unfused in training;\nits backward materializes the full score matrix" as attn #FECACA
+rectangle "First fix\nTiled FlashAttention forward and backward\nSaved attention state scales with N x D" as flash #DCFCE7
+rectangle "The limit moves to the launch guard\nThe guard budgets a whole launch chain;\nMLX commits large ranges in separate buffers" as guard #FECACA
+rectangle "Second fix\nBudget each command buffer\nKeep the safety margin unchanged" as perbuf #DCFCE7
+rectangle "Upstream moves it again\nA later MLX release adds a blocked backward\nfor calls without an array mask" as upstream #FEF3C7
+rectangle "After every move\nLook again at what now sets the limit" as next #EDE9FE
+
+logits -down-> attn : no demonstrated context gain
+attn -down-> flash : remove the quadratic term
+flash -right-> guard : exposes a new limit
+guard -down-> perbuf : correct the model
+perbuf -down-> upstream : the framework changes too
+upstream -down-> next
+
+caption Conceptual sequence. It holds no measured values and is not an allocation-lifetime trace.
+@enduml

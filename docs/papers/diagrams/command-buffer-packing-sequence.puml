@@ -14,21 +14,21 @@ skinparam rectangle {
   BackgroundColor #F8FAFC
 }
 
-rectangle "MLX 0.32.0 commit check on applegpu_g13s, after each encoded operation:\ncommit when ops > 50 or floor(elements / 2^20) > 50" as rule #DBEAFE {
+rectangle "MLX 0.32.0 commit rule on applegpu_g13s, checked after each evaluated primitive:\ncommit when ops > 50 or floor(elements / 2^20) > 50" as rule #DBEAFE {
 
   rectangle "Large backward dispatches (dK/dV class)" as laneA {
-    rectangle "Command buffer\npossible smaller prefix work\nthen dK/dV range 1\n~118 M unique elements = 112 units\nover the limit after encoding" as a1 #FECACA
+    rectangle "Command buffer\npossible smaller prefix work\nthen dK/dV range 1\n~118 M unique elements = 112 units\nover the limit at its check" as a1 #FECACA
     rectangle "Command buffer\npossible smaller prefix work\nthen dK/dV range 2\ncounters reset, buffers recounted\ncrosses the limit again" as a2 #FECACA
   }
 
-  rectangle "Small forward dispatches (scalar class)" as laneB {
+  rectangle "Small forward dispatches (scalar class, row-contiguous inputs)" as laneB {
     rectangle "Command buffer\nq k v: 48 units, counted once\neach range adds ~0.46 units\nthe 7th range reaches 51" as b1 #DCFCE7
     rectangle "Command buffer\nthe next 7 ranges\npack the same way" as b2 #DCFCE7
   }
 }
 
 laneA -[hidden]down- laneB
-a1 -right-> a2 : range triggers commit\nafter it is encoded
+a1 -right-> a2 : range triggers commit\nafter its primitive
 b1 -right-> b2 : commit after\nthe 7th range
 
 caption Accounting model derived from pinned MLX 0.32.0 source. Element counts are source-reported arithmetic, not a Metal command-buffer capture.
