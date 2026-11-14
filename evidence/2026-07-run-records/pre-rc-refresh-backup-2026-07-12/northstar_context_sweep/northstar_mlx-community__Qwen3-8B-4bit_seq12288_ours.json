@@ -1,0 +1,30 @@
+{
+  "identity": {
+    "schema_version": 1,
+    "mlx_version": "0.32.0",
+    "mlx_lm_version": "0.31.3",
+    "machine": "arm64",
+    "macos": "26.5.1",
+    "code_sha": "14cdad93fdab8137",
+    "package_version": "0.1.1.dev1+g30f05857c.d20260709",
+    "kind": "train_step",
+    "session_id": "68b48e5fe97eea043da5c3aab2211515",
+    "attention_impl": "flash",
+    "model": "mlx-community/Qwen3-8B-4bit",
+    "revision": null,
+    "seq_len": 12288,
+    "batch": 1,
+    "steps": 2,
+    "lora_rank": 8,
+    "lora_layers": -1,
+    "impl": "auto",
+    "stock": false,
+    "seed": 0,
+    "compute_dtype": "bfloat16",
+    "grad_checkpoint": true,
+    "script_sha": "cdb2a14be0c07fca",
+    "dataset_recipe": "synthetic-fixed-length-random-tokens (bench/worker.py::_synthetic_train_examples)"
+  },
+  "status": "refused",
+  "error": "projected 0.49 s/dispatch (1920 rows), 3 s total at 783.8 G MAC/s (budget 0.5 s / 2.0 s). Reduce shape/context, or pass a measured rate."
+}
