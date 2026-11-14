@@ -13,14 +13,23 @@ operation. In MLX 0.32.0 the check runs after each primitive is evaluated
 and one primitive can encode more than one Metal dispatch. The trigger values in section 2 are
 therefore the counts at which a check can first commit, and a primitive can carry the counters
 past them before the check runs. The conclusion about the large attention ranges in
-`mlx-train-perf` is unchanged, because each range is its own custom-kernel call. The seven-range
-packing of small forward ranges holds for row-contiguous inputs. On the library's model path the
-values reach the kernel as a transposed view, which MLX copies inside each range's call
-(section 3). The probe that section 4
-describes now has a published
+`mlx-train-perf` is unchanged, because each range is its own custom-kernel call.
+
+The earlier version also gave the seven-range packing of small forward ranges with no condition;
+that packing holds for row-contiguous inputs. By a reading of the library's and MLX's source, with
+no capture to confirm it, the values on the library's model path reach the kernel as a transposed
+view, which MLX copies inside each range's call (section 3).
+
+The same version said that the timings of the probe in section 4 were not published with the
+release. They have since been published as a
 [record](https://github.com/IonDen/mlx-train-perf/blob/fc45488b21d0f476ee7b2b0e56ce3120b9317ed0/evidence/2026-07-run-records/launch_budget_evidence/probe_results.json),
-which names no MLX runtime version and no script fingerprint. The
-[previous version](https://github.com/IonDen/mlx-train-perf/blob/fc45488b21d0f476ee7b2b0e56ce3120b9317ed0/docs/papers/how-mlx-packs-metal-command-buffers.md)
+which names no MLX runtime version and no script fingerprint.
+
+That version also said the probes ran "against the shipped 0.32.0 wheel". The probe script targets MLX
+0.32.0, but the probe's record does not name the runtime version, so the article no longer says
+which wheel ran.
+
+The [previous version](https://github.com/IonDen/mlx-train-perf/blob/fc45488b21d0f476ee7b2b0e56ce3120b9317ed0/docs/papers/how-mlx-packs-metal-command-buffers.md)
 is still readable at its commit.
 
 A chain of Metal kernels is not necessarily one Metal command buffer. That distinction matters when
@@ -46,7 +55,8 @@ README and changelog are the project's own record of the design that followed.
 ### Evidence scope
 
 - Project release: `mlx-train-perf` 0.3.0, documented 2026-07-14.
-- Runtime: MLX 0.32.0 wheel.
+- Runtime: MLX 0.32.0, the version the release's lock file pins; the package accepts any 0.32.x
+  (the probe record names no runtime version).
 - Machine: Apple M1 Max, 32 GB, reported as `applegpu_g13s`, running macOS 26.5.
 - Sources: pinned MLX 0.32.0 source for the packing rule; the project's recorded probe, described
   qualitatively, for the behavioral observations; the public 0.3.0 README and changelog as the
@@ -179,15 +189,16 @@ ranges pack into one buffer, and the commit follows the seventh. Buffers already
 window, such as framework work encoded before the first range, move the trigger earlier, by about
 two ranges per extra unit (one unit is 1,048,576 elements, a little over two ranges of 482,976).
 
-That packing holds for row-contiguous inputs, such as the probe's. MLX's custom-kernel primitive
+That packing holds for row-contiguous inputs. MLX's custom-kernel primitive, with its default
+`ensure_row_contiguous` setting, which the library keeps,
 [copies an input that is not row-contiguous](https://github.com/ml-explore/mlx/blob/v0.32.0/mlx/backend/metal/custom_kernel.cpp#L41-L50)
-into a new buffer before its dispatch, in every call, and the new buffer is counted again. In the
-library's model wrapper the values reach the kernel as a
+into a new buffer before its dispatch, in every call. Reading the source, with no capture to
+confirm it: in the library's model wrapper the values reach the kernel as a
 [transposed view](https://github.com/IonDen/mlx-train-perf/blob/v0.3.0/src/mlx_train_perf/attention/wrapper.py#L134),
-so on that path each scalar forward range adds a fresh copy of `v`, 8 units. The check after the
-first range then already commits, and each range closes its own command buffer. This is a reading
-of the source, not a capture. It errs on the safe side, since the planner then models more work in
-a buffer than that path places there.
+so on that path each scalar forward range adds a fresh copy of `v`, 8 units, counted on top of
+`v`'s own buffer. The check after the first range then already commits, and each range closes its
+own command buffer. On that path the planner's seven-range model errs on the safe side: it models
+more work in one buffer than MLX places there.
 
 The large backward ranges are the decisive case. Their referenced unique backing buffers already
 exceed the element threshold within one range, which is one custom-kernel primitive. The check after
@@ -212,8 +223,8 @@ is published with the paper.*
 ## 4. What the behavioral probes add
 
 Source inspection tells us what MLX intends to count. On 2026-07-14, the project also recorded three
-subprocess-per-condition behavioral checks against the shipped 0.32.0 wheel on the M1 Max running
-macOS 26.5. These are qualitative consistency checks, not measurements of the exact threshold or an
+subprocess-per-condition behavioral checks on the M1 Max running macOS 26.5, with a probe script
+that targets MLX 0.32.0. These are qualitative consistency checks, not measurements of the exact threshold or an
 isolated overhead component. The probe's timings were not published with the release; the project
 published its record on 2026-11-14
 ([`probe_results.json`](https://github.com/IonDen/mlx-train-perf/blob/fc45488b21d0f476ee7b2b0e56ce3120b9317ed0/evidence/2026-07-run-records/launch_budget_evidence/probe_results.json)).
