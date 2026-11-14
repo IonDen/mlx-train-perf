@@ -18,6 +18,47 @@ assertion, dependence on machine state) come from the guard module alone. Sectio
 watchdog's 28 GiB anchor with the largest training-step peak in the project's records that
 has not been withdrawn, 21.61 GiB.
 
+*Records published 2026-11-14.* The project has since published the
+[July 2026 run records](https://github.com/IonDen/mlx-train-perf/blob/fc45488b21d0f476ee7b2b0e56ce3120b9317ed0/evidence/2026-07-run-records/README.md)
+behind those figures, and the withdrawal stands
+([changelog](https://github.com/IonDen/mlx-train-perf/blob/fc45488b21d0f476ee7b2b0e56ce3120b9317ed0/CHANGELOG.md)).
+The 25.68 GiB figure is a 20-step Qwen3-8B run at 8,192 tokens with stock attention and the stock
+loss, with a total peak of 25.6808 GiB
+([record](https://github.com/IonDen/mlx-train-perf/blob/fc45488b21d0f476ee7b2b0e56ce3120b9317ed0/evidence/2026-07-run-records/bench_train_step_stockattn/train_step_mlx-community__Qwen3-8B-4bit_seq8192_stock.json)).
+The project used to set it against 12.7462 GiB, which is flash attention with the fused loss
+([record](https://github.com/IonDen/mlx-train-perf/blob/fc45488b21d0f476ee7b2b0e56ce3120b9317ed0/evidence/2026-07-run-records/bench_train_step/train_step_mlx-community__Qwen3-8B-4bit_seq8192_ours.json)),
+from a different session. That pair differs in both attention and loss. A context sweep from
+2026-07-11, whose records the project published later on 2026-11-14 as a seventh set, holds both 8,192-token peaks in
+one sweep, at two steps each: 25.6808 GiB for stock attention with the stock loss and 12.7462 GiB for
+flash attention with the fused loss
+([record](https://github.com/IonDen/mlx-train-perf/blob/aba2cd53c85c7cf8beb6a733d828742a7211e77a/evidence/2026-07-run-records/pre-rc-refresh-backup-2026-07-12/northstar_context_sweep/northstar_mlx-community__Qwen3-8B-4bit_seq8192_stock.json),
+[record](https://github.com/IonDen/mlx-train-perf/blob/aba2cd53c85c7cf8beb6a733d828742a7211e77a/evidence/2026-07-run-records/pre-rc-refresh-backup-2026-07-12/northstar_context_sweep/northstar_mlx-community__Qwen3-8B-4bit_seq8192_ours.json)).
+They still change attention and loss together, and the stock peak is above the 24.96 GiB wired
+limit, so the comparison stays withdrawn
+([changelog](https://github.com/IonDen/mlx-train-perf/blob/aba2cd53c85c7cf8beb6a733d828742a7211e77a/CHANGELOG.md)).
+The like-for-like flash
+file with the stock loss, from the 12.7462 GiB file's session, reads 15.9153 GiB
+([record](https://github.com/IonDen/mlx-train-perf/blob/fc45488b21d0f476ee7b2b0e56ce3120b9317ed0/evidence/2026-07-run-records/bench_train_step/train_step_mlx-community__Qwen3-8B-4bit_seq8192_stock.json)).
+The stock-attention run with the fused loss aborted at the watchdog's ceiling
+([record](https://github.com/IonDen/mlx-train-perf/blob/fc45488b21d0f476ee7b2b0e56ce3120b9317ed0/evidence/2026-07-run-records/bench_train_step_stockattn/train_step_mlx-community__Qwen3-8B-4bit_seq8192_ours.json)),
+so the records do not rank the two loss arms under stock attention. The 25.6808 GiB peak sits
+above the 24.96 GiB wired limit recorded with it, and the project's note says such a peak is not
+evidence of a safe working size. These figures are recorded (records published 2026-11-14; chip
+and run date annotated): the files name neither, and the project added both.
+
+Of the context-sweep figures, this memo uses only some from the 2026-07-11 sweep, as examples in
+section 5: completed peaks above the wired limit and the readings at which its watchdog aborted.
+The claims withdrawn on 2026-11-13 stay withdrawn. Where section 5 names a point they rested on (the
+25.68 GiB step, the stock point at 9,728 tokens), it is as a completed peak above the wired limit;
+the memo draws no context limit and no comparison from a sweep point. Three sections changed with this update. Section 2 now says the stock loss
+built its logits in the same training step as the long-context attention workload, where it said
+on top of that workload, and that the guard module records nothing about which allocations were
+live. Section 3 now says that on MLX 0.32.4 a causal training call runs fused in both passes and
+that the measurement does not split the drop between them, where it said that release made the
+backward much lighter on memory. Section 5 now sets the 28 GiB anchor against the largest step
+peak in the records at v0.9.1 and adds the higher completed peaks and the aborted readings of the
+July records.
+
 ---
 
 A configured memory limit can be real without being a hard stop. That distinction matters on Apple
@@ -41,7 +82,8 @@ thrashing, or pressure created after startup by other processes.
 Nothing was rerun for this memo. Its figures and incident facts come from the project's published
 records, each linked where it is used and listed under References: the v0.4.0 README and changelog,
 the [v0.9.1 changelog](https://github.com/IonDen/mlx-train-perf/blob/v0.9.1/CHANGELOG.md), a
-community benchmark file at v0.3.1, and the training-step records and source code at v0.9.1. The
+community benchmark file at v0.3.1, the training-step records, attention benchmark records and
+source code at v0.9.1, and the July 2026 run records published on 2026-11-14. The
 guard module's opening comment, which says the wired cap turns a wired-class over-allocation into a
 clean MLX out-of-memory error, states the assumption section 1 corrects; `main` has since reworded
 it. Its comment on the 28 GiB anchor still cites the step figure the project withdrew; this memo
@@ -93,11 +135,12 @@ rather than limit residency.
 
 The guard module dates the incident to 2026-07-10 and names the failing worker a "Qwen3-8B
 stock-CE seq-8192 bench condition": Qwen3-8B at 8,192 tokens with stock cross-entropy. That loss
-materializes the full logits tensor, shape `(8192, 151936)`, on top of the long-context attention
-workload; 151,936 is the vocabulary size in the
+materializes the full logits tensor, shape `(8192, 151936)`, in the same training step as the
+long-context attention workload; 151,936 is the vocabulary size in the
 [model config](https://github.com/IonDen/mlx-train-perf/blob/v0.9.1/_artifacts/calib_050/qwen3-8b-4bit.config.json)
-the project committed with its training-step records. The guard module names the failing condition's
-loss arm, not its attention arm.
+the project committed with its training-step records. The guard module names the failing
+condition's loss arm, not its attention arm, and records nothing about which allocations were live
+at the moment of failure.
 
 The guard module names neither the machine nor the MLX version. For context only, the project's
 0.2.0 release four days later reports its measurements from an M1 Max with 32 GB of unified memory
@@ -164,12 +207,22 @@ paging is not required by the available evidence.
 
 A different, later benchmark of MLX's own attention call, `mx.fast.scaled_dot_product_attention`,
 shows that a later MLX release changed the attention part of this workload. With a causal mask at
-8,192 tokens, stock attention's forward plus backward peaked at 12.532 GiB on MLX 0.32.0 and
-0.682 GiB on MLX 0.32.4, according to the [v0.9.1 changelog](https://github.com/IonDen/mlx-train-perf/blob/v0.9.1/CHANGELOG.md); the 0.32.4
-figure was taken with the benchmark's measurement-only override, because the package refuses MLX
-0.32.4. MLX 0.32.4 made its backward much lighter on memory. The training step was not re-measured
-on 0.32.4, and the library pins `mlx==0.32.0` as of v0.9.1, so the training-step peak in this memo
-holds for MLX 0.32.0, the version the project's releases reported at the time of the incident.
+8,192 tokens, one stock attention forward plus backward had a marginal peak of 12.532 GiB on MLX
+0.32.0
+([record](https://github.com/IonDen/mlx-train-perf/blob/v0.9.1/_artifacts/bench_attention_marginal/mlx-0.32.0/causal-stock-n8192.json))
+and 0.682 GiB on MLX 0.32.4
+([record](https://github.com/IonDen/mlx-train-perf/blob/v0.9.1/_artifacts/bench_attention_marginal/mlx-0.32.4/causal-stock-n8192.json)),
+both on an M1 Max under macOS 27.0.1; the 0.32.4 figure was taken with the benchmark's
+measurement-only override, because the package refuses MLX 0.32.4. On MLX 0.32.0, under
+`mx.grad` or `value_and_grad`, the whole attention call falls back to unfused operations. On
+0.32.4 a causal training call runs fused in both passes, with a backward that works in tiles, for
+supported head sizes and dtypes; the measurement does not split the drop between the two passes.
+That was measured for the causal mask. Per the MLX source a call with no mask runs the same way,
+which was not measured, and a mask passed as an array still falls back
+([changelog](https://github.com/IonDen/mlx-train-perf/blob/fc45488b21d0f476ee7b2b0e56ce3120b9317ed0/CHANGELOG.md)).
+The training step was not re-measured on 0.32.4, and the library pins `mlx==0.32.0` as of v0.9.1,
+so the training-step peaks in this memo hold for MLX 0.32.0, the version the project's releases
+reported at the time of the incident.
 
 The evidence is classified as follows:
 
@@ -177,10 +230,10 @@ The evidence is classified as follows:
 |---|---|---|
 | the panic assertion and the date, 2026-07-10 | directly observed incident, as the project records it | project guard module at v0.9.1 |
 | allocation past physical RAM, about three hours of paging, and the dependence on machine state | the guard module's account, with no measurement published | project guard module at v0.9.1 |
-| the benchmark's materialized pure-MLX attention reference (the arm the README labels stock) paging at 8,192 tokens before the watchdog | separate source-reported measurement on MLX 0.32.0; no record of that run is committed, and the committed record of the same condition with the watchdog shows an abort at the ceiling | v0.4.0 README; community benchmark file at v0.3.1 |
-| largest recorded training-step peak, 21.61 GiB (stock loss, flash attention, 12,288 tokens) | recorded training step on MLX 0.32.0 | training-step records at v0.9.1 |
+| the benchmark's materialized pure-MLX attention reference (the arm the README labels stock) paging at 8,192 tokens before the watchdog | separate measurement on MLX 0.32.0 that the README reports; no record of that run is committed, and the committed record of the same condition with the watchdog shows an abort at the ceiling | v0.4.0 README; community benchmark file at v0.3.1 |
+| largest training-step peak in the records at v0.9.1, 21.61 GiB (stock loss, flash attention, 12,288 tokens) | recorded training step on MLX 0.32.0 | training-step records at v0.9.1 |
 | prepare/complete bookkeeping mechanism | unverified hypothesis | project reconstruction and comparison with public reports |
-| released watchdog behavior and specific abort paths | source-reported operational behavior | v0.4.0 README and changelog; watchdog code at v0.9.1 |
+| released watchdog behavior and specific abort paths | operational behavior as the release documents and code describe it | v0.4.0 README and changelog; watchdog code at v0.9.1 |
 
 ## 4. Reports from other machines narrow the conclusion
 
@@ -232,11 +285,22 @@ effective ceiling = min(
 )
 ```
 
-For the 32 GB reference machine, the static value is 28.0 GiB. It sits above the largest recorded
-training-step peak, 21.61 GiB, and below physical memory. That peak is the Qwen3-8B step at 12,288
-tokens with the stock loss under flash attention on MLX 0.32.0, in the project's
+For the 32 GB reference machine, the static value is 28.0 GiB. It sits above the largest
+training-step peak in the records at v0.9.1, 21.61 GiB, and below physical memory. That peak is the
+Qwen3-8B step at 12,288 tokens with the stock loss under flash attention on MLX 0.32.0, in the
+project's
 [training-step records](https://github.com/IonDen/mlx-train-perf/tree/v0.9.1/_artifacts/calib_050)
-at v0.9.1. The dynamic term exists because a schedule that fits after a clean boot can still be
+at v0.9.1. The run records published on 2026-11-14 hold higher completed peaks: their note lists
+six completed points above 24.96 GiB, from 25.68 to 27.54 GiB, across three sessions, and says none
+is evidence of a safe working size. Three of them come from a context sweep of 2026-07-11, the
+highest being 27.54 GiB for stock attention at 9,728 tokens
+([note](https://github.com/IonDen/mlx-train-perf/blob/aba2cd53c85c7cf8beb6a733d828742a7211e77a/evidence/2026-07-run-records/README.md)).
+That sweep ran an
+earlier build whose watchdog compared a fixed 28.0 GiB ceiling with active memory only, and its four
+aborts read 28.0754 to 31.2302 GiB
+([record](https://github.com/IonDen/mlx-train-perf/blob/aba2cd53c85c7cf8beb6a733d828742a7211e77a/evidence/2026-07-run-records/pre-rc-refresh-backup-2026-07-12/northstar_context_sweep/northstar_mlx-community__Qwen3-8B-4bit_seq9984_stock.json),
+[record](https://github.com/IonDen/mlx-train-perf/blob/aba2cd53c85c7cf8beb6a733d828742a7211e77a/evidence/2026-07-run-records/pre-rc-refresh-backup-2026-07-12/northstar_context_sweep/northstar_mlx-community__Qwen3-8B-4bit_seq16384_stock.json)),
+so a reading can be well past the watchdog's ceiling by the time the abort fires. The dynamic term exists because a schedule that fits after a clean boot can still be
 unsafe when other processes already occupy unified memory. Here, availability is a one-shot
 `vm_stat` sum of free, inactive, and speculative pages, including reclaimable inactive file cache.
 Availability is sampled when the watchdog is installed; the resulting ceiling is fixed for that
@@ -264,7 +328,7 @@ Those two documents are the project's own release record. They describe the guar
 or that the exit happens even when the abort record cannot be written; those are in the watchdog
 code at v0.9.1.
 
-That abort is a source-reported operational observation, not proof that the watchdog prevents every
+That abort is an operational observation the release documents report, not proof that the watchdog prevents every
 form of the IOGPU assertion. It exercises the path the mitigation was designed for: sustained growth
 in MLX active memory that crosses the configured ceiling slowly enough for the daemon to observe it.
 
@@ -323,14 +387,25 @@ fails, the process must still terminate.
   project's own release record for the single-operation attention benchmark and the released
   memory-safety behavior.
 - [Training-step records](https://github.com/IonDen/mlx-train-perf/tree/v0.9.1/_artifacts/calib_050)
-  at v0.9.1, for the largest recorded step peak and the model config.
+  at v0.9.1, for the largest step peak at that tag and the model config.
+- [July 2026 run records](https://github.com/IonDen/mlx-train-perf/blob/fc45488b21d0f476ee7b2b0e56ce3120b9317ed0/evidence/2026-07-run-records/README.md)
+  at commit fc45488, published 2026-11-14, for the 25.6808, 12.7462 and 15.9153 GiB steps, the
+  aborted fused-loss run and the 24.96 GiB wired limit; and the
+  [changelog](https://github.com/IonDen/mlx-train-perf/blob/fc45488b21d0f476ee7b2b0e56ce3120b9317ed0/CHANGELOG.md)
+  at the same commit, for the standing withdrawal and the corrected account of MLX attention in
+  training.
+- The [note on the July 2026 run records](https://github.com/IonDen/mlx-train-perf/blob/aba2cd53c85c7cf8beb6a733d828742a7211e77a/evidence/2026-07-run-records/README.md)
+  at commit aba2cd5, also published 2026-11-14, for the six completed peaks above 24.96 GiB and the
+  four aborted readings of the 2026-07-11 context sweep.
+- [Attention benchmark records](https://github.com/IonDen/mlx-train-perf/tree/v0.9.1/_artifacts/bench_attention_marginal)
+  at v0.9.1, for the causal attention figures on MLX 0.32.0 and 0.32.4.
 - [Community benchmark file](https://github.com/IonDen/mlx-train-perf/blob/v0.3.1/community-benchmarks/apple-m1-max-32gb-2026-07-13.json)
   at v0.3.1, for the abort record of the attention reference at 8,192 tokens with the watchdog.
 - [Changelog at commit 895957e](https://github.com/IonDen/mlx-train-perf/blob/895957e/CHANGELOG.md),
   for the release figures the project withdrew on 2026-11-13 and the 0.2.0 release's machine and
   MLX version.
 - [Changelog at v0.9.1](https://github.com/IonDen/mlx-train-perf/blob/v0.9.1/CHANGELOG.md), for the
-  attention figures on MLX 0.32.4 and 0.32.0 and the opt-in external supervision.
+  opt-in external supervision.
 - [Guard module](https://github.com/IonDen/mlx-train-perf/blob/v0.9.1/src/mlx_train_perf/core/guards.py),
   [abort writer](https://github.com/IonDen/mlx-train-perf/blob/v0.9.1/src/mlx_train_perf/bench/artifacts.py)
   and [benchmark worker](https://github.com/IonDen/mlx-train-perf/blob/v0.9.1/src/mlx_train_perf/bench/worker.py)
@@ -341,4 +416,4 @@ fails, the process must still terminate.
 
 ---
 
-*Prepared 2026-07-17. Last updated 2026-11-13. Denis Ineshin.*
+*Prepared 2026-07-17. Last updated 2026-11-14. Denis Ineshin.*
