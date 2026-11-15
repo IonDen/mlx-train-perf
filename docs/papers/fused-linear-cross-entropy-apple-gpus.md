@@ -4,6 +4,21 @@
 
 > 📄 [Read on the website](https://ineshin.space/papers/fused-linear-cross-entropy-apple-gpus/) — same paper, formatted for reading.
 
+## Update, 2026-11-14
+
+The [earlier version](https://github.com/IonDen/mlx-train-perf/blob/d610767592e6eebbb5eb256c1fc8afd9e367f232/docs/papers/fused-linear-cross-entropy-apple-gpus.md)
+of section 7 reported, from the project's first release, that fused cross-entropy alone did not
+materially extend the maximum trainable context, said the release "attributes the long-context peak
+to stock attention backward", and called that a source-reported result. It also said MLX 0.32.4
+"made stock causal attention light", with one attention call "peaking at" 0.682 GiB against
+12.532 GiB on MLX 0.32.0. Section 7 now quotes the 0.1.0 changelog, adds the project's 2026-11-14
+correction (on MLX 0.32.0 the whole attention call falls back to unfused operations under training)
+and, from the MLX source, that this path builds the full score matrix in the forward as well. It
+says what survives of the MLX 0.31.2 runs: four points of the context search, and no raw record of
+the points at 4,096 and 8,192 tokens or of the attention probe. It gives the two attention figures as marginal peaks from the attention records. The rung table in section 6 had no word on
+where its slowdown column came from; a sentence under it now says the column comes from exploratory
+runs on MLX 0.31.2, so its 1.63× for `v2e` is a different measurement from the 1.64× used elsewhere.
+
 Training a language model often allocates a huge logits matrix just to compute cross-entropy. For `N`
 tokens and a vocabulary of size `V`, that matrix has shape `(N, V)`. Yet the loss needs only a
 log-sum-exp and one target logit from each row. We built a fused MLX/Metal forward kernel that computes
@@ -230,6 +245,10 @@ tiles eventually closed that gap.
 | v2e | `4 × 4` tiles (`32 × 32`) | 2423.7 G MAC/s | 1.63× |
 | v2f | `4 × 8` tiles (`32 × 64`) | 1403.2 G MAC/s | 2.8× |
 
+The slowdown column comes from the exploratory runs on MLX 0.31.2. Its 1.63× for `v2e` is a
+different measurement from the 1.64× in Sections 3, 7 and 11, which comes from the committed MLX
+0.32.0 run.
+
 Performance improved up to the `32 × 32` tile, which used roughly 32 fp32 accumulator elements per
 lane. Doubling one tile dimension then cut throughput from 2423.7 to 1403.2 G MAC/s. Across both design
 families, more data reuse helped only while the extra per-lane state did not make the compiled kernel
@@ -254,18 +273,37 @@ memory run is consistent with a large reduction, but its unequal starting baseli
 ratio. In a complete training step, the transformer, optimizer, model weights, and attention backward
 remain. Removing one allocation does not guarantee a proportional increase in maximum context.
 
-The project's 0.1.0 release measurements show why scope matters. With stock attention held across the
-loss comparison, the release record reports that fused cross-entropy alone did not materially extend
-maximum trainable context. It attributes the long-context peak to stock attention backward. Because
-the raw historical sweep is not public, this remains a source-reported result rather than an
-independently reconstructable comparison.
+The project's own first release makes the same point about scope. Among the known limits of 0.1.0,
+its [changelog](https://github.com/IonDen/mlx-train-perf/blob/895957e/CHANGELOG.md) states that "the
+fused loss frees memory at a given context but does not, on its own, extend the maximum trainable
+context on MLX." It names the backward of stock attention, `mx.fast.scaled_dot_product_attention`, as
+the memory bottleneck at long context: that backward materializes the `(N, N)` attention matrix. The
+runs behind the statement were not published with that release.
+
+The project corrected that account on 2026-11-14
+([changelog](https://github.com/IonDen/mlx-train-perf/blob/fc45488b21d0f476ee7b2b0e56ce3120b9317ed0/CHANGELOG.md)):
+on MLX 0.32.0 under training (`mx.grad` or `value_and_grad`), the whole attention call falls back to
+unfused operations, and the unfused path in the
+[MLX source](https://github.com/ml-explore/mlx/blob/v0.32.0/mlx/backend/metal/scaled_dot_product_attention.cpp#L601-L605)
+computes the full `(N, N)` score matrix in the forward as well. The July 2026 run records the
+project published the same day hold four points of the MLX 0.31.2 context search, the only ones that
+survive, and their note says no raw record survives for the MLX 0.31.2 points at 4,096 and 8,192
+tokens or for the MLX 0.31.2 attention probe
+([records note](https://github.com/IonDen/mlx-train-perf/blob/fc45488b21d0f476ee7b2b0e56ce3120b9317ed0/evidence/2026-07-run-records/README.md)).
 
 The loss kernel therefore removes loss-layer waste without solving training memory as a whole. In the
 project's measurements on MLX 0.31.2 it did not automatically increase maximum context; that was not
-re-measured as a sweep on 0.32.0, and not at all on 0.32.4. MLX 0.32.4 made stock causal attention
-light: the project's [v0.9.1 changelog](https://github.com/IonDen/mlx-train-perf/blob/v0.9.1/CHANGELOG.md)
-records one stock attention forward plus backward at 8,192 tokens peaking at 0.682 GiB, against
-12.532 GiB for the same call on MLX 0.32.0. The library still pins MLX 0.32.0.
+re-measured as a loss-only sweep on 0.32.0, and not at all on 0.32.4. On MLX 0.32.4 a causal
+attention call runs fused in both passes during training, with a backward that works in tiles. The
+project's attention records at v0.9.1 give one stock causal attention forward plus backward at
+8,192 tokens a marginal peak of 0.682 GiB on MLX 0.32.4
+([record](https://github.com/IonDen/mlx-train-perf/blob/v0.9.1/_artifacts/bench_attention_marginal/mlx-0.32.4/causal-stock-n8192.json),
+taken with a measurement-only override because the package refuses that version), against
+12.532 GiB on MLX 0.32.0
+([record](https://github.com/IonDen/mlx-train-perf/blob/v0.9.1/_artifacts/bench_attention_marginal/mlx-0.32.0/causal-stock-n8192.json)).
+The benchmark measured the causal mask. Per the MLX source a call with no mask runs the same way,
+which was not measured, and a mask passed as an array still falls back. The library still pins MLX
+0.32.0.
 
 Speed also changes with scope. The isolated fused forward was 1.64× slower than the highly tuned
 materialized MLX path, but the loss layer is only part of a training step. Later end-to-end measurements
@@ -274,8 +312,7 @@ implementation, and backward path. It cannot be inferred from the isolated table
 
 The public
 [`bench_train_step.py`](https://github.com/IonDen/mlx-train-perf/blob/v0.3.1/scripts/bench_train_step.py)
-documents the later step-level method. The loss-only context conclusion appears under the 0.1.0 known
-limits in the [changelog](https://github.com/IonDen/mlx-train-perf/blob/v0.3.1/CHANGELOG.md). The current
+documents the later step-level method. The current
 [`northstar_context_sweep.py`](https://github.com/IonDen/mlx-train-perf/blob/v0.3.1/scripts/northstar_context_sweep.py)
 changes both attention and loss. It therefore documents the later whole-product comparison, not this
 loss-only result.
@@ -319,8 +356,8 @@ contains the kit, the loss-layer grid lives in the package's own
 [`contribute.py`](https://github.com/IonDen/mlx-train-perf/blob/v0.2.0/src/mlx_train_perf/contribute.py#L484).
 [`bench_loss_layer.py`](https://github.com/IonDen/mlx-train-perf/blob/v0.1.0/scripts/bench_loss_layer.py),
 in the repository since v0.1.0, is an earlier standalone driver of the same grid. The JSON records the condition identities, the code
-fingerprint, and all three wall-time samples. The exploratory ladder has no equivalent public bundle,
-so its results remain source-reported and cannot be rerun independently.
+fingerprint, and all three wall-time samples. The exploratory ladder has no equivalent public bundle:
+its results come from runs whose records were not published, and they cannot be rerun independently.
 
 [Cut Cross-Entropy](https://arxiv.org/abs/2411.09009) develops the broader logit-free linear
 cross-entropy approach. [Liger-Kernel](https://github.com/linkedin/Liger-Kernel) provides fused training
@@ -340,4 +377,4 @@ compiled resource cost stays under control, and source-level reuse alone cannot 
 
 ---
 
-*Prepared 2026-07-14. Last updated 2026-11-13. Denis Ineshin.*
+*Prepared 2026-07-14. Last updated 2026-11-14. Denis Ineshin.*

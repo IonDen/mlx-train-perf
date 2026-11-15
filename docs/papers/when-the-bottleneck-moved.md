@@ -9,7 +9,7 @@
 The [July 2026 version](https://github.com/IonDen/mlx-train-perf/blob/v0.9.1/docs/papers/when-the-bottleneck-moved.md)
 of this paper built its argument on figures from runs whose records were not published with the
 code. An [update on 2026-11-13](https://github.com/IonDen/mlx-train-perf/blob/2deff631171b457f072dae923cc8268bf5af5363/docs/papers/when-the-bottleneck-moved.md)
-added an account of MLX 0.32.4 and repeated two of those figures. This version replaces both.
+added an account of MLX 0.32.4 and kept the July figures. This version replaces both.
 
 It no longer sets a 25.68 GiB training step against a 12.75 GiB one ("close to a twofold
 reduction in total peak"), and it drops the 7,936 against 23,040 token contexts (2.9×), the 0.99×
@@ -17,10 +17,11 @@ throughput ratio and a launch cap "near 10,000 tokens". On 2026-11-13 the projec
 25.68 GiB peak, those two contexts and their ratio, the 0.99× ratio and the launch cap, because no
 record published with the code showed them at the time
 ([changelog](https://github.com/IonDen/mlx-train-perf/blob/fc45488b21d0f476ee7b2b0e56ce3120b9317ed0/CHANGELOG.md)).
-Two more are dropped here for their own reasons. The comparison with the 12.75 GiB step goes
+Three are dropped here for reasons of their own. The comparison with the 12.75 GiB step goes
 because that step keeps its record but differs from the 25.68 GiB one in both attention and loss
-(section 6). The 21.39 GiB tie on MLX 0.31.2 goes because nothing published shows it. The MLX
-0.31.2 attention probe is gone too.
+(section 6). The 21.39 GiB tie on MLX 0.31.2 goes because nothing published shows it. The numbers
+of the MLX 0.31.2 attention probe go because no record of them survives; section 3 describes the
+probe only in words.
 
 On 2026-11-14 the project published six sets of July run records, with a
 [note on each](https://github.com/IonDen/mlx-train-perf/blob/fc45488b21d0f476ee7b2b0e56ce3120b9317ed0/evidence/2026-07-run-records/README.md):
@@ -31,14 +32,19 @@ stock-attention set. The 12.75 GiB step is in the flash-attention set and in the
 at v0.9.1, each from a different session than the 25.68 GiB step. The two steps change attention
 and loss together. The stock-attention run with the fused loss at that length aborted. The
 23,040-token sweep point reports `ok` with a non-finite second loss, and the same sweep holds two
-launch-budget refusals (section 6).
+refusals by the fused loss kernel's launch budget (section 6). Later on 2026-11-14 the project
+published a seventh set, a context sweep from 2026-07-11 that holds the chain cap's refusals of the
+flash path; section 7 uses it. That sweep also holds both 8,192-token peaks, 25.68 GiB for stock
+attention with the stock loss and 12.75 GiB for flash attention with the fused loss, at two steps
+each. They still change attention and loss together, and the stock peak is above the 24.96 GiB
+wired limit, so the comparison stays out.
 
-Other records are still missing: nothing published shows the 21.39 GiB tie, the attention probe
-or the 0.2.0 chain cap's refusals. The command-buffer probe's record is published, but it names no
+Other records are still missing: nothing published shows the 21.39 GiB tie or the attention
+probe. The command-buffer probe's record is published, but it names no
 MLX runtime version and no script fingerprint, so this paper does not use it (section 10).
 
 Section 2 now uses the surviving MLX 0.31.2 records, and section 5 compares the two losses under
-flash attention. The context-sweep table is gone; section 6 says what the sweep's records do and
+flash attention. The context-sweep table is gone; section 6 says what the 2026-07-14 sweep's records do and
 do not show. The MLX 0.32.4 account is corrected. Its source shows calls without an array mask,
 not only causal ones, taking the new backward, and calls with no mask were not measured.
 
@@ -285,7 +291,7 @@ attention either
 ([note on the records](https://github.com/IonDen/mlx-train-perf/blob/fc45488b21d0f476ee7b2b0e56ce3120b9317ed0/evidence/2026-07-run-records/README.md)).
 This paper gives no step-level figure for switching attention, and none for the whole change.
 
-A context sweep in the same records paired the two ends on MLX 0.32.0, flash attention with the
+A context sweep in the same records, dated 2026-07-14 in the project's note, paired the two ends on MLX 0.32.0, flash attention with the
 fused loss against stock attention with the stock loss, at two training steps per probe. Its points
 stop at 7,936 tokens for the stock pair
 ([record](https://github.com/IonDen/mlx-train-perf/blob/fc45488b21d0f476ee7b2b0e56ce3120b9317ed0/evidence/2026-07-run-records/northstar_context_sweep/northstar_mlx-community__Qwen3-8B-4bit_seq7936_stock.json))
@@ -293,19 +299,30 @@ and at 22,528 tokens, the last point with finite losses, for the flash pair
 ([record](https://github.com/IonDen/mlx-train-perf/blob/fc45488b21d0f476ee7b2b0e56ce3120b9317ed0/evidence/2026-07-run-records/northstar_context_sweep/northstar_mlx-community__Qwen3-8B-4bit_seq22528_ours.json)).
 The project labels both points recorded (records published 2026-11-14; chip and run date
 annotated). These are where the sweep's points stop, not limits of either path. Each probe ran only
-two steps, and the stock arm ran far slower than the same condition in another session. The abort
-ceilings followed free memory at launch. Stock attention aborted at 8,192 tokens in this sweep
+two steps, and the stock arm ran far slower than the same condition in another session: at 2,048
+tokens, 27.2 tokens per second over its two steps, against 97.8 over the 20 steps of the
+stock-attention set, with the same 8.041 GiB peak
+([sweep record](https://github.com/IonDen/mlx-train-perf/blob/fc45488b21d0f476ee7b2b0e56ce3120b9317ed0/evidence/2026-07-run-records/northstar_context_sweep/northstar_mlx-community__Qwen3-8B-4bit_seq2048_stock.json),
+[20-step record](https://github.com/IonDen/mlx-train-perf/blob/fc45488b21d0f476ee7b2b0e56ce3120b9317ed0/evidence/2026-07-run-records/bench_train_step_stockattn/train_step_mlx-community__Qwen3-8B-4bit_seq2048_stock.json)). The abort ceilings followed free memory at
+launch. Stock attention aborted at 8,192 tokens in this sweep
 ([record](https://github.com/IonDen/mlx-train-perf/blob/fc45488b21d0f476ee7b2b0e56ce3120b9317ed0/evidence/2026-07-run-records/northstar_context_sweep/northstar_mlx-community__Qwen3-8B-4bit_seq8192_stock.json))
 but completed that length in the 20-step session above. The flash point at 23,040 tokens reports
 `ok`, but its second loss is non-finite
 ([record](https://github.com/IonDen/mlx-train-perf/blob/fc45488b21d0f476ee7b2b0e56ce3120b9317ed0/evidence/2026-07-run-records/northstar_context_sweep/northstar_mlx-community__Qwen3-8B-4bit_seq23040_ours.json)),
-so it is not a completed point. Two flash points did not run at all: at 23,296 and 32,768 tokens
-the launch budget refused them, projecting 1.66 and 1.03 seconds per dispatch against a 1.0-second
-limit ([record](https://github.com/IonDen/mlx-train-perf/blob/fc45488b21d0f476ee7b2b0e56ce3120b9317ed0/evidence/2026-07-run-records/northstar_context_sweep/northstar_mlx-community__Qwen3-8B-4bit_seq23296_ours.json),
+so it is not a completed point. At 24,576 tokens the flash pair aborted at the memory ceiling,
+25.64 GiB observed against a 23.11 GiB ceiling
+([record](https://github.com/IonDen/mlx-train-perf/blob/fc45488b21d0f476ee7b2b0e56ce3120b9317ed0/evidence/2026-07-run-records/northstar_context_sweep/northstar_mlx-community__Qwen3-8B-4bit_seq24576_ours.json)).
+Two flash points did not run at all: at 23,296 and 32,768 tokens the fused loss kernel's launch
+budget refused them, projecting 1.66 and 1.03 seconds per dispatch against its 1.0-second limit
+([record](https://github.com/IonDen/mlx-train-perf/blob/fc45488b21d0f476ee7b2b0e56ce3120b9317ed0/evidence/2026-07-run-records/northstar_context_sweep/northstar_mlx-community__Qwen3-8B-4bit_seq23296_ours.json),
 [record](https://github.com/IonDen/mlx-train-perf/blob/fc45488b21d0f476ee7b2b0e56ce3120b9317ed0/evidence/2026-07-run-records/northstar_context_sweep/northstar_mlx-community__Qwen3-8B-4bit_seq32768_ours.json)).
-These are launch-budget refusals, not memory failures. The records name a development build with
-uncommitted changes, so they do not tie that budget, 1.0 s per dispatch and 60 s in total, to
-released code. The sweep changes both components at once, so it says nothing about either alone.
+That budget, 1.0 s per dispatch and 60 s in total, is the released loss kernel's own
+([`core/kernel/launch.py` at v0.3.0](https://github.com/IonDen/mlx-train-perf/blob/v0.3.0/src/mlx_train_perf/core/kernel/launch.py#L33-L34),
+whose [budget check](https://github.com/IonDen/mlx-train-perf/blob/v0.3.0/src/mlx_train_perf/core/kernel/launch.py#L63-L72)
+writes the message both records carry). These are not refusals by the attention guard of section
+7, and not memory failures. The two projections assumed different kernel rates, 471 and
+1,063 G MAC/s (billions of multiply-accumulate operations per second), which is why the shorter context projects the longer dispatch. The sweep changes
+both components at once, so it says nothing about either alone.
 
 The records do show the end state: a flash step with the fused loss completes at 12,288 tokens
 with room to spare, at 16.85 GiB (`calib_050` at v0.9.1).
@@ -318,13 +335,30 @@ display compositing. So the 0.2.0 design split work before a dispatch crossed a 
 budget. It also capped an entire chained backward at two projected seconds
 (`MAX_TOTAL_SECONDS = 2.0` in
 [`launch.py` at v0.2.0](https://github.com/IonDen/mlx-train-perf/blob/v0.2.0/src/mlx_train_perf/attention/kernel/launch.py#L85-L97)),
-on the assumption that MLX packed consecutive custom-kernel dispatches into one command buffer. No
-published record shows where that chain cap stopped the flash path. Memory had room: a later flash
-step with the fused loss completed 10,240 tokens at a whole-step peak of 14.80 GiB
-([`_artifacts/calib_050/flash_n10240/` at v0.9.1](https://github.com/IonDen/mlx-train-perf/tree/v0.9.1/_artifacts/calib_050/flash_n10240)),
-under half of the machine's unified memory. Its record notes less free memory at launch than
-expected and a reduced memory ceiling, yet memory was not the limit at that length. The chain cap
-treated a whole chain as one unit of risk, and the MLX source shows why that model was wrong.
+on the assumption that MLX packed consecutive custom-kernel dispatches into one command buffer.
+A context sweep from 2026-07-11, which the project published later on 2026-11-14 as a seventh set
+of July records, shows where a cap with that budget stopped the flash path in that sweep; the shared session id of its records marks the recipe, not
+one launch. On MLX
+0.32.0, flash attention with the fused loss completed 9,984 tokens at a total peak of 14.54 GiB
+([record](https://github.com/IonDen/mlx-train-perf/blob/aba2cd53c85c7cf8beb6a733d828742a7211e77a/evidence/2026-07-run-records/pre-rc-refresh-backup-2026-07-12/northstar_context_sweep/northstar_mlx-community__Qwen3-8B-4bit_seq9984_ours.json))
+and was refused before it ran at 10,240, 12,288 and 16,384 tokens
+([record](https://github.com/IonDen/mlx-train-perf/blob/aba2cd53c85c7cf8beb6a733d828742a7211e77a/evidence/2026-07-run-records/pre-rc-refresh-backup-2026-07-12/northstar_context_sweep/northstar_mlx-community__Qwen3-8B-4bit_seq10240_ours.json),
+[record](https://github.com/IonDen/mlx-train-perf/blob/aba2cd53c85c7cf8beb6a733d828742a7211e77a/evidence/2026-07-run-records/pre-rc-refresh-backup-2026-07-12/northstar_context_sweep/northstar_mlx-community__Qwen3-8B-4bit_seq12288_ours.json),
+[record](https://github.com/IonDen/mlx-train-perf/blob/aba2cd53c85c7cf8beb6a733d828742a7211e77a/evidence/2026-07-run-records/pre-rc-refresh-backup-2026-07-12/northstar_context_sweep/northstar_mlx-community__Qwen3-8B-4bit_seq16384_ours.json)).
+Each refusal names a budget of 0.5 s per dispatch and 2.0 s in total, and each projected a chain
+total over the 2.0 s budget. The records round those totals to whole seconds. At 10,240 tokens
+the message gives 0.50 s per dispatch for ranges of 2,432 rows, so the total over 10,240 rows comes
+to about 2.1 s; the records give 3 s at the longer two. The chain total is projected from the
+kernel speed measured at launch, and no memory reading was taken, so the stop came from the launch
+check, not from memory or context
+([note on the set](https://github.com/IonDen/mlx-train-perf/blob/aba2cd53c85c7cf8beb6a733d828742a7211e77a/evidence/2026-07-run-records/README.md)).
+The project labels these figures recorded (records published 2026-11-14; chip and run date
+annotated): the records do not name the chip, and each probe ran two training steps. A
+later flash step with the fused loss, from another build and session, completed 10,240 tokens at a whole-step peak of 14.80 GiB
+([`_artifacts/calib_050/flash_n10240/` at v0.9.1](https://github.com/IonDen/mlx-train-perf/tree/v0.9.1/_artifacts/calib_050/flash_n10240)).
+Its record notes less free memory at launch than expected and a memory ceiling reduced to
+15.90 GiB. The step completed below that ceiling, so memory did not stop it at that length. The
+chain cap treated a whole chain as one unit of risk, and the MLX source shows why that model was wrong.
 
 MLX 0.32.0's Metal backend [decides when to commit](https://github.com/ml-explore/mlx/blob/v0.32.0/mlx/backend/metal/device.cpp#L512-L514)
 from two counters: dispatches in the current command buffer, and input and output elements,
@@ -359,7 +393,8 @@ This is a source-grounded conservative model, not a measurement of the macOS wat
 rule. The project
 [README](https://github.com/IonDen/mlx-train-perf/blob/fc45488b21d0f476ee7b2b0e56ce3120b9317ed0/README.md#what-it-changes-memory-at-long-context)
 says what set the limit next: "With that cap gone, the flash path is bound by memory". The flash
-end of the sweep in section 6, though, mixes memory aborts with two launch-budget refusals.
+end of the 2026-07-14 sweep in section 6, though, mixes memory aborts with two refusals by the fused loss
+kernel's launch budget.
 
 ## 8. The third move: MLX 0.32.4
 
@@ -415,10 +450,10 @@ Third, algorithmic complexity and measured scaling are different statements. Lin
 does not make a measured device peak double when the sequence doubles.
 
 Fourth, safety models deserve the same empirical scrutiny as performance models. The per-chain guard
-budgeted a unit MLX does not submit, and no published record shows how far it held the flash path
-back.
+budgeted a unit MLX does not submit, and in the 2026-07-11 sweep it refused the flash path on that
+chain total, with no memory reading taken.
 
-Fifth, a run that completes at the edge, a run the watchdog aborts and a run the launcher refuses
+Fifth, a run that completes at the edge, a run the watchdog aborts and a run a launch budget refuses
 answer different questions. Calling all three "does not fit" hides which limit was hit. A fourth
 kind looks like success: the 23,040-token sweep point reported `ok` with a non-finite second loss.
 
@@ -447,10 +482,18 @@ names at v0.9.1 are later revisions.
   [`bench_train_step_stockattn/`](https://github.com/IonDen/mlx-train-perf/tree/fc45488b21d0f476ee7b2b0e56ce3120b9317ed0/evidence/2026-07-run-records/bench_train_step_stockattn)
   under `evidence/2026-07-run-records/` at fc45488, macOS 26.5.2, from
   [`bench_train_step.py` at 01b2f7b](https://github.com/IonDen/mlx-train-perf/blob/01b2f7b687d35a953bc5b9773eb0922078bc9589/scripts/bench_train_step.py).
-- The MLX 0.32.0 context sweep (section 6):
+- The 2026-07-14 MLX 0.32.0 context sweep (section 6):
   [`northstar_context_sweep/`](https://github.com/IonDen/mlx-train-perf/tree/fc45488b21d0f476ee7b2b0e56ce3120b9317ed0/evidence/2026-07-run-records/northstar_context_sweep)
   under `evidence/2026-07-run-records/` at fc45488, macOS 26.5.2, from
   [`northstar_context_sweep.py` at 3fea237](https://github.com/IonDen/mlx-train-perf/blob/3fea2372eb6dbc7e2b6272bf7b2c94568c88ba38/scripts/northstar_context_sweep.py).
+- The 2026-07-11 context sweep, the seventh set (section 7): 20 files in
+  [`pre-rc-refresh-backup-2026-07-12/northstar_context_sweep/`](https://github.com/IonDen/mlx-train-perf/tree/aba2cd53c85c7cf8beb6a733d828742a7211e77a/evidence/2026-07-run-records/pre-rc-refresh-backup-2026-07-12/northstar_context_sweep)
+  under `evidence/2026-07-run-records/` at aba2cd5, MLX 0.32.0, macOS 26.5.1, from
+  `northstar_context_sweep.py` at 01b2f7b. Its
+  [note](https://github.com/IonDen/mlx-train-perf/blob/aba2cd53c85c7cf8beb6a733d828742a7211e77a/evidence/2026-07-run-records/README.md)
+  says each probe ran two training steps, the records do not name the chip, the invocation that
+  ran the sweep is not recorded, and the shared session id marks the recipe, not one launch. The
+  folder also holds the MLX 0.31.2 points of section 2, from another session.
 - Steps at 8,192 tokens (sections 5, 6): `_artifacts/bench_train_step_flash/` at v0.9.1, macOS
   26.5.1, and the second pair in
   [`bench_train_step/`](https://github.com/IonDen/mlx-train-perf/tree/fc45488b21d0f476ee7b2b0e56ce3120b9317ed0/evidence/2026-07-run-records/bench_train_step)
@@ -465,12 +508,11 @@ names at v0.9.1 are later revisions.
   from `bench_train_step.py` at 01b2f7b.
 - Chain cap and mechanism (sections 3, 7, 8): `launch.py` at v0.2.0; MLX source at its tags.
 
-The community record names the chip, an Apple M1 Max with 32 GB; the attention records name only
-`arm64` and the macOS build. The training-step records at v0.9.1 name the MLX version, the macOS
+The community record names the chip, an Apple M1 Max with 32 GB; the attention records name the
+chip and its memory in their `device` block, with the macOS build. The training-step records at v0.9.1 name the MLX version, the macOS
 build and the script's hash, not the chip or a run date; the project
 [README](https://github.com/IonDen/mlx-train-perf/blob/fc45488b21d0f476ee7b2b0e56ce3120b9317ed0/README.md#the-fused-cross-entropy-loss)
-states the machine. These records came from development builds that do not identify the exact
-code revision.
+states the machine. These records do not identify the exact code revision that produced them.
 
 The July records the project published on 2026-11-14 under `evidence/2026-07-run-records/` name no
 chip, and the training records name no run date. The project's
@@ -478,12 +520,13 @@ chip, and the training records name no run date. The project's
 adds both, ties each training record to its script, and labels their figures "recorded (records
 published 2026-11-14; chip and run date annotated)". Section 2 uses the MLX 0.31.2 pairs and the
 four surviving points of the MLX 0.31.2 context search. Section 6 says why the stock-attention
-steps and the MLX 0.32.0 sweep do not support the old comparisons.
+steps and the 2026-07-14 sweep do not support the old comparisons.
 
 Some records are still missing. As the note lists, none survives for the MLX 0.31.2 points at
-4,096 and 8,192 tokens or for the inline attention probe. Other July runs, among them an earlier
-context sweep and the run summary logs, are held back. No published record shows the 21.39 GiB
-tie or the 0.2.0 chain cap's refusals. The command-buffer probe's record is published but names no
+4,096 and 8,192 tokens or for the inline attention probe. When that note was published on
+2026-11-14, other July runs, among them the 2026-07-11 context sweep (published later that day as
+the seventh set) and the run summary logs, were held back. Nothing published shows the 21.39 GiB tie. The chain cap's refusals are in the
+seventh set, the 2026-07-11 sweep listed above. The command-buffer probe's record is published but names no
 MLX runtime version and no script fingerprint, so this paper does not use it.
 
 ### Related work
