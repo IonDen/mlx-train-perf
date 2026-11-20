@@ -14,7 +14,8 @@ for not reimplementing subprocess-per-condition / instant-artifact / resume-by-s
 refusal-as-a-result: `packed_train` is a `worker.py` condition kind, so `run_conditions`
 already provides all of it. This script builds the ONE condition for the requested arm,
 runs it, prints the resulting artifact, and follows the repo bench exit policy: exit 0 only
-on a `status="ok"` measurement, nonzero on a refusal / crash / abort (no measurement).
+on a `status="ok"` measurement, 1 on any other status: a refusal, crash or abort (no
+measurement), or a run whose loss went non-finite (its record keeps the measured fields).
 
 Heavy GPU run at production shape -- main session only, ETA per arm stated before launch,
 AC power + `memory_pressure` pre-flight, serialized (never two arms at once). The dataset is

@@ -415,6 +415,31 @@ def test_probe_still_reads_a_crash_as_does_not_fit(
     assert probe(1024) is False
 
 
+def test_probe_reads_a_nonfinite_loss_as_does_not_fit_without_retrying(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pins policy for the `nonfinite_loss` status (the probe already reads every status
+    but `ok` as does-not-fit). Goes red if a diverged point is later counted as fitting,
+    or retried like an environment refusal (the queued "ok" would then make the probe
+    answer True)."""
+    calls: list[int] = []
+    fake = _fake_run_conditions_with_statuses(tmp_path, ["nonfinite_loss", "ok"])
+
+    def counting_run_conditions(conditions, out_dir, *, session_id):  # type: ignore[no-untyped-def]
+        calls.append(1)
+        return fake(conditions, out_dir, session_id=session_id)
+
+    monkeypatch.setattr(northstar_context_sweep, "run_conditions", counting_run_conditions)
+    sleeps: list[float] = []
+    probe = make_probe(
+        model="m", revision=None, batch=1, lora_rank=8, lora_layers=-1, seed=0,
+        arm="ours", out_dir=tmp_path, session_id="s", _sleep=sleeps.append,
+    )
+    assert probe(1024) is False
+    assert len(calls) == 1
+    assert sleeps == []
+
+
 def test_sweep_arm_records_unconverged_on_persistent_environment_refusal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

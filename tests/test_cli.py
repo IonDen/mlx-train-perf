@@ -507,6 +507,16 @@ def test_bench_exit_code_three_on_refusals_only() -> None:
     assert _bench_exit_code(["refused", "refused"]) == 3
 
 
+def test_bench_exit_code_nonfinite_loss_is_an_error_not_a_refusal() -> None:
+    """Pins policy for the `nonfinite_loss` status: a run whose loss went non-finite is a
+    failed measurement, not the launch guard doing its job, so it exits 1, alone or beside
+    refusals. `_bench_exit_code` already sends every unknown status to 1; this pin goes red
+    if `nonfinite_loss` is later grouped with `refused` (exit 3) or with `ok` (exit 0)."""
+    assert _bench_exit_code(["ok", "nonfinite_loss"]) == 1
+    assert _bench_exit_code(["refused", "nonfinite_loss"]) == 1
+    assert _bench_exit_code(["nonfinite_loss"]) == 1
+
+
 def test_bench_exit_code_unknown_status_is_an_error_not_a_refusal() -> None:
     """A status string outside the known set (a corrupt artifact reads as 'error' via
     `_read_status`, but a future worker could emit something new) must take the LOUD
