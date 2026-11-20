@@ -34,16 +34,17 @@ The ceiling it fails against has TWO terms (`effective_memory_ceiling` combines 
 
 1. STATIC, device-relative, anchored-proportional (`memory_ceiling_bytes`). The 32 GB
    machine class is the CALIBRATION ANCHOR: at exactly 32 GiB physical the ceiling is
-   28.0 GiB -- a byte-preservation pin, strictly above the 25.68 GiB legitimate near-cap
-   peak (so real work is never falsely aborted) and strictly below 32 GiB physical (so a
-   pageable over-allocation is failed before it pages past RAM). Below 32 GiB it keeps
-   the original semantics (physical minus 4 GiB, floored at half the device). Above it
-   the ceiling grows with 95% of the excess working set (the net is the LAST line above
-   the wired caps, so only 5% of the excess is reserved; OS overhead is mostly absolute
-   and lives in the 32-anchor). The static rule ALSO doubles as the EXPECTED-FREE model
-   for the machine class -- on a 32 GiB box we expect ~28 GiB free at training start (the
-   rest is OS + background); a measured availability far below that means other heavy
-   processes are resident (`memory_divergence_warning`).
+   physical RAM minus a 4 GiB reserve for the OS and other processes, 28.0 GiB (a
+   byte-preservation pin). That is strictly below physical RAM, so a pageable
+   over-allocation is failed before it pages past RAM (the watchdog samples, so a reading
+   can land above the ceiling). Below 32 GiB it keeps the original semantics (physical
+   minus 4 GiB, floored at half the device). Above it the ceiling grows with 95% of the
+   excess working set (the net is the LAST line above the wired caps, so only 5% of the
+   excess is reserved; OS overhead is mostly absolute and lives in the 32-anchor). The
+   static rule ALSO doubles as the EXPECTED-FREE model for the machine class -- on a
+   32 GiB box we expect ~28 GiB free at training start (the rest is OS + background); a
+   measured availability far below that means other heavy processes are resident
+   (`memory_divergence_warning`).
 
 2. DYNAMIC, measured at start (`available_memory_bytes` parsing `vm_stat`): the same
    schedule that ran healthy on a fresh-boot machine panicked IOGPU on a pre-loaded one
@@ -65,8 +66,9 @@ on small machines; ~8-12 GB on 128 GB+ class), and the ladder's reserves (4 GiB 
 side -- reserving more than the likely unreclaimable footprint. Apple's own Metal
 working-set model reserves ~20-25% of total RAM (`max_recommended_working_set_size` is
 ~75-80% of physical; the dev box reports 78%); that is the conservative sibling the WIRED
-caps respect, and this net deliberately sits ABOVE it (25.68 GiB legit work ran healthy
-above the 24.96 GiB recommendation) and BELOW physical RAM.
+caps respect. At the 32 GiB anchor this net sits ABOVE it by design (a training step may
+need more than the recommended working set, and the net is not meant to stop it there)
+and BELOW physical RAM.
 
 Distributed (mx.distributed / mlx.launch / mpirun with mlx_lm): every input to the
 effective ceiling is RANK-LOCAL -- `mx.device_info()` (this node's RAM), `vm_stat` (this
@@ -166,9 +168,8 @@ def wired_cap_holds(*, observed_bytes: int, expected_bytes: int) -> bool:
 # caps, and OS overhead is mostly absolute and already in the 32-anchor).
 _CEILING_ANCHOR_BYTES = 32 * _GIB
 _CEILING_EXCESS_SHARE = 0.95
-# Dynamic-term headroom subtracted from measured-available at start (see the module
-# docstring): the fresh-boot ~29 GiB free minus this keeps the effective ceiling (~27 GiB)
-# above the 25.68 GiB legitimate near-cap peak.
+# Dynamic-term headroom (see the module docstring): the dynamic term is the memory
+# measured as available at start minus this 2 GiB.
 _DYNAMIC_HEADROOM_BYTES = 2 * _GIB
 # Below memory_size // this share the machine is too crowded to start safely -> refusal.
 _REFUSAL_FLOOR_DIVISOR = 4
@@ -186,8 +187,9 @@ def memory_ceiling_bytes(memory_size: int, *, headroom_gb: int = 4) -> int:
 
     - `memory_size` <= 32 GiB: physical minus `headroom_gb` GiB, floored at half the
       device (so a machine smaller than the headroom can't get a zero/negative,
-      guard-disabling ceiling). At exactly 32 GiB this is the 28.0 GiB byte-preservation
-      pin -- above the 25.68 GiB legit peak, below 32 GiB physical. 16 GiB -> 12 GiB;
+      guard-disabling ceiling). At exactly 32 GiB this is 28.0 GiB (a byte-preservation
+      pin), strictly below 32 GiB physical, so an over-allocation fails before it pages
+      past RAM. Smaller machines follow the same rule: 16 GiB -> 12 GiB;
       8 GiB -> 4 GiB (subtraction and floor coincide there).
     - `memory_size` > 32 GiB: the 28 GiB anchor (at the default headroom) + 95% of the
       excess working set. A 512 GB Ultra can measure big shapes while always keeping real
