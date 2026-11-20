@@ -39,6 +39,22 @@ All notable changes to this project are documented here. The format follows
   flash point: flash attention completed up to 9,984 tokens (14.5425 GiB) and was refused at
   10,240. The figures stay withdrawn.
 
+### Fixed
+- A run of the train-step or packed-training benchmark whose recorded per-step loss
+  (`loss_all`) holds NaN or infinity is now written with status `nonfinite_loss` instead of
+  `ok`. The memory and timing fields are kept, and the record's `error` reads like
+  `non-finite loss at loss_all[1]`, where the number is a zero-based position in the list.
+  `scripts/bench_packed_training.py` exits 1 for such a run. `scripts/bench_train_step.py`
+  reports that pair as `incomplete`, names the status, and leaves out its comparison. The
+  context sweep counts the point as "does not fit", so its maximum is never read past the last
+  point that trained cleanly. The community kit's full-tier train-step runs record the status,
+  and the community table leaves them out. Like any status other than `ok`, the condition runs
+  again on resume. Published records are unchanged: the 23,040-token sweep point described
+  under Added keeps its `ok`.
+- The memory-guard docstrings now explain the 28 GiB ceiling by its rule (physical memory
+  minus 4 GiB, below physical RAM) and no longer cite a measured step peak. No ceiling value
+  changed.
+
 ### Documentation
 - Corrected how the README describes MLX attention during training (under `mx.grad` or
   `value_and_grad`). On 0.32.0 the whole call falls back to unfused matrix operations. On
