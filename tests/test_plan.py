@@ -327,11 +327,13 @@ def test_naive_estimate_is_conservative_at_smaller_n() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_predicted_peak_matches_measured_qwen3_8b_within_tolerance() -> None:
-    """Measured-vs-predicted acceptance: anchor the corrected model to the North-Star
-    measurement it was fit against -- Qwen3-8B-4bit, seq 8192, grad_checkpoint=True,
-    kernel, MEASURED total peak 25.68 GB (`_artifacts/northstar_context_sweep/`, session
-    435c2ef). The model (with the committed calibration) predicts within 15%, and
+def test_predicted_peak_matches_a_fixed_qwen3_8b_reference_within_tolerance() -> None:
+    """Reference-vs-predicted acceptance: anchor the corrected model to a fixed reference
+    total peak for Qwen3-8B-4bit, seq 8192, grad_checkpoint=True. The reference, 25.68 GiB,
+    is a test input equal to the published stock-loss arm figure (stock attention,
+    `evidence/2026-07-run-records/bench_train_step_stockattn/`), not the fused-loss
+    configuration below; the test only pins the model's output against that constant.
+    The model (with the committed calibration) predicts within 15%, and
     OVER-predicts (the safe direction for a fit planner). The whole point of the O(N^2)
     correction is here: a purely-linear activation model grossly UNDER-predicts at this
     context, which is exactly the (unsafe) failure this task fixed."""
@@ -341,9 +343,9 @@ def test_predicted_peak_matches_measured_qwen3_8b_within_tolerance() -> None:
     cfg = TrainConfig(batch=1, seq_len=8192, dtype="bfloat16", lora_rank=8, lora_layers=36,
                       grad_checkpoint=True, impl="kernel")
     peak, _ = estimate_peak(qwen, cfg, calib)
-    measured_bytes = 25.68 * 1024**3
-    assert abs(peak - measured_bytes) / measured_bytes < 0.15
-    assert peak >= measured_bytes  # over-predicts -- the safe direction for a fit planner
+    reference_bytes = 25.68 * 1024**3
+    assert abs(peak - reference_bytes) / reference_bytes < 0.15
+    assert peak >= reference_bytes  # over-predicts -- the safe direction for a fit planner
 
 
 def test_attention_component_scales_quadratically_with_seq() -> None:

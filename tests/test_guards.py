@@ -95,8 +95,9 @@ def test_wired_cap_holds_false_when_observed_differs_from_expected() -> None:
 # memory_ceiling_bytes: the pure active-memory ceiling (physical RAM minus headroom).
 # The wired cap only bounds the WIRED class; a PAGEABLE over-allocation still pages
 # past physical RAM into the GPU paging storm that panicked IOGPU on 2026-07-10. The
-# ceiling is what a runtime watchdog fails against, so it must sit ABOVE legitimate
-# near-cap work (25.68 GiB measured) and BELOW the storm class (past physical RAM).
+# ceiling is what a runtime watchdog fails against. At the 32 GiB anchor it is physical
+# RAM minus a 4 GiB reserve (28.0 GiB), strictly BELOW physical RAM, so an
+# over-allocation is failed before it pages past RAM.
 # ---------------------------------------------------------------------------
 
 _M1MAX_32GB_MEMORY_SIZE = 34_359_738_368  # mx.device_info()["memory_size"], exactly 32 GiB
@@ -106,14 +107,16 @@ def test_memory_ceiling_subtracts_headroom_gib() -> None:
     assert memory_ceiling_bytes(_M1MAX_32GB_MEMORY_SIZE) == _M1MAX_32GB_MEMORY_SIZE - 4 * _GIB
 
 
-def test_memory_ceiling_sits_above_legit_peak_and_below_storm_on_this_machine() -> None:
-    """The load-bearing property this whole guardrail turns on: 28.0 GiB is strictly
-    above the 25.68 GiB legitimate near-cap peak (so real work is never falsely aborted)
-    and strictly below 32 GiB physical RAM (so the paging storm is caught before it
-    pages past RAM into an IOGPU panic)."""
+def test_memory_ceiling_sits_at_28_gib_below_physical_ram_on_this_machine() -> None:
+    """The load-bearing property this whole guardrail turns on: at the 32 GiB anchor the
+    ceiling is 28.0 GiB (physical minus 4 GiB), strictly below 32 GiB physical RAM, so the
+    paging storm is caught before it pages past RAM into an IOGPU panic."""
     ceiling_gib = memory_ceiling_bytes(_M1MAX_32GB_MEMORY_SIZE) / _GIB
     assert ceiling_gib == 28.0
-    assert 25.68 < ceiling_gib < 32.0
+    assert 25.68 < ceiling_gib < 32.0, (
+        "regression floor kept from the earlier calibration (25.68 GiB, a fixed test "
+        "input; the exact 28.0 GiB is pinned above) and physical RAM bound the 32 GB ceiling"
+    )
 
 
 def test_memory_ceiling_headroom_param_widens_the_reservation() -> None:
@@ -147,8 +150,7 @@ _ANCHOR = 32 * _GIB  # the 32 GB-class calibration baseline
 
 def test_memory_ceiling_preserves_the_28gib_pin_at_the_32gib_anchor() -> None:
     """Byte-preservation pin: the validated 0.1.0 baseline (exactly 28.0 GiB at 32 GiB
-    physical) must not move -- every fire-path firing in the northstar sweep and every
-    no-false-abort at the 25.68 GiB legit peak was measured against it."""
+    physical) must not move -- it is the anchor the whole ladder is built on."""
     assert memory_ceiling_bytes(_ANCHOR) == 28 * _GIB
 
 
@@ -351,12 +353,15 @@ def test_effective_ceiling_static_wins_on_an_empty_machine() -> None:
 
 
 def test_effective_ceiling_reproduces_the_fresh_boot_baseline() -> None:
-    """Fresh boot ~91% free (=~29 GiB) on the 32 GiB dev Mac: the effective ceiling stays
-    ABOVE the 25.68 GiB legitimate near-cap peak, so real work is never falsely aborted.
-    The load-bearing no-false-abort reproduction, with an injected reader."""
+    """Fresh boot ~91% free (=~29 GiB) on the 32 GiB dev Mac: the dynamic term (available
+    at start minus 2 GiB) wins, so the effective ceiling is 27 GiB. Checked with an
+    injected reader."""
     result = effective_memory_ceiling(memory_size=_ANCHOR, available_reader=lambda: 29 * _GIB)
     assert result.ceiling_bytes == 27 * _GIB  # min(28, 27)
-    assert result.ceiling_bytes > int(25.68 * _GIB)
+    assert result.ceiling_bytes > int(25.68 * _GIB), (
+        "regression floor kept from the earlier calibration (25.68 GiB, a fixed test "
+        "input; the exact 27 GiB is pinned above)"
+    )
     assert result.warning is None
 
 

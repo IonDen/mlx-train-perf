@@ -26,6 +26,8 @@ compiled, apples to apples.
 import argparse
 import functools
 import json
+import math
+import numbers
 import random
 import statistics
 import tempfile
@@ -68,6 +70,38 @@ from mlx_train_perf.errors import (
 )
 
 _ATTENTION_IMPLS = ("stock", "flash")
+
+# Every recorded loss field the condition kinds return: `run_train_step` and
+# `run_packed_train` (through `_packed_summary`) both record the per-step `loss_all`, built
+# by `_loss_curve_fields`; `run_loss_layer` records no loss value. A new loss field must be
+# added here, or the non-finite gate in `main` will not see it.
+LOSS_FIELDS: tuple[str, ...] = ("loss_all",)
+
+
+def _loss_curve_fields(step_reports: list[dict[str, object]]) -> dict[str, object]:
+    """The per-step loss curve as recorded: `loss_all`, one rounded float per report."""
+    loss_all = [float(cast(float, info["train_loss"])) for info in step_reports]
+    return {"loss_all": [round(x, 6) for x in loss_all]}
+
+
+def first_nonfinite_loss(
+    fields: dict[str, object], *, loss_fields: tuple[str, ...] = LOSS_FIELDS,
+) -> tuple[str, int] | None:
+    """The first non-finite recorded loss as `(field, zero-based index)`, or None.
+
+    NaN, +Inf and -Inf are non-finite. A list or tuple field is checked element by element;
+    any other value counts as index 0. Each real number (numpy scalars included) is read
+    with `float()`; bools, None and non-numbers are skipped. Fields not named in
+    `loss_fields` are ignored."""
+    for name in loss_fields:
+        value = fields.get(name)
+        values = value if isinstance(value, list | tuple) else [value]
+        for index, item in enumerate(values):
+            if isinstance(item, bool) or not isinstance(item, numbers.Real):
+                continue
+            if not math.isfinite(float(item)):
+                return name, index
+    return None
 
 _DTYPES: dict[str, mx.Dtype] = {
     "float32": mx.float32, "bfloat16": mx.bfloat16, "float16": mx.float16,
@@ -470,13 +504,12 @@ def run_train_step(
     tokens_per_sec_all = [
         float(cast(float, info["tokens_per_second"])) for info in step_reports
     ]
-    loss_all = [float(cast(float, info["train_loss"])) for info in step_reports]
     return {
         "tokens_per_sec_median": (
             round(statistics.median(tokens_per_sec_all), 3) if tokens_per_sec_all else 0.0
         ),
         "tokens_per_sec_all": [round(x, 3) for x in tokens_per_sec_all],
-        "loss_all": [round(x, 6) for x in loss_all],
+        **_loss_curve_fields(step_reports),
         "active_before_gb": round(active_before / 1024**3, 4),
         "marginal_peak_gb": round(marginal_peak_gb, 4),
         "total_peak_gb": round(active_before / 1024**3 + marginal_peak_gb, 4),
@@ -670,14 +703,13 @@ def _packed_summary(
     peak_all = [
         float(cast(float, info["peak_memory"])) * 1e9 / 1024**3 for info in step_reports
     ]
-    loss_all = [float(cast(float, info["train_loss"])) for info in step_reports]
     return {
         **packed_throughput_fields(
             mean_real_tokens_per_step=mean_real, mean_samples_per_step=mean_samples,
             median_step_wall_s=median_wall,
         ),
         "step_walls_s": [round(w, 6) for w in walls],
-        "loss_all": [round(x, 6) for x in loss_all],
+        **_loss_curve_fields(step_reports),
         "callback_peak_memory_gb": round(max(peak_all), 4) if peak_all else 0.0,
     }
 
@@ -890,6 +922,20 @@ def main(argv: list[str] | None = None) -> int:
             # that measured under an uncapped run) and is deliberately NOT caught here --
             # it propagates the same way an unsupported kind does.
             write_result_unless_breached(out, ident, "refused", error=str(exc), **warning_field)
+            return 0
+        # A non-finite loss means the run diverged: the memory and timing fields still
+        # describe what ran, but the condition did not train cleanly, so it is never `ok`
+        # (a context sweep would otherwise read the length as fitting). Exit 0 as for a
+        # refusal: it is a recorded result, not a crash. Like every non-`ok` status it is
+        # not fresh on resume, so the condition re-runs. Breach-aware, as below.
+        nonfinite = first_nonfinite_loss(fields)
+        if nonfinite is not None:
+            field, index = nonfinite
+            write_result_unless_breached(
+                out, ident, "nonfinite_loss",
+                error=f"non-finite loss at {field}[{index}]",
+                **fields, **warning_field,
+            )
             return 0
         # Breach-aware: if the watchdog started recording a breach while this result was
         # being computed, its record stands -- an `ok` landing before the hard exit would

@@ -6,6 +6,7 @@ at a tiny synthetic shape with `impl="naive"`/`"chunked"` -- fast, no Metal JIT,
 `--run-metal`/`--run-smoke` gate needed.
 """
 import json
+import math
 import subprocess
 import sys
 import threading
@@ -89,10 +90,13 @@ def test_stale_on_any_identity_change(tmp_path: Path) -> None:
     assert not result_is_fresh(p, changed)
 
 
-def test_not_fresh_on_error_status_or_corrupt(tmp_path: Path) -> None:
+@pytest.mark.parametrize("status", ["error", "refused", "nonfinite_loss"])
+def test_not_fresh_on_error_status_or_corrupt(tmp_path: Path, status: str) -> None:
+    # Catches: a freshness check that accepts any status but `error` (a refused or diverged
+    # point would then be skipped on resume instead of re-run).
     ident = run_identity(model="m", session_id="s1")
     p = tmp_path / "r.json"
-    write_result(p, ident, "error", error_type="OOM")
+    write_result(p, ident, status, error="not a clean measurement")
     assert not result_is_fresh(p, ident)
     p.write_text("{not json")
     assert not result_is_fresh(p, ident)
@@ -701,6 +705,198 @@ def test_worker_main_records_environment_refusal_distinctly(
     data = json.loads(out.read_text())
     assert data["status"] == "refused_environment"
     assert "crowded" in data["error"]
+
+
+def _train_step_config(tmp_path: Path, kind: str = "train_step") -> tuple[Path, Path]:
+    out = tmp_path / "r.json"
+    cfg = tmp_path / "config.json"
+    cfg.write_text(json.dumps({
+        "kind": kind, "params": {"steps": 3}, "session_id": "s1", "out": str(out),
+    }))
+    return cfg, out
+
+
+def _stub_run(
+    monkeypatch: pytest.MonkeyPatch, name: str, fields: dict[str, object],
+) -> None:
+    def _fake_run(
+        _params: dict[str, object], **_kwargs: object,
+    ) -> dict[str, object]:
+        return dict(fields)
+
+    monkeypatch.setattr(worker, name, _fake_run)
+
+
+def test_worker_main_records_an_infinite_train_step_loss_as_nonfinite_not_ok(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Catches: a training run whose loss went to Infinity recorded as `ok` -- a sweep then
+    # reads that context length as fitting.
+    cfg, out = _train_step_config(tmp_path)
+    _stub_run(monkeypatch, "run_train_step",
+              {"loss_all": [12.809766, float("inf")], "total_peak_gb": 24.0})
+    rc = worker.main(["--config", str(cfg)])
+    assert rc == 0                    # a recorded result, not a crash
+    data = json.loads(out.read_text())
+    assert data["status"] == "nonfinite_loss"
+    assert data["error"] == "non-finite loss at loss_all[1]"
+    assert data["total_peak_gb"] == 24.0
+
+
+def test_worker_main_records_a_nan_train_step_loss_as_nonfinite_not_ok(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Catches: a gate that tests only `math.isinf` (NaN compares unequal to everything, so an
+    # `x > big` or `x == inf` check lets it through).
+    cfg, out = _train_step_config(tmp_path)
+    _stub_run(monkeypatch, "run_train_step", {"loss_all": [float("nan"), 3.5, 3.4]})
+    assert worker.main(["--config", str(cfg)]) == 0
+    data = json.loads(out.read_text())
+    assert data["status"] == "nonfinite_loss"
+    assert data["error"] == "non-finite loss at loss_all[0]"
+    assert math.isnan(data["loss_all"][0])
+
+
+def test_worker_main_records_a_nonfinite_packed_train_loss_as_nonfinite_not_ok(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Catches: a gate wired into the train_step branch only, so the packed bench (which also
+    # records a per-step `loss_all`) still writes `ok` over a diverged run.
+    cfg, out = _train_step_config(tmp_path, kind="packed_train")
+    _stub_run(monkeypatch, "run_packed_train", {"loss_all": [2.0, 1.9, float("-inf")]})
+    assert worker.main(["--config", str(cfg)]) == 0
+    data = json.loads(out.read_text())
+    assert data["status"] == "nonfinite_loss"
+    assert data["error"] == "non-finite loss at loss_all[2]"
+
+
+def test_worker_main_writes_ok_with_unchanged_fields_for_a_finite_loss(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Catches: a gate that always fires, or one that adds/drops fields on the ok path.
+    fields: dict[str, object] = {
+        "loss_all": [2.5, 2.25, 2.0], "tokens_per_sec_all": [10.0, 11.0, 12.0],
+        "total_peak_gb": 3.25,
+    }
+    cfg, out = _train_step_config(tmp_path)
+    _stub_run(monkeypatch, "run_train_step", fields)
+    assert worker.main(["--config", str(cfg)]) == 0
+    data = json.loads(out.read_text())
+    assert data.pop("status") == "ok"
+    data.pop("identity")
+    assert data == {
+        "loss_all": [2.5, 2.25, 2.0], "tokens_per_sec_all": [10.0, 11.0, 12.0],
+        "total_peak_gb": 3.25,
+    }
+
+
+def test_worker_main_breach_record_wins_over_a_nonfinite_loss_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Catches: the non-finite write going through plain `write_result`, which would replace
+    # the watchdog's breach record with a status the sweep reads as an ordinary verdict.
+    cfg, out = _train_step_config(tmp_path)
+
+    def _run_while_the_watchdog_fires(
+        _params: dict[str, object], **_kwargs: object,
+    ) -> dict[str, object]:
+        on_breach = make_watchdog_on_breach(
+            out, {"session_id": "s1"}, 1 << 30, exit_fn=lambda _code: None,
+        )
+        on_breach("memory_ceiling", {"active_bytes": 2 << 30, "elapsed_s": 1.0})
+        return {"loss_all": [float("inf")]}
+
+    monkeypatch.setattr(worker, "run_train_step", _run_while_the_watchdog_fires)
+    assert worker.main(["--config", str(cfg)]) == 0   # a recorded result, not a crash
+    assert json.loads(out.read_text())["status"] == "aborted_memory_ceiling"
+
+
+def test_worker_main_records_memory_warning_on_a_nonfinite_loss_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Catches: the non-finite write dropping `**warning_field`, so a diverged point taken on
+    # a crowded machine loses its degraded-start disclosure.
+    monkeypatch.setattr(
+        worker, "effective_memory_ceiling",
+        lambda: EffectiveCeiling(ceiling_bytes=987654321, warning="only 8 GiB free"),
+    )
+    fake_handle = _FakeWatchdogHandle()
+    monkeypatch.setattr(
+        worker, "install_memory_watchdog",
+        lambda *, ceiling_bytes, wall_budget_s, on_breach: fake_handle,  # noqa: ARG005
+    )
+    cfg, out = _train_step_config(tmp_path)
+    _stub_run(monkeypatch, "run_train_step", {"loss_all": [2.0, float("nan")]})
+    assert worker.main(["--config", str(cfg)]) == 0
+    data = json.loads(out.read_text())
+    assert data["status"] == "nonfinite_loss"
+    assert data["memory_warning"] == "only 8 GiB free"
+
+
+def test_packed_summary_loss_curve_is_seen_by_the_nonfinite_gate() -> None:
+    # Catches: `_packed_summary` recording its loss curve under a key the gate does not
+    # read (a rename of `loss_all` there would let a diverged packed run be written `ok`).
+    def report(loss: float) -> dict[str, object]:
+        return {"iterations_per_second": 1.0, "peak_memory": 1.0, "train_loss": loss}
+
+    result = worker._packed_summary(
+        [report(2.0), report(float("inf"))], warmup=0, mean_real=1.0, mean_samples=1.0,
+    )
+    assert worker.first_nonfinite_loss(result) == ("loss_all", 1)
+
+
+def test_train_step_loss_curve_is_seen_by_the_nonfinite_gate() -> None:
+    # Catches: `run_train_step` recording its loss curve under a key the gate does not read.
+    # The loss-curve fields come from one pure helper shared with `_packed_summary`.
+    fields = worker._loss_curve_fields(
+        [{"train_loss": 12.809766}, {"train_loss": float("inf")}],
+    )
+    assert worker.first_nonfinite_loss(fields) == ("loss_all", 1)
+    assert fields["loss_all"][0] == 12.809766   # type: ignore[index]
+
+
+def test_first_nonfinite_loss_checks_a_tuple_field() -> None:
+    # Catches: a helper that iterates lists only, so a tuple field is read as one scalar
+    # and its NaN is missed.
+    assert worker.first_nonfinite_loss({"loss_all": (1.0, float("nan"))}) == ("loss_all", 1)
+
+
+def test_first_nonfinite_loss_checks_a_numpy_float32_nan() -> None:
+    # Catches: an `isinstance(item, int | float)` test, which a numpy float32 fails, so its
+    # NaN passes as finite.
+    import numpy as np  # noqa: PLC0415 -- a dev dependency; a missing numpy fails loudly
+    assert worker.first_nonfinite_loss({"loss_all": [np.float32(1.0), np.float32("nan")]}) == (
+        "loss_all", 1,
+    )
+
+
+def test_first_nonfinite_loss_skips_none_and_non_numbers() -> None:
+    # Catches: calling `float()` on every element, which crashes on None and reads the
+    # string "nan" as a non-finite loss.
+    assert worker.first_nonfinite_loss({"loss_all": [None, "nan", 2.0]}) is None
+
+
+def test_first_nonfinite_loss_names_the_field_and_first_bad_step() -> None:
+    # Catches: reporting the last bad step, or an off-by-one index.
+    fields = {"loss_all": [1.0, 2.0, float("inf"), float("nan")], "wall_s": float("inf")}
+    assert worker.first_nonfinite_loss(fields) == ("loss_all", 2)
+
+
+def test_first_nonfinite_loss_is_none_for_finite_empty_or_absent_losses() -> None:
+    # Catches: `all()` / `any()` inverted on the empty list, or a non-loss field (a wall
+    # time, a peak) being read as a loss.
+    assert worker.first_nonfinite_loss({"loss_all": [3.0, 2.9]}) is None
+    assert worker.first_nonfinite_loss({"loss_all": []}) is None
+    assert worker.first_nonfinite_loss({"wall_s": float("nan")}) is None
+    assert worker.first_nonfinite_loss({}) is None
+
+
+def test_first_nonfinite_loss_checks_a_scalar_loss_field_as_step_zero() -> None:
+    # Catches: a helper that only iterates lists, so a scalar loss field is never checked.
+    assert worker.first_nonfinite_loss(
+        {"loss": float("nan")}, loss_fields=("loss",),
+    ) == ("loss", 0)
+    assert worker.first_nonfinite_loss({"loss": 1.5}, loss_fields=("loss",)) is None
 
 
 def test_worker_main_crashes_on_unsupported_kind(tmp_path: Path) -> None:
