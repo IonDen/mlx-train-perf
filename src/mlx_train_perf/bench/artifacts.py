@@ -234,13 +234,19 @@ def write_result(path: Path, identity: dict[str, object], status: str, **fields:
 def write_result_unless_breached(
     path: Path, identity: dict[str, object], status: str, **fields: object,
 ) -> bool:
-    """`write_result` for a writer that must never replace a breach record (the external
-    checkpoint callback). Returns False, writing nothing, once the watchdog has started
-    recording a breach. The check and the write share the lock, so the order is total:
-    either this write lands first and the breach record then replaces it, or the breach
-    came first and this write does not happen. (The one exception is a breach write that
-    timed out on the lock while this writer stalled for seconds mid-write; both outcomes are
-    non-ok and retried, so that window only costs the abort reason.)"""
+    """`write_result` for a writer that must never replace a breach record (a final `ok`,
+    `refused` or `nonfinite_loss` write, a progress flush, the external checkpoint
+    callback). Returns False, writing nothing, once the watchdog has started recording a
+    breach. The check and the write share the lock, so in the normal case the order is
+    total: either this write lands first and the breach record then replaces it, or the
+    breach came first and this write does not happen. Two narrow cases can leave this
+    write, an `ok` included, standing after a breach: the breach write raises, or it times
+    out on the lock while this writer stalls for seconds mid-write and this rename lands
+    last. The process still exits nonzero, and a parent that launched it covers that case:
+    after a nonzero exit, `bench.runner.run_conditions` and the bench scripts' grids
+    replace an `ok` or unreadable artifact with a `WorkerCrashed` record carrying the exit
+    code. A process run directly, with no such parent, leaves the `ok` beside its exit
+    code."""
     with _WRITE_LOCK:
         if _BREACH.is_set():
             return False

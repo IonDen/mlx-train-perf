@@ -244,6 +244,26 @@ def _spawn_guarded_worker(
     )
 
 
+def _artifact_status(path: Path) -> object:
+    """The artifact's recorded `status`, or None when it cannot be read as a record."""
+    try:
+        data = json.loads(path.read_text())
+    except (ValueError, OSError):
+        return None
+    return data.get("status") if isinstance(data, dict) else None
+
+
+def _no_record_to_keep(out_path: Path, returncode: int | None) -> bool:
+    """True when the worker left no record the runner should keep: no artifact at all, or,
+    after a nonzero exit, one that is unreadable or says `ok`. A worker whose breach write
+    failed after its `ok` landed still exits nonzero, so a nonzero exit never keeps an
+    `ok`; a non-`ok` record the worker wrote itself is its own honest reason and stands.
+    `returncode` is None when the exit is unknown (the guard client failed after launch)."""
+    if not out_path.exists():
+        return True
+    return returncode not in (None, 0) and _artifact_status(out_path) in (None, "ok")
+
+
 def _text_output(value: object) -> str:
     if isinstance(value, bytes):
         return value.decode("utf-8", errors="replace")
@@ -304,8 +324,10 @@ def _launch_under_guard(
             records["supervision"], ident, "guard_supervised",
             outcome=guarded.outcome, report=guard_report.name,
         )
-    if not out_path.exists():
-        # No worker artifact to respect, and the supervision layer knows why.
+    returncode = guarded.process.returncode if guarded.process is not None else None
+    if _no_record_to_keep(out_path, returncode):
+        # No worker record to respect (none, or an `ok` or unreadable file left by a worker
+        # that exited nonzero), and the supervision layer knows why.
         if guarded.client_error is not None and guarded.process is None:
             write_result(
                 out_path, ident, "error", error_type="GuardClientError",
@@ -381,15 +403,14 @@ def run_conditions(
                 )
             if proc is None:
                 pass  # recorded above; a client failure never fabricates a worker status
-            elif proc.returncode != 0 and not out_path.exists():
-                # A nonzero exit that left NO artifact: the worker crashed before/without
-                # reaching any `write_result`. THIS is the sweep-level failure envelope,
-                # keyed by the SAME identity the worker would have used, so a later resume
-                # run (after the underlying bug is fixed) still sees it as stale and
-                # retries. If the artifact DOES exist, the worker wrote its own honest
-                # record before hard-exiting -- the memory/wall watchdog's `os._exit(70)`
-                # breach path (status `aborted_*`) -- and the pre-spawn `unlink` above
-                # guarantees it is THIS worker's write, so it is respected, not clobbered.
+            elif proc.returncode != 0 and _no_record_to_keep(out_path, proc.returncode):
+                # A nonzero exit that left no artifact, an unreadable one, or an `ok` (the
+                # watchdog's breach write failed after the `ok` landed, and it still exited
+                # 70). THIS is the sweep-level failure envelope, keyed by the SAME identity
+                # the worker would have used, so a later resume run still sees it as stale
+                # and retries. A non-`ok` record the worker wrote itself before
+                # hard-exiting (the watchdog's `aborted_*` breach record) is respected, not
+                # clobbered: the pre-spawn `unlink` above guarantees it is THIS worker's.
                 stderr_tail = (proc.stderr or proc.stdout or "")[-_STDERR_TAIL_CHARS:]
                 write_result(
                     out_path, ident, "error", error_type="WorkerCrashed",
