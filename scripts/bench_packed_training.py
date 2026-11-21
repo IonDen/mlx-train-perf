@@ -148,7 +148,8 @@ def main(argv: list[str] | None = None) -> int:
     artifact = read_artifact(paths[0])
     print(json.dumps(artifact, indent=2))
     # Repo bench exit policy: only a real measurement (`status="ok"`) is a success; a
-    # refusal / crash / memory-abort all exit nonzero so a wrapping run notices.
+    # refusal / crash / memory-abort / non-finite loss all exit nonzero so a wrapping run
+    # notices.
     status = artifact.get("status") if artifact else None
     return 0 if status == "ok" else 1
 

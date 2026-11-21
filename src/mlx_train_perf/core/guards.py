@@ -35,9 +35,9 @@ The ceiling it fails against has TWO terms (`effective_memory_ceiling` combines 
 1. STATIC, device-relative, anchored-proportional (`memory_ceiling_bytes`). The 32 GB
    machine class is the CALIBRATION ANCHOR: at exactly 32 GiB physical the ceiling is
    physical RAM minus a 4 GiB reserve for the OS and other processes, 28.0 GiB (a
-   byte-preservation pin). That is strictly below physical RAM, so a pageable
-   over-allocation is failed before it pages past RAM (the watchdog samples, so a reading
-   can land above the ceiling). Below 32 GiB it keeps the original semantics (physical
+   byte-preservation pin). That is strictly below physical RAM, so a sustained pageable
+   over-allocation trips the watchdog while memory is still below physical RAM (it samples, so
+   a reading can land above the ceiling). Below 32 GiB it keeps the original semantics (physical
    minus 4 GiB, floored at half the device). Above it the ceiling grows with 95% of the
    excess working set (the net is the LAST line above the wired caps, so only 5% of the
    excess is reserved; OS overhead is mostly absolute and lives in the 32-anchor). The
@@ -188,9 +188,9 @@ def memory_ceiling_bytes(memory_size: int, *, headroom_gb: int = 4) -> int:
     - `memory_size` <= 32 GiB: physical minus `headroom_gb` GiB, floored at half the
       device (so a machine smaller than the headroom can't get a zero/negative,
       guard-disabling ceiling). At exactly 32 GiB this is 28.0 GiB (a byte-preservation
-      pin), strictly below 32 GiB physical, so an over-allocation fails before it pages
-      past RAM. Smaller machines follow the same rule: 16 GiB -> 12 GiB;
-      8 GiB -> 4 GiB (subtraction and floor coincide there).
+      pin), strictly below 32 GiB physical, so a sustained over-allocation trips the
+      watchdog while memory is still below physical RAM. Smaller machines follow the same rule:
+      16 GiB -> 12 GiB; 8 GiB -> 4 GiB (subtraction and floor coincide there).
     - `memory_size` > 32 GiB: the 28 GiB anchor (at the default headroom) + 95% of the
       excess working set. A 512 GB Ultra can measure big shapes while always keeping real
       headroom below physical (this is the static term of the watchdog's effective

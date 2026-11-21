@@ -846,8 +846,10 @@ def test_packed_summary_loss_curve_is_seen_by_the_nonfinite_gate() -> None:
 
 
 def test_train_step_loss_curve_is_seen_by_the_nonfinite_gate() -> None:
-    # Catches: `run_train_step` recording its loss curve under a key the gate does not read.
-    # The loss-curve fields come from one pure helper shared with `_packed_summary`.
+    # Catches: `_loss_curve_fields`, the helper `run_train_step` and `_packed_summary` share,
+    # recording the loss curve under a key the gate does not read, or changing its values.
+    # The packed producer's tie is the test above; `tests/test_worker_train_step.py` pins
+    # that `run_train_step` records `loss_all`.
     fields = worker._loss_curve_fields(
         [{"train_loss": 12.809766}, {"train_loss": float("inf")}],
     )
@@ -876,7 +878,7 @@ def test_first_nonfinite_loss_skips_none_and_non_numbers() -> None:
     assert worker.first_nonfinite_loss({"loss_all": [None, "nan", 2.0]}) is None
 
 
-def test_first_nonfinite_loss_names_the_field_and_first_bad_step() -> None:
+def test_first_nonfinite_loss_names_the_field_and_first_bad_index() -> None:
     # Catches: reporting the last bad step, or an off-by-one index.
     fields = {"loss_all": [1.0, 2.0, float("inf"), float("nan")], "wall_s": float("inf")}
     assert worker.first_nonfinite_loss(fields) == ("loss_all", 2)
@@ -891,7 +893,7 @@ def test_first_nonfinite_loss_is_none_for_finite_empty_or_absent_losses() -> Non
     assert worker.first_nonfinite_loss({}) is None
 
 
-def test_first_nonfinite_loss_checks_a_scalar_loss_field_as_step_zero() -> None:
+def test_first_nonfinite_loss_checks_a_scalar_loss_field_as_index_zero() -> None:
     # Catches: a helper that only iterates lists, so a scalar loss field is never checked.
     assert worker.first_nonfinite_loss(
         {"loss": float("nan")}, loss_fields=("loss",),
@@ -1338,3 +1340,137 @@ def test_worker_main_omits_memory_warning_when_absent(
     data = json.loads(out.read_text())
     assert data["status"] == "ok"
     assert "memory_warning" not in data
+
+
+# --- run_conditions: a nonzero exit never keeps an `ok` or an unreadable artifact --------
+# The worker's breach write can fail (or lose the lock) after its `ok` already landed; the
+# watchdog still hard-exits 70. Both launch paths must then record the crash, while a
+# non-`ok` record the worker wrote itself, and the guard's own classification, stand.
+
+
+def _artifact_then_exit(
+    content: str | None, returncode: int,
+) -> Callable[[Path], subprocess.CompletedProcess[str]]:
+    """A `_spawn_worker` stand-in: writes `content` (a status, or `"<unreadable>"` for a
+    truncated file) to the config's `out`, then exits `returncode` with empty output, as a
+    hard `os._exit` after a failed breach write leaves it."""
+
+    def _spawn(config_path: Path) -> subprocess.CompletedProcess[str]:
+        cfg = json.loads(config_path.read_text())
+        out = Path(cfg["out"])
+        if content == "<unreadable>":
+            out.write_text('{"status": "o')
+        elif content is not None:
+            ident = condition_identity(
+                kind=cfg["kind"], session_id=cfg["session_id"], params=cfg["params"],
+                attention_impl=cfg.get("attention_impl"),
+            )
+            write_result(out, ident, content, wall_s=0.01)
+        return subprocess.CompletedProcess(args=[], returncode=returncode, stdout="", stderr="")
+
+    return _spawn
+
+
+@pytest.mark.parametrize("content", ["ok", "<unreadable>"])
+def test_run_conditions_replaces_an_ok_or_unreadable_artifact_after_a_nonzero_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, content: str,
+) -> None:
+    # Catches: recording a crash only when no artifact exists, so an `ok` that landed
+    # before the watchdog's exit 70 is served as fresh by the next same-session resume.
+    monkeypatch.setattr(runner, "_spawn_worker", _artifact_then_exit(content, 70))
+    paths = run_conditions([_tiny_loss_layer("late_ok")], tmp_path, session_id="s1")
+    data = json.loads(paths[0].read_text())
+    assert data["status"] == "error"
+    assert data["error_type"] == "WorkerCrashed"
+    assert data["returncode"] == 70
+
+
+def test_run_conditions_keeps_an_ok_from_a_worker_that_exited_zero(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Catches: replacing every `ok` (the exit-code test dropped or inverted).
+    monkeypatch.setattr(runner, "_spawn_worker", _artifact_then_exit("ok", 0))
+    paths = run_conditions([_tiny_loss_layer("clean")], tmp_path, session_id="s1")
+    data = json.loads(paths[0].read_text())
+    assert data["status"] == "ok"
+    assert data["wall_s"] == 0.01
+
+
+def _guarded_artifact_then_exit(
+    content: str | None, returncode: int, kind: str,
+) -> Callable[..., runner.GuardedWorkerResult]:
+    """A `_spawn_guarded_worker` stand-in: the worker writes `content`, exits `returncode`,
+    and the supervisor reports outcome `kind`."""
+    spawn = _artifact_then_exit(content, returncode)
+
+    def _guarded(
+        config_path: Path, _report: Path, _policy: object, **_kw: object,
+    ) -> runner.GuardedWorkerResult:
+        return runner.GuardedWorkerResult(
+            process=spawn(config_path), fallback_reason=None, client_error=None,
+            outcome={"kind": kind, "returncode": returncode},
+        )
+
+    return _guarded
+
+
+def _run_guarded(tmp_path: Path) -> dict[str, object]:
+    paths = run_conditions(
+        [_tiny_loss_layer("guarded")], tmp_path, session_id="s1",
+        guard=runner.ExternalGuardConfig(max_footprint_bytes=1 << 30),
+    )
+    return dict(json.loads(paths[0].read_text()))
+
+
+@pytest.mark.parametrize("content", ["ok", "<unreadable>"])
+def test_guarded_run_replaces_an_ok_or_unreadable_artifact_after_a_worker_crash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, content: str,
+) -> None:
+    # Catches: the supervised path keeping an `ok` that a worker left before exiting 70.
+    monkeypatch.setattr(
+        runner, "_spawn_guarded_worker", _guarded_artifact_then_exit(content, 70, "child_exited"),
+    )
+    data = _run_guarded(tmp_path)
+    assert data["status"] == "error"
+    assert data["error_type"] == "WorkerCrashed"
+    assert data["returncode"] == 70
+
+
+def test_guarded_intervention_after_an_ok_is_an_external_abort(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Catches: fixing only `run_conditions`, so a stale `ok` under a guard intervention turns
+    # into `WorkerCrashed` instead of the `aborted_external_guard` the guard's report names.
+    monkeypatch.setattr(
+        runner, "_spawn_guarded_worker",
+        _guarded_artifact_then_exit("ok", 75, "policy_intervention"),
+    )
+    data = _run_guarded(tmp_path)
+    assert data["status"] == "aborted_external_guard"
+    assert data["guard_outcome"] == {"kind": "policy_intervention", "returncode": 75}
+
+
+@pytest.mark.parametrize("kind", ["child_exited", "supervisor_failure"])
+def test_guarded_run_keeps_an_ok_from_a_worker_that_exited_zero(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str,
+) -> None:
+    # Catches: the supervised path replacing every `ok`, or treating exit 0 as a failure,
+    # so a report-side supervisor failure after a clean exit discards a good measurement.
+    monkeypatch.setattr(
+        runner, "_spawn_guarded_worker", _guarded_artifact_then_exit("ok", 0, kind),
+    )
+    data = _run_guarded(tmp_path)
+    assert data["status"] == "ok"
+    assert data["wall_s"] == 0.01
+
+
+def test_guarded_run_keeps_a_non_ok_record_the_worker_wrote_before_an_intervention(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Catches: replacing whatever a failed worker wrote, which would erase its own reason.
+    monkeypatch.setattr(
+        runner, "_spawn_guarded_worker",
+        _guarded_artifact_then_exit("checkpointed_partial", 75, "policy_intervention"),
+    )
+    data = _run_guarded(tmp_path)
+    assert data["status"] == "checkpointed_partial"

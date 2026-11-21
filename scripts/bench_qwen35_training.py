@@ -93,7 +93,9 @@ from mlx_train_perf.bench.artifacts import (
     new_session_id,
     result_is_fresh,
     write_result,
+    write_result_unless_breached,
 )
+from mlx_train_perf.bench.worker import first_nonfinite_loss
 from mlx_train_perf.core.guards import (
     DEFAULT_WALL_BUDGET_S,
     clamped_caps,
@@ -457,10 +459,29 @@ def _run_single_condition(condition: TrainCondition, *, out_dir: Path, session_i
     )
     try:
         fields = measure_condition(condition)
-        write_result(out_path, ident, "ok", **fields, **warning_field)
+        # A non-finite loss means the run diverged: the timing and memory fields still
+        # describe what ran, but it did not train cleanly, so it is never `ok`. Same record
+        # as the bench worker's (`nonfinite_loss` plus `error`); breach-aware, as below.
+        # Exit 0 like the other non-`error` statuses; it is not fresh on resume.
+        nonfinite = first_nonfinite_loss(fields, loss_fields=("loss_all",))
+        if nonfinite is not None:
+            field, index = nonfinite
+            write_result_unless_breached(
+                out_path, ident, "nonfinite_loss",
+                error=f"non-finite loss at {field}[{index}]",
+                **fields, **warning_field,
+            )
+            return out_path
+        # Breach-aware: if the watchdog started recording a breach while this result was
+        # being computed, its record stands -- an `ok` landing before the hard exit would
+        # count as fresh forever.
+        write_result_unless_breached(out_path, ident, "ok", **fields, **warning_field)
         return out_path
     finally:
-        # A breach never reaches here -- `on_breach` already hard-exited the process.
+        # A breach during the measurement hard-exits before this point. One that began
+        # while the final write was pending does reach here (that write was skipped):
+        # `stop()` joins the breach thread for up to 5 s, and its `os._exit(70)` ends
+        # the process.
         watchdog.stop()
 
 
@@ -489,12 +510,23 @@ def _spawn_condition(
     return subprocess.run(cmd, capture_output=True, text=True, check=False)
 
 
+def _artifact_status(path: Path) -> object:
+    """The artifact's recorded `status`, or None when it cannot be read as a record."""
+    try:
+        data = json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
+    return data.get("status") if isinstance(data, dict) else None
+
+
 def run_grid(
     conditions: list[TrainCondition], *, out_dir: Path, session_id: str,
 ) -> list[Path]:
     """Subprocess-per-condition orchestration: a fresh artifact is skipped without
-    spawning; a stale one is unlinked BEFORE spawning; a nonzero exit or a clean exit
-    that wrote nothing is recorded as an `"error"` result on this side."""
+    spawning; a stale one is unlinked BEFORE spawning; a nonzero exit that left no
+    artifact, an unreadable one or an `ok`, and a clean exit that wrote nothing, are
+    recorded as an `"error"` result on this side. A non-`ok` record from a failed
+    subprocess (its breach record) is kept."""
     out_dir.mkdir(parents=True, exist_ok=True)
     paths: list[Path] = []
     for condition in conditions:
@@ -505,7 +537,12 @@ def run_grid(
             continue
         out_path.unlink(missing_ok=True)
         proc = _spawn_condition(condition, out_dir=out_dir, session_id=session_id)
-        if proc.returncode != 0 and not out_path.exists():
+        # A nonzero exit never keeps an `ok` or an unreadable artifact: the watchdog's
+        # breach write can fail after an `ok` landed and the child still exits 70. A
+        # non-`ok` record the child wrote itself (its breach record) stands.
+        if proc.returncode != 0 and (
+            not out_path.exists() or _artifact_status(out_path) in (None, "ok")
+        ):
             stderr_tail = (proc.stderr or proc.stdout or "")[-_STDERR_TAIL_CHARS:]
             write_result(
                 out_path, ident, "error", error_type="WorkerCrashed",

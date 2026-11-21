@@ -90,7 +90,9 @@ from mlx_train_perf.bench.artifacts import (
     make_watchdog_on_breach,
     new_session_id,
     write_result,
+    write_result_unless_breached,
 )
+from mlx_train_perf.bench.worker import first_nonfinite_loss
 from mlx_train_perf.core.guards import (
     DEFAULT_WALL_BUDGET_S,
     clamped_caps,
@@ -371,7 +373,9 @@ class _FlushingCallback:
         self.val_info: list[dict[str, object]] = []
 
     def _flush(self) -> None:
-        write_result(
+        # Breach-aware: a loss report between the watchdog's breach record and its hard
+        # exit must not replace that record with `in_progress`.
+        write_result_unless_breached(
             self._out_path, self._identity, "in_progress",
             train_info=self.train_info, val_info=self.val_info,
         )
@@ -467,6 +471,18 @@ def run_convergence(
     }
 
 
+def _loss_history(fields: dict[str, object]) -> dict[str, object]:
+    """The recorded loss values by history field, in report order: `train_info[i]`'s
+    `train_loss` and `val_info[i]`'s `val_loss`, so a finiteness check indexes them the
+    way the record does."""
+    train_info = cast("list[dict[str, object]]", fields.get("train_info", []))
+    val_info = cast("list[dict[str, object]]", fields.get("val_info", []))
+    return {
+        "train_info": [info.get("train_loss") for info in train_info],
+        "val_info": [info.get("val_loss") for info in val_info],
+    }
+
+
 def _run_single_condition(
     condition: ConvergenceCondition, *, out_path: Path, identity: dict[str, object],
 ) -> dict[str, object]:
@@ -494,9 +510,29 @@ def _run_single_condition(
     )
     try:
         fields = run_convergence(condition, out_path=out_path, identity=identity)
-        write_result(out_path, identity, "ok", **fields, **warning_field)
+        # A non-finite train or validation loss means the run diverged, so it is never
+        # `ok`: the bench worker's `nonfinite_loss` record plus `error`, breach-aware as
+        # below. `main` exits 1 for it, as for every non-`ok` status.
+        nonfinite = first_nonfinite_loss(
+            _loss_history(fields), loss_fields=("train_info", "val_info"),
+        )
+        if nonfinite is not None:
+            field, index = nonfinite
+            write_result_unless_breached(
+                out_path, identity, "nonfinite_loss",
+                error=f"non-finite loss at {field}[{index}]",
+                **fields, **warning_field,
+            )
+        else:
+            # Breach-aware: if the watchdog started recording a breach while this result
+            # was being computed, its record stands -- an `ok` landing before the hard
+            # exit would count as fresh forever.
+            write_result_unless_breached(out_path, identity, "ok", **fields, **warning_field)
     finally:
-        # A breach never reaches here -- `on_breach` already hard-exited the process.
+        # A breach during the measurement hard-exits before this point. One that began
+        # while the final write was pending does reach here (that write was skipped):
+        # `stop()` joins the breach thread for up to 5 s, and its `os._exit(70)` ends
+        # the process.
         watchdog.stop()
     return cast("dict[str, object]", json.loads(out_path.read_text()))
 
