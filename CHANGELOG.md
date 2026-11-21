@@ -52,8 +52,32 @@ All notable changes to this project are documented here. The format follows
   again on resume. Published records are unchanged: the 23,040-token sweep point described
   under Added keeps its `ok`.
 - The memory-guard docstrings now explain the 28 GiB ceiling by its rule (physical memory
-  minus 4 GiB, below physical RAM) and no longer cite a measured step peak. No ceiling value
-  changed.
+  minus 4 GiB, below physical RAM) and no longer cite a measured step peak. The
+  `memory_ceiling_bytes` docstring also says a sustained over-allocation trips the watchdog
+  while memory is still below physical RAM. No ceiling value changed.
+- `scripts/bench_attention_op.py`, `scripts/bench_qwen35_training.py` and
+  `scripts/bench_qwen35_convergence.py` now keep the `aborted_memory_ceiling` or
+  `aborted_wall_budget` record when the memory watchdog fires. A result computed at the same
+  moment (`ok`, or `refused` in the attention script) no longer replaces it, and neither does
+  the convergence script's progress flush. The child still exits 70.
+- A NaN or infinity in the loss is now written as `nonfinite_loss`, not `ok`, in two more
+  scripts. `scripts/bench_qwen35_training.py` checks `loss_all`, keeps every measured field and
+  adds an `error` like `non-finite loss at loss_all[1]`; the child exits 0 and the condition
+  runs again on resume. `scripts/bench_qwen35_convergence.py` checks every recorded train and
+  validation loss, keeps the full `train_info` and `val_info` history and adds an `error` like
+  `non-finite loss at train_info[2]` or `non-finite loss at val_info[0]`; it exits 1.
+- A worker that exits nonzero no longer leaves an `ok`, or an unreadable file, standing as a
+  result. The library runner (used by `mlx-train-perf bench`, the context sweep, the community
+  kit and `scripts/bench_packed_training.py`) and the recurrent-layer, attention and
+  training grids record `error` / `WorkerCrashed` with the return code and the stderr tail
+  instead. A record that is not `ok` is kept, and under mlx-guard an intervention is still
+  recorded as `aborted_external_guard`. A condition that now counts as an error makes the
+  bench command exit 1 and the packed-training script exit 1; the context sweep treats that
+  length as not fitting.
+- Not covered: a single benchmark condition run directly by hand keeps whatever it wrote
+  beside its exit code. If the parent process dies between a worker's exit and its check, the
+  `ok` stays on disk, and a run that resumes with the same session id and unchanged code (the
+  context sweep and the community kit resume this way) reuses it.
 
 ### Documentation
 - Corrected how the README describes MLX attention during training (under `mx.grad` or

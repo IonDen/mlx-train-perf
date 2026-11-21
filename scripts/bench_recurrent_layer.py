@@ -422,13 +422,23 @@ def _spawn_condition(
     return subprocess.run(cmd, capture_output=True, text=True, check=False)
 
 
+def _artifact_status(path: Path) -> object:
+    """The artifact's recorded `status`, or None when it cannot be read as a record."""
+    try:
+        data = json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
+    return data.get("status") if isinstance(data, dict) else None
+
+
 def run_grid(
     conditions: list[LayerCondition], *, out_dir: Path, session_id: str,
 ) -> list[Path]:
-    """Subprocess-per-condition orchestration -- same shape as
-    `scripts/bench_attention_op.py`'s own `run_grid`: a fresh artifact is skipped
-    without spawning; a stale one is unlinked BEFORE spawning; a nonzero exit or a
-    clean exit that wrote nothing is recorded as an `"error"` result on this side."""
+    """Subprocess-per-condition orchestration: a fresh artifact is skipped without
+    spawning; a stale one is unlinked BEFORE spawning; a nonzero exit that left no
+    artifact, an unreadable one or an `ok`, and a clean exit that wrote nothing, are
+    recorded as an `"error"` result on this side. A non-`ok` record from a failed
+    subprocess is kept."""
     out_dir.mkdir(parents=True, exist_ok=True)
     paths: list[Path] = []
     for condition in conditions:
@@ -439,7 +449,13 @@ def run_grid(
             continue
         out_path.unlink(missing_ok=True)
         proc = _spawn_condition(condition, out_dir=out_dir, session_id=session_id)
-        if proc.returncode != 0 and not out_path.exists():
+        # The breach callback exits 2 without writing a record, so an `ok` that landed just
+        # before that exit would read as a clean measurement taken past the ceiling. A
+        # nonzero exit never keeps an `ok`: it becomes the crash record, whose `returncode`
+        # (2 for the watchdog) keeps the reason.
+        if proc.returncode != 0 and (
+            not out_path.exists() or _artifact_status(out_path) in (None, "ok")
+        ):
             stderr_tail = (proc.stderr or proc.stdout or "")[-_STDERR_TAIL_CHARS:]
             write_result(
                 out_path, ident, "error", error_type="WorkerCrashed",

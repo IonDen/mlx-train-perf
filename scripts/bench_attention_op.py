@@ -79,6 +79,7 @@ from mlx_train_perf.bench.artifacts import (
     new_session_id,
     result_is_fresh,
     write_result,
+    write_result_unless_breached,
 )
 from mlx_train_perf.core.guards import (
     DEFAULT_WALL_BUDGET_S,
@@ -326,9 +327,14 @@ def _run_single_condition(condition: AttnCondition, *, out_dir: Path, session_id
         try:
             fields = measure_condition(condition)
         except LaunchBudgetError as exc:
-            write_result(out_path, ident, "refused", error=str(exc), **warning_field)
+            write_result_unless_breached(
+                out_path, ident, "refused", error=str(exc), **warning_field,
+            )
             return out_path
-        write_result(out_path, ident, "ok", **fields, **warning_field)
+        # Breach-aware: if the watchdog started recording a breach while this result was
+        # being computed, its record stands -- an `ok` landing before the hard exit would
+        # count as fresh forever.
+        write_result_unless_breached(out_path, ident, "ok", **fields, **warning_field)
         return out_path
     finally:
         watchdog.stop()
@@ -351,6 +357,15 @@ def _spawn_condition(
     return subprocess.run(cmd, capture_output=True, text=True, check=False)
 
 
+def _artifact_status(path: Path) -> object:
+    """The artifact's recorded `status`, or None when it cannot be read as a record."""
+    try:
+        data = json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
+    return data.get("status") if isinstance(data, dict) else None
+
+
 def run_grid(
     conditions: list[AttnCondition], *, out_dir: Path, session_id: str,
 ) -> list[Path]:
@@ -361,13 +376,12 @@ def run_grid(
     nothing is recorded as an `"error"` result on this side, keyed by the identity the
     subprocess would have used, so a later resume run still sees it as stale.
 
-    FINDING H1 (safety review): both branches below require `not out_path.exists()` --
-    mirroring `bench.runner.run_conditions` exactly -- so a subprocess that wrote its OWN
-    honest `aborted_*` artifact before hard-exiting (the watchdog `os._exit(70)` breach
-    path) is never clobbered by the generic `WorkerCrashed` envelope. Because the
-    pre-spawn `unlink` above already guarantees an existing artifact is THIS subprocess's
-    write, `out_path.exists()` after a nonzero exit unambiguously means the subprocess
-    recorded its own breach."""
+    After a nonzero exit, as in `bench.runner.run_conditions`, a non-`ok` artifact is the
+    subprocess's own honest record (the watchdog's `aborted_*` breach record before its
+    `os._exit(70)`) and is never clobbered by the generic `WorkerCrashed` envelope; the
+    pre-spawn `unlink` guarantees an existing artifact is THIS subprocess's write. An
+    `ok` or unreadable artifact after a nonzero exit is replaced by that envelope: the
+    breach write can fail after the `ok` landed, and the subprocess still exits 70."""
     out_dir.mkdir(parents=True, exist_ok=True)
     paths: list[Path] = []
     for condition in conditions:
@@ -378,7 +392,12 @@ def run_grid(
             continue
         out_path.unlink(missing_ok=True)
         proc = _spawn_condition(condition, out_dir=out_dir, session_id=session_id)
-        if proc.returncode != 0 and not out_path.exists():
+        # A nonzero exit never keeps an `ok` or an unreadable artifact: the watchdog's
+        # breach write can fail after an `ok` landed and the child still exits 70. A
+        # non-`ok` record the child wrote itself (its breach record) stands.
+        if proc.returncode != 0 and (
+            not out_path.exists() or _artifact_status(out_path) in (None, "ok")
+        ):
             stderr_tail = (proc.stderr or proc.stdout or "")[-_STDERR_TAIL_CHARS:]
             write_result(
                 out_path, ident, "error", error_type="WorkerCrashed",
